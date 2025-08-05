@@ -1,117 +1,31 @@
 import types
-import sys
+import os
 
 import ray
 import torch
 import torch.distributed as dist
 import comfy
 import folder_paths
-import time
 
 from comfy import sd, sample, utils
 
+from .wan.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
+
 import raylight
 
-## GLOBAL SETTER ##
-from typing import Tuple
-
-_USE_XDIT = False
-
-
-def set_use_xdit(use_dit: bool) -> None:
-    """Set whether to use DIT model.
-
-    Args:
-        use_dit: Boolean flag indicating whether to use xdur
-    """
-    global _USE_XDIT
-    _USE_XDIT = use_dit
-    print(f"The xDiT flag use_xdit={use_dit}")
-
-
-def is_use_xdit() -> bool:
-    return _USE_XDIT
-
-
-_ULYSSES_DEGREE = None
-_RING_DEGREE = None
-_CFG_PARALLEL = None
-
-
-def set_usp_config(ulysses_degree: int, ring_degree: int, cfg_parallel: bool) -> None:
-    global _ULYSSES_DEGREE, _RING_DEGREE, _CFG_PARALLEL
-    _ULYSSES_DEGREE = ulysses_degree
-    _RING_DEGREE = ring_degree
-    _CFG_PARALLEL = cfg_parallel
-    print(
-        f"Now we use xdit with ulysses degree {ulysses_degree}, ring degree {ring_degree}, and CFG parallel {cfg_parallel}"
-    )
-
-
-def get_usp_config() -> Tuple[int, int, bool]:
-    return _ULYSSES_DEGREE, _RING_DEGREE, _CFG_PARALLEL
-
-
-_USE_FSDP = False
-
-
-def set_use_fsdp(use_fsdp: bool) -> None:
-    global _USE_FSDP
-    _USE_FSDP = use_fsdp
-    print(f"The FSDP flag use_fsdp={use_fsdp}")
-
-
-def is_use_fsdp() -> bool:
-    return _USE_FSDP
-
-
-class Timer:
-    def __init__(self):
-        self.times = {}  # Dictionary to store times per stage
-
-    def __call__(self, name):
-        print(f"Timing {name}")
-        return self.TimerContextManager(self, name)
-
-    def print_stats(self):
-        total_time = sum(self.times.values())
-        # Print table header
-        print("{:<20} {:>10} {:>10}".format("Stage", "Time(s)", "Percent"))
-        for name, t in self.times.items():
-            percent = (t / total_time) * 100 if total_time > 0 else 0
-            print("{:<20} {:>10.2f} {:>9.2f}%".format(name, t, percent))
-
-    class TimerContextManager:
-        def __init__(self, outer, name):
-            self.outer = outer  # Reference to the Timer instance
-            self.name = name
-            self.start_time = None
-
-        def __enter__(self):
-            self.start_time = time.perf_counter()
-            return self
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            end_time = time.perf_counter()
-            elapsed = end_time - self.start_time
-            self.outer.times[self.name] = self.outer.times.get(self.name, 0) + elapsed
-
+from xfuser.core.distributed import (
+            init_distributed_environment,
+            initialize_model_parallel,)
 
 
 class RayWorker:
-
-    master_address = None
-    master_port = None
-    use_usp = False
-
-
-    def __init__(self, local_rank):
+    def __init__(self, local_rank, world_size):
         self.model = None
+        self.model_type = None
         self.local_rank = local_rank
-        print("Initializing Local Rank: ", self.local_rank)
+        self.world_size = world_size
         # Unused
         self.device_id = None
-        self.world_size = None
         self.decode_type = None
         self.decode_args = None
         self.use_fsdp = None
@@ -120,32 +34,27 @@ class RayWorker:
         self.ring_degree = None
         self.cfg_parallel = None
 
-        t = Timer()
-        with t("init_process_group"):
-            dist.init_process_group(
-                "nccl",
-                rank=local_rank,
-                world_size=RayWorker.world_size,
-                device_id=self.device_id,  # force non-lazy init
-            )
+        dist.init_process_group(
+            "nccl",
+            rank=local_rank,
+            world_size=self.world_size,
+            device_id=self.device_id,
+        )
+        init_distributed_environment(
+            rank=dist.get_rank(), world_size=dist.get_world_size())
 
+        initialize_model_parallel(
+            sequence_parallel_degree=dist.get_world_size(),
+            ring_degree=1,
+            ulysses_degree=2,
+        )
     """
     Just Placeholder for now, since without USP it is just
     using both gpu to sample different latent
     """
 
-    def get_sys_path(self):
-        return sys.path
-
     def patch_usp(self):
-
-        # Just place holder so LSP not complaining
-        def usp_dit_forward():
-            pass
-
-        def usp_self_attn_patch():
-            pass
-
+        print("Initializing USP")
         block_len = len(self.model.model.diffusion_model.blocks)
         model_options = {
             "dtype": torch.float8_e4m3fn,
@@ -153,7 +62,7 @@ class RayWorker:
                 "patches_replace": {
                     "dit": {
                         **{
-                            ("self_attn", i): usp_self_attn_patch
+                            ("self_attn", i): usp_attn_forward
                             for i in range(block_len)
                         }
                     }
@@ -162,9 +71,10 @@ class RayWorker:
         }
 
         self.model.model_options = model_options
-        self.model.model.diffusion_model.forward = types.MethodType(
+        self.model.model.diffusion_model.forward_orig = types.MethodType(
             usp_dit_forward, self.model.model.diffusion_model
         )
+        print("PATCHED USP")
 
     """
     instance_RayWorker.load_unet.remote(*args, **kwargs)
@@ -265,6 +175,13 @@ class RayInitializer:
     CATEGORY = "Raylight"
 
     def spawn_actor(self, ray_cluster_address, ray_cluster_namespace):
+        # THIS IS PYTORCH DIST ADDRESS
+        # (TODO) Change so it can be edited
+        # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29500"
+
+        world_size = torch.cuda.device_count()
         try:
             ray.init(
                 ray_cluster_address,
@@ -275,13 +192,18 @@ class RayInitializer:
             ray.init(runtime_env={"py_modules": [raylight]})
             raise RuntimeError(f"Ray connection failed: {e}")
 
-        world_size = torch.cuda.device_count()
-        print(f"current world size: {world_size}")
         RemoteActor = ray.remote(RayWorker)
-
         actors = []
         for local_rank in range(world_size):
-            actors.append(RemoteActor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(local_rank=local_rank))
+            actors.append(
+                RemoteActor.options(
+                    num_gpus=1,
+                    name=f"RayWorker:{local_rank}"
+                ).remote(
+                    local_rank=local_rank,
+                    world_size=world_size
+                )
+            )
 
         return (actors,)
 
@@ -444,6 +366,10 @@ class XFuserKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
     ):
+        # TEST USP
+        for actor in ray_actors:
+            actor.patch_usp.remote()
+
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
@@ -469,7 +395,7 @@ class XFuserKSamplerAdvanced:
                 force_full_denoise=force_full_denoise,
             ))
 
-        return (ray.get(final_sample[0])[0], ray.get(final_sample[1])[0],)
+        return (ray.get(final_sample[0])[0],)
 
 
 NODE_CLASS_MAPPINGS = {
