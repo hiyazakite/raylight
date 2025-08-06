@@ -6,6 +6,7 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+from comfy.ldm.flux.math import apply_rope
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -32,46 +33,21 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-def rope_apply(x, grid_sizes, freqs):
-    """
-    x:          [B, L, N, C].
-    grid_sizes: [B, 3].
-    freqs:      [M, C // 2].
-    """
-    s, n, c = x.size(1), x.size(2), x.size(3) // 2
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+def apply_rope_sp(xq, xk, freqs_cis):
+    sp_size = get_sequence_parallel_world_size()
+    sp_rank = get_sequence_parallel_rank()
 
-    # loop over samples
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
+    s_per_rank = xq.shape[1] // sp_size
+    start = sp_rank * s_per_rank
+    end = (sp_rank + 1) * s_per_rank
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
-        freqs_i = torch.cat(
-            [
-                freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-            ],
-            dim=-1,
-        ).reshape(seq_len, 1, -1)
+    xq_sp = xq[:, start:end]
+    xk_sp = xk[:, start:end]
+    freqs_sp = freqs_cis[start:end]
 
-        # apply rotary embedding
-        sp_size = get_sequence_parallel_world_size()
-        sp_rank = get_sequence_parallel_rank()
-        freqs_i = pad_freqs(freqs_i, s * sp_size)
-        s_per_rank = s
-        freqs_i_rank = freqs_i[
-            (sp_rank * s_per_rank) : ((sp_rank + 1) * s_per_rank), :, :
-        ]
-        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
+    xq_out_sp, xk_out_sp = apply_rope(xq_sp, xk_sp, freqs_sp)
 
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+    return xq_out_sp, xk_out_sp
 
 
 def usp_dit_forward(
@@ -184,7 +160,7 @@ def usp_attn_forward(self, x, freqs):
         return q, k, v
 
     q, k, v = qkv_fn(x)
-    q, k = rope_apply(q, k, freqs)
+    q, k = apply_rope_sp(q, k, freqs)
 
     x = xFuserLongContextAttention()(
         None, query=q, key=k, value=v, window_size=self.window_size
