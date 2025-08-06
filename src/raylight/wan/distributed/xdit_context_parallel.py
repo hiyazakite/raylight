@@ -34,20 +34,40 @@ def pad_freqs(original_tensor, target_len):
 
 
 def apply_rope_sp(xq, xk, freqs_cis):
-    sp_size = get_sequence_parallel_world_size()
-    sp_rank = get_sequence_parallel_rank()
+    """
+    Applies RoPE on sequence-parallel chunk only.
 
-    s_per_rank = xq.shape[1] // sp_size
+    xq, xk: [B, L, 1, D]
+    freqs_cis: [B, L, 1, D/2, 2, 2] or [L, 1, D/2, 2, 2]
+    Returns: local chunk of RoPE-applied xq, xk
+    """
+    from torch.distributed import get_rank, get_world_size
+
+    sp_rank = get_rank()
+    sp_size = get_world_size()
+
+    B, L, _, D = xq.shape
+    s_per_rank = L // sp_size
     start = sp_rank * s_per_rank
     end = (sp_rank + 1) * s_per_rank
 
-    xq_sp = xq[:, start:end]
-    xk_sp = xk[:, start:end]
-    freqs_sp = freqs_cis[start:end]
+    # Slice local chunk
+    xq_local = xq[:, start:end]
+    xk_local = xk[:, start:end]
 
-    xq_out_sp, xk_out_sp = apply_rope(xq_sp, xk_sp, freqs_sp)
+    freqs_local = freqs_cis[:, start:end] if freqs_cis.dim() == 6 else freqs_cis[start:end]
 
-    return xq_out_sp, xk_out_sp
+    # RoPE application
+    xq_ = xq_local.to(freqs_local.dtype).reshape(*xq_local.shape[:-1], -1, 1, 2)
+    xk_ = xk_local.to(freqs_local.dtype).reshape(*xk_local.shape[:-1], -1, 1, 2)
+
+    xq_out = freqs_local[..., 0] * xq_[..., 0] + freqs_local[..., 1] * xq_[..., 1]
+    xk_out = freqs_local[..., 0] * xk_[..., 0] + freqs_local[..., 1] * xk_[..., 1]
+
+    return (
+        xq_out.reshape_as(xq_local).type_as(xq),
+        xk_out.reshape_as(xk_local).type_as(xk),
+    )
 
 
 def usp_dit_forward(
@@ -156,7 +176,7 @@ def usp_attn_forward(self, x, freqs):
     def qkv_fn(x):
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n * d)
+        v = self.v(x).view(b, s, n, d)
         return q, k, v
 
     q, k, v = qkv_fn(x)
