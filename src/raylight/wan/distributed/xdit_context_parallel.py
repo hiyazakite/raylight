@@ -15,7 +15,7 @@ def sinusoidal_embedding_1d(dim, position):
     half = dim // 2
     position = position.type(torch.float64)
 
-    # calculation
+    # calculationk
     sinusoid = torch.outer(
         position, torch.pow(10000, -torch.arange(half).to(position).div(half))
     )
@@ -24,16 +24,16 @@ def sinusoidal_embedding_1d(dim, position):
 
 
 def pad_freqs(original_tensor, target_len):
-    seq_len, s1, s2 = original_tensor.shape
+    b, seq_len, z, dim, a, c  = original_tensor.shape
     pad_size = target_len - seq_len
     padding_tensor = torch.ones(
-        pad_size, s1, s2, dtype=original_tensor.dtype, device=original_tensor.device
+        b, pad_size, z, dim, a, c, dtype=original_tensor.dtype, device=original_tensor.device
     )
-    padded_tensor = torch.cat([original_tensor, padding_tensor], dim=0)
+    padded_tensor = torch.cat([original_tensor, padding_tensor], dim=1)
     return padded_tensor
 
 
-def apply_rope_sp(xq, xk, freqs_cis):
+def apply_rope_sp(xq_ori, xk_ori, freqs_cis):
     """
     Applies RoPE on sequence-parallel chunk only.
 
@@ -41,33 +41,33 @@ def apply_rope_sp(xq, xk, freqs_cis):
     freqs_cis: [B, L, 1, D/2, 2, 2] or [L, 1, D/2, 2, 2]
     Returns: local chunk of RoPE-applied xq, xk
     """
-    from torch.distributed import get_rank, get_world_size
 
-    sp_rank = get_rank()
-    sp_size = get_world_size()
+    sp_rank = get_sequence_parallel_rank()
+    sp_size = get_sequence_parallel_world_size()
 
-    B, L, _, D = xq.shape
+    B, L, _, D = xq_ori.shape
     s_per_rank = L // sp_size
     start = sp_rank * s_per_rank
     end = (sp_rank + 1) * s_per_rank
 
-    # Slice local chunk
-    xq_local = xq[:, start:end]
-    xk_local = xk[:, start:end]
+    xq = xq_ori[:, start:end]
+    xk = xk_ori[:, start:end]
 
-    freqs_local = freqs_cis[:, start:end] if freqs_cis.dim() == 6 else freqs_cis[start:end]
+    freqs_padded = pad_freqs(freqs_cis, L * sp_size)
+    freqs_local = freqs_padded[:, start:end]
 
     # RoPE application
-    xq_ = xq_local.to(freqs_local.dtype).reshape(*xq_local.shape[:-1], -1, 1, 2)
-    xk_ = xk_local.to(freqs_local.dtype).reshape(*xk_local.shape[:-1], -1, 1, 2)
+    xq_ = xq.to(dtype=freqs_local.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.to(dtype=freqs_local.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
 
     xq_out = freqs_local[..., 0] * xq_[..., 0] + freqs_local[..., 1] * xq_[..., 1]
     xk_out = freqs_local[..., 0] * xk_[..., 0] + freqs_local[..., 1] * xk_[..., 1]
 
-    return (
-        xq_out.reshape_as(xq_local).type_as(xq),
-        xk_out.reshape_as(xk_local).type_as(xk),
-    )
+    # Write back the RoPE-applied chunk to the original tensors
+    xq_ori[:, start:end] = xq_out.reshape_as(xq).type_as(xq_ori)
+    xk_ori[:, start:end] = xk_out.reshape_as(xk).type_as(xk_ori)
+
+    return xq_ori, xk_ori
 
 
 def usp_dit_forward(
@@ -189,3 +189,4 @@ def usp_attn_forward(self, x, freqs):
     x = x.flatten(2)
     x = self.o(x)
     return x
+
