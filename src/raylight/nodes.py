@@ -55,22 +55,9 @@ class RayWorker:
 
     def patch_usp(self):
         print("Initializing USP")
-        block_len = len(self.model.model.diffusion_model.blocks)
-        model_options = {
-            "dtype": torch.float8_e4m3fn,
-            "transformer_options": {
-                "patches_replace": {
-                    "dit": {
-                        **{
-                            ("self_attn", i): usp_attn_forward
-                            for i in range(block_len)
-                        }
-                    }
-                }
-            },
-        }
-
-        self.model.model_options = model_options
+        for block in self.model.model.diffusion_model.blocks:
+            block.self_attn.forward = types.MethodType(
+                usp_attn_forward, block.self_attn)
         self.model.model.diffusion_model.forward_orig = types.MethodType(
             usp_dit_forward, self.model.model.diffusion_model
         )
@@ -369,7 +356,7 @@ class XFuserKSamplerAdvanced:
     ):
         # TEST USP
         for actor in ray_actors:
-            _ = ray.get(actor.patch_usp.remote())
+            actor.patch_usp.remote()
 
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
