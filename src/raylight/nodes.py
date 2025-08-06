@@ -75,6 +75,7 @@ class RayWorker:
             usp_dit_forward, self.model.model.diffusion_model
         )
         print("PATCHED USP")
+        return None
 
     """
     instance_RayWorker.load_unet.remote(*args, **kwargs)
@@ -368,7 +369,7 @@ class XFuserKSamplerAdvanced:
     ):
         # TEST USP
         for actor in ray_actors:
-            actor.patch_usp.remote()
+            _ = ray.get(actor.patch_usp.remote())
 
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
@@ -380,7 +381,7 @@ class XFuserKSamplerAdvanced:
         final_sample = []
         for additional_noise, actor in enumerate(ray_actors):
             final_sample.append(actor.common_ksampler.remote(
-                noise_seed + additional_noise,
+                noise_seed,
                 steps,
                 cfg,
                 sampler_name,
