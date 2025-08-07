@@ -6,8 +6,9 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
-from comfy.ldm.flux.math import apply_rope
 
+from comfy.ldm.flux.math import apply_rope
+import torch.cuda.amp as amp
 
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
@@ -15,97 +16,116 @@ def sinusoidal_embedding_1d(dim, position):
     half = dim // 2
     position = position.type(torch.float64)
 
-    # calculationk
+    # calculation
     sinusoid = torch.outer(
         position, torch.pow(10000, -torch.arange(half).to(position).div(half))
     )
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
 
-
-def pad_freqs(original_tensor: torch.Tensor, target_len: int) -> torch.Tensor:
+@amp.autocast(enabled=False)
+def rope_apply(x, grid_sizes, freqs):
     """
-    Pad freqs along sequence dimension to length `target_len` with identity rotations (ones on diagonal).
-
-    original_tensor: [B, L, 1, D//2, 2, 2]
-    returns: [B, target_len, 1, D//2, 2, 2]
+    x:          [B, L, N, C].
+    grid_sizes: [B, 3].
+    freqs:      [M, C // 2].
     """
-    B, L, _, dim_half, _, _ = original_tensor.shape
-    pad_size = target_len - L
-    if pad_size <= 0:
-        return original_tensor
-    # Create identity rotation matrices for padding
-    pad_shape = (B, pad_size, 1, dim_half, 2, 2)
-    padding = torch.zeros(pad_shape, dtype=original_tensor.dtype, device=original_tensor.device)
-    # set [[1,0],[0,1]] for each
-    padding[..., 0, 0] = 1
-    padding[..., 1, 1] = 1
-    return torch.cat([original_tensor, padding], dim=1)
+    s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    # split freqs
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    # loop over samples
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        # precompute multipliers
+        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
+            s, n, -1, 2))
+        freqs_i = torch.cat([
+            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ],
+                            dim=-1).reshape(seq_len, 1, -1)
+
+        # apply rotary embedding
+        sp_size = get_sequence_parallel_world_size()
+        sp_rank = get_sequence_parallel_rank()
+        freqs_i = pad_freqs(freqs_i, s * sp_size)
+        s_per_rank = s
+        freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
+                                                       s_per_rank), :, :]
+        x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
+        x_i = torch.cat([x_i, x[i, s:]])
+
+        # append to collection
+        output.append(x_i)
+    return torch.stack(output).float()
 
 
-def apply_rope_sp(xq_ori: torch.Tensor, xk_ori: torch.Tensor, freqs_cis: torch.Tensor) -> (torch.Tensor, torch.Tensor):
-    """
-    Sequence-parallel Rotary Positional Embedding on query/key tensors.
+def pad_freqs(original_tensor, target_len):
+    seq_len, s1, s2 = original_tensor.shape
+    pad_size = target_len - seq_len
+    padding_tensor = torch.ones(
+        pad_size, s1, s2, dtype=original_tensor.dtype, device=original_tensor.device
+    )
+    padded_tensor = torch.cat([original_tensor, padding_tensor], dim=0)
+    return padded_tensor
 
-    Splits the sequence dimension across GPUs using sequence-parallel rank and size,
-    applying RoPE only on the local slice and writing back to originals.
 
-    Args:
-        xq_ori, xk_ori: tensors of shape [B, L, 1, D]
-        freqs_cis:     tensor of shape [B, L, 1, D//2, 2, 2] or [L, 1, D//2, 2, 2]
-    Returns:
-        xq_ori, xk_ori: with RoPE applied in-place on local slices.
-    """
-    sp_rank = get_sequence_parallel_rank()
+
+def apply_rope_sp(xq, xk, freqs_cis):
+    # sp_size = get_sequence_parallel_world_size()
+    # s_per_rank = xq.shape[1] // sp_size
+
+    # xq_chunks = []
+    # xk_chunks = []
+
+    # for sp_rank in range(sp_size):
+    #     start = sp_rank * s_per_rank
+    #     end = (sp_rank + 1) * s_per_rank
+
+    #     xq_sp = xq[:, start:end]
+    #     xk_sp = xk[:, start:end]
+    #     freqs_sp = freqs_cis[:, start:end]
+
+    #     xq_out_sp, xk_out_sp = apply_rope(xq_sp, xk_sp, freqs_sp)
+
+    #     xq_chunks.append(xq_out_sp)
+    #     xk_chunks.append(xk_out_sp)
+
+    # # Concat all processed parts to rebuild the full tensors
+    # xq_out = torch.cat(xq_chunks, dim=1)
+    # xk_out = torch.cat(xk_chunks, dim=1)
+
+    # return xq_out, xk_out
+
+
+def apply_rope_sp(xq, xk, freqs_cis):
     sp_size = get_sequence_parallel_world_size()
+    s_per_rank = xq.shape[1] // sp_size
 
-    B, L, _, D = xq_ori.shape
-    # compute local slice indices (handle remainder)
-    base = L // sp_size
-    rem = L % sp_size
-    if sp_rank < rem:
-        start = sp_rank * (base + 1)
-        end = start + base + 1
-    else:
-        start = sp_rank * base + rem
-        end = start + base
+    xq_chunks = [None] * sp_size
+    xk_chunks = [None] * sp_size
 
-    # pad freqs to full length if needed
-    if freqs_cis.dim() == 5:
-        # no batch dim
-        freqs = freqs_cis.unsqueeze(0).expand(B, -1, -1, -1, -1, -1)
-    else:
-        freqs = freqs_cis
-    freqs_full = pad_freqs(freqs, L)
+    for sp_rank in range(sp_size):
+        start = sp_rank * s_per_rank
+        end = (sp_rank + 1) * s_per_rank
 
-    # prepare slices
-    seq_dim = 1
-    x_slices = [slice(None)] * xq_ori.dim()
-    freq_slices = [slice(None)] * freqs_full.dim()
-    x_slices[seq_dim] = slice(start, end)
-    freq_slices[seq_dim] = slice(start, end)
+        xq_sp = xq[:, start:end]
+        xk_sp = xk[:, start:end]
+        freqs_sp = freqs_cis[:, start:end]
 
-    # extract local chunks
-    xq_chunk = xq_ori[tuple(x_slices)]  # [B, chunk, 1, D]
-    xk_chunk = xk_ori[tuple(x_slices)]
-    f_chunk = freqs_full[tuple(freq_slices)]  # [B, chunk, 1, D//2, 2, 2]
+        xq_out_sp, xk_out_sp = apply_rope(xq_sp, xk_sp, freqs_sp)
 
-    # apply RoPE on each
-    def apply_chunk(x_chunk: torch.Tensor):
-        # view last dim for complex
-        c = x_chunk.shape[-1] // 2
-        x_c = x_chunk.to(f_chunk.dtype).reshape(*x_chunk.shape[:-1], c, 1, 2)
-        # rotation: [[cos, -sin],[sin, cos]] stored in f_chunk
-        real = f_chunk[..., 0, 0] * x_c[..., 0] + f_chunk[..., 0, 1] * x_c[..., 1]
-        imag = f_chunk[..., 1, 0] * x_c[..., 0] + f_chunk[..., 1, 1] * x_c[..., 1]
-        # reconstruct flattened
-        out = torch.stack([real, imag], dim=-1).flatten(-2)
-        return out.type_as(x_chunk)
+        xq_chunks[sp_rank] = xq_out_sp
+        xk_chunks[sp_rank] = xk_out_sp
 
-    xq_ori[tuple(x_slices)] = apply_chunk(xq_chunk)
-    xk_ori[tuple(x_slices)] = apply_chunk(xk_chunk)
+    xq_out = torch.cat(xq_chunks, dim=1)
+    xk_out = torch.cat(xk_chunks, dim=1)
 
-    return xq_ori, xk_ori
+    return xq_out, xk_out
 
 
 def usp_dit_forward(
@@ -210,15 +230,18 @@ def usp_attn_forward(self, x, freqs):
     """
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-    # query, key, value function
+
     def qkv_fn(x):
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+        v = self.v(x).view(b, s, n , d)
         return q, k, v
+
 
     q, k, v = qkv_fn(x)
     q, k = apply_rope_sp(q, k, freqs)
+
+
 
     x = xFuserLongContextAttention()(
         None, query=q, key=k, value=v, window_size=self.window_size

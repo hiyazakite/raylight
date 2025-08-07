@@ -62,6 +62,10 @@ class RayWorker:
             usp_dit_forward, self.model.model.diffusion_model
         )
         print("PATCHED USP")
+
+        # Wait until every worker get patched
+        if dist.is_initialized():
+            dist.barrier()
         return None
 
     """
