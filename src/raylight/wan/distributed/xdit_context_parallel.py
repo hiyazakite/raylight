@@ -23,89 +23,87 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-def pad_freqs(original_tensor: torch.Tensor, target_len: int) -> torch.Tensor:
-    """
-    Pad freqs along sequence dimension to length `target_len` with identity rotations (ones on diagonal).
-
-    original_tensor: [B, L, 1, D//2, 2, 2]
-    returns: [B, target_len, 1, D//2, 2, 2]
-    """
-    B, L, _, dim_half, _, _ = original_tensor.shape
-    pad_size = target_len - L
+def pad_freqs(original_tensor, target_len):
+    b, seq_len, z, dim, a, c  = original_tensor.shape
+    pad_size = target_len - seq_len
     if pad_size <= 0:
         return original_tensor
-    # Create identity rotation matrices for padding
-    pad_shape = (B, pad_size, 1, dim_half, 2, 2)
-    padding = torch.zeros(pad_shape, dtype=original_tensor.dtype, device=original_tensor.device)
-    # set [[1,0],[0,1]] for each
-    padding[..., 0, 0] = 1
-    padding[..., 1, 1] = 1
-    return torch.cat([original_tensor, padding], dim=1)
+    padding_tensor = torch.ones(
+        b, pad_size, z, dim, a, c, dtype=original_tensor.dtype, device=original_tensor.device
+    )
+    padded_tensor = torch.cat([original_tensor, padding_tensor], dim=1)
+    return padded_tensor
 
 
-def apply_rope_sp(xq_ori: torch.Tensor, xk_ori: torch.Tensor, freqs_cis: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+def apply_rope_sp(xq, xk, freqs_cis):
     """
-    Sequence-parallel Rotary Positional Embedding on query/key tensors.
-
-    Splits the sequence dimension across GPUs using sequence-parallel rank and size,
-    applying RoPE only on the local slice and writing back to originals.
-
-    Args:
-        xq_ori, xk_ori: tensors of shape [B, L, 1, D]
-        freqs_cis:     tensor of shape [B, L, 1, D//2, 2, 2] or [L, 1, D//2, 2, 2]
-    Returns:
-        xq_ori, xk_ori: with RoPE applied in-place on local slices.
+    xq, xk:       [B, L_local, 1, D]
+    freqs_cis:    [B, L_global, 1, D/2, 2, 2] — full freq tensor
+    Returns:      RoPE-applied local xq, xk
     """
+
     sp_rank = get_sequence_parallel_rank()
     sp_size = get_sequence_parallel_world_size()
 
-    B, L, _, D = xq_ori.shape
-    # compute local slice indices (handle remainder)
-    base = L // sp_size
-    rem = L % sp_size
-    if sp_rank < rem:
-        start = sp_rank * (base + 1)
-        end = start + base + 1
-    else:
-        start = sp_rank * base + rem
-        end = start + base
+    B, L_local, _, D = xq.shape
+    L_global = L_local * sp_size
 
-    # pad freqs to full length if needed
-    if freqs_cis.dim() == 5:
-        # no batch dim
-        freqs = freqs_cis.unsqueeze(0).expand(B, -1, -1, -1, -1, -1)
-    else:
-        freqs = freqs_cis
-    freqs_full = pad_freqs(freqs, L)
+    # Ensure freqs_cis has length L_global
+    freqs_cis = pad_freqs(freqs_cis, L_global)
 
-    # prepare slices
-    seq_dim = 1
-    x_slices = [slice(None)] * xq_ori.dim()
-    freq_slices = [slice(None)] * freqs_full.dim()
-    x_slices[seq_dim] = slice(start, end)
-    freq_slices[seq_dim] = slice(start, end)
+    # Slice the correct frequency chunk for this rank
+    start = sp_rank * L_local
+    end = start + L_local
+    freqs_local = freqs_cis[:, start:end]  # [B, L_local, 1, D/2, 2, 2]
 
-    # extract local chunks
-    xq_chunk = xq_ori[tuple(x_slices)]  # [B, chunk, 1, D]
-    xk_chunk = xk_ori[tuple(x_slices)]
-    f_chunk = freqs_full[tuple(freq_slices)]  # [B, chunk, 1, D//2, 2, 2]
+    # Prepare xq/xk for RoPE (split real/imag)
+    xq_ = xq.to(dtype=freqs_local.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.to(dtype=freqs_local.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
 
-    # apply RoPE on each
-    def apply_chunk(x_chunk: torch.Tensor):
-        # view last dim for complex
-        c = x_chunk.shape[-1] // 2
-        x_c = x_chunk.to(f_chunk.dtype).reshape(*x_chunk.shape[:-1], c, 1, 2)
-        # rotation: [[cos, -sin],[sin, cos]] stored in f_chunk
-        real = f_chunk[..., 0, 0] * x_c[..., 0] + f_chunk[..., 0, 1] * x_c[..., 1]
-        imag = f_chunk[..., 1, 0] * x_c[..., 0] + f_chunk[..., 1, 1] * x_c[..., 1]
-        # reconstruct flattened
-        out = torch.stack([real, imag], dim=-1).flatten(-2)
-        return out.type_as(x_chunk)
+    # Apply RoPE using local frequencies
+    xq_out = freqs_local[..., 0] * xq_[..., 0] + freqs_local[..., 1] * xq_[..., 1]
+    xk_out = freqs_local[..., 0] * xk_[..., 0] + freqs_local[..., 1] * xk_[..., 1]
 
-    xq_ori[tuple(x_slices)] = apply_chunk(xq_chunk)
-    xk_ori[tuple(x_slices)] = apply_chunk(xk_chunk)
+    return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
 
-    return xq_ori, xk_ori
+
+
+# def apply_rope_sp(xq_ori, xk_ori, freqs_cis):
+#     """
+#     Applies RoPE on sequence-parallel chunk only.
+
+#     xq, xk: [B, L, 1, D]
+#     freqs_cis: [B, L, 1, D/2, 2, 2] or [L, 1, D/2, 2, 2]
+#     Returns: local chunk of RoPE-applied xq, xk
+#     """
+
+#     sp_rank = get_sequence_parallel_rank()
+#     sp_size = get_sequence_parallel_world_size()
+
+#     B, L, _, D = xq_ori.shape
+#     s_per_rank = L // sp_size
+#     start = sp_rank * s_per_rank
+#     end = (sp_rank + 1) * s_per_rank
+
+#     xq = xq_ori[:, start:end]
+#     xk = xk_ori[:, start:end]
+
+#     freqs_padded = pad_freqs(freqs_cis, L * sp_size)
+#     freqs_local = freqs_padded[:, start:end]
+
+#     # RoPE application
+#     xq_ = xq.to(dtype=freqs_local.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
+#     xk_ = xk.to(dtype=freqs_local.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
+
+#     xq_out = freqs_local[..., 0] * xq_[..., 0] + freqs_local[..., 1] * xq_[..., 1]
+#     xk_out = freqs_local[..., 0] * xk_[..., 0] + freqs_local[..., 1] * xk_[..., 1]
+
+#     # Write back the RoPE-applied chunk to the original tensors
+#     xq_ori[:, start:end] = xq_out.reshape_as(xq).type_as(xq_ori)
+#     xk_ori[:, start:end] = xk_out.reshape_as(xk).type_as(xk_ori)
+
+#     return xq_ori, xk_ori
+
 
 
 def usp_dit_forward(
@@ -140,6 +138,7 @@ def usp_dit_forward(
             List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
     """
     # embeddings
+
     x = self.patch_embedding(x.float()).to(x.dtype)
     grid_sizes = x.shape[2:]
     x = x.flatten(2).transpose(1, 2)
@@ -160,10 +159,15 @@ def usp_dit_forward(
             context = torch.concat([context_clip, context], dim=1)
         context_img_len = clip_fea.shape[-2]
 
+    print("before chunk")
+    print(x.size())
     # Context Parallel
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[
         get_sequence_parallel_rank()
     ]
+
+    print("after chunk")
+    print(x.size())
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -194,11 +198,14 @@ def usp_dit_forward(
     # head
     x = self.head(x, e)
 
+    print("forward")
     # Context Parallel
     x = get_sp_group().all_gather(x, dim=1)
 
+
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
+
     return x
 
 
@@ -227,4 +234,5 @@ def usp_attn_forward(self, x, freqs):
     x = x.flatten(2)
     x = self.o(x)
     return x
+
 

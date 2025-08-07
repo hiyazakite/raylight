@@ -63,9 +63,6 @@ class RayWorker:
         )
         print("PATCHED USP")
 
-        # Wait until every worker get patched
-        if dist.is_initialized():
-            dist.barrier()
         return None
 
     """
