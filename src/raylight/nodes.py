@@ -59,7 +59,6 @@ class RayInitializer:
             # Shut down so if comfy user try another workflow it will not cause
             # error
             ray.shutdown()
-
             ray.init(
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
@@ -78,6 +77,9 @@ class RayInitializer:
                     local_rank=local_rank, world_size=world_size, device_id=0, parallel_dict=self.parallel_dict
                 )
             )
+
+        for actor in actors:
+            ray.get(actor.__ray_ready__.remote())
 
         return (actors,)
 
@@ -171,9 +173,17 @@ class XFuserUNETLoader:
             model_options["dtype"] = torch.float8_e5m2
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+        parallel_dicts = ray.get([actor.get_parallel_dict.remote() for actor in ray_actors])
 
         for actor in ray_actors:
+            parallel_dict = ray.get(actor.get_parallel_dict.remote())
             actor.load_unet.remote(unet_path, model_options=model_options)
+
+            if parallel_dict["is_xdit"]:
+                actor.patch_usp.remote()
+
+            if parallel_dict["is_fsdp"]:
+                actor.patch_fsdp.remote()
 
         return (ray_actors,)
 

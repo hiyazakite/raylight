@@ -1,4 +1,5 @@
 import types
+import os
 
 import torch
 import torch.distributed as dist
@@ -33,6 +34,7 @@ class RayWorker:
 
         # TO DO, Actual error checking to determine total rank_nums is equal to world size
         self.device = torch.device(f"cuda:{self.device_id}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
         dist.init_process_group(
             "nccl",
             rank=local_rank,
@@ -87,22 +89,21 @@ class RayWorker:
             usp_dit_forward, self.model.model.diffusion_model
         )
         print("USP APPLIED")
+        return None
 
     def patch_fsdp(self):
         print("Initializing FSDP")
         shard_fn = partial(shard_model, device_id=self.device_id)
         self.model.model.diffusion_model = shard_fn(self.model.model.diffusion_model)
         print("FSDP APPLIED")
+        return None
 
     def load_unet(self, unet_path, model_options):
         self.model = comfy.sd.load_diffusion_model(
             unet_path, model_options=model_options
         )
-        if self.parallel_dict["is_xdit"]:
-            self.patch_usp()
-            if self.parallel_dict["is_fsdp"]:
-                self.patch_fsdp()
-
+        print(f"{self.model.load_device=}")
+        print(f"{self.model.offload_device=}")
         return None
 
     def load_lora(self, lora, strength_model):
