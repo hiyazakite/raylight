@@ -181,12 +181,14 @@ class RayInitializer:
 
         world_size = torch.cuda.device_count()
         try:
+            ray.shutdown()
             ray.init(
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
                 runtime_env={"py_modules": [raylight]},
             )
         except Exception as e:
+            ray.shutdown()
             ray.init(runtime_env={"py_modules": [raylight]})
             raise RuntimeError(f"Ray connection failed: {e}")
 
@@ -203,6 +205,8 @@ class RayInitializer:
                     device_id=0
                 )
             )
+
+
 
         return (actors,)
 
