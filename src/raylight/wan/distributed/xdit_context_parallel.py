@@ -140,6 +140,7 @@ def usp_dit_forward(
     # embeddings
 
     x = self.patch_embedding(x.float()).to(x.dtype)
+    #x = self.patch_embedding(x.to(next(self.patch_embedding.parameters()).dtype, copy=False)).to(x.dtype, copy=False)
     grid_sizes = x.shape[2:]
     x = x.flatten(2).transpose(1, 2)
 
@@ -149,6 +150,7 @@ def usp_dit_forward(
     )
     e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
+    # head
     # context
     context = self.text_embedding(context)
 
@@ -159,15 +161,10 @@ def usp_dit_forward(
             context = torch.concat([context_clip, context], dim=1)
         context_img_len = clip_fea.shape[-2]
 
-    print("before chunk")
-    print(x.size())
     # Context Parallel
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[
         get_sequence_parallel_rank()
     ]
-
-    print("after chunk")
-    print(x.size())
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -195,10 +192,10 @@ def usp_dit_forward(
                 x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len
             )
 
-    # head
-    x = self.head(x, e)
+    # For FSDP sake
+    x = self.head(x.to(e[0].dtype), e)
+    # x = self.head(x, e)
 
-    print("forward")
     # Context Parallel
     x = get_sp_group().all_gather(x, dim=1)
 
@@ -209,7 +206,7 @@ def usp_dit_forward(
     return x
 
 
-def usp_attn_forward(self, x, freqs):
+def usp_attn_forward(self, x, freqs, dtype=torch.bfloat16):
     r"""
     Args:
         x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -234,5 +231,3 @@ def usp_attn_forward(self, x, freqs):
     x = x.flatten(2)
     x = self.o(x)
     return x
-
-

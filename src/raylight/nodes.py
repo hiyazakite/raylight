@@ -35,11 +35,12 @@ class RayWorker:
 
         # TO DO, Actual error checking to determine total rank_nums is equal to world size
 
+        self.device = torch.device(f"cuda:{self.device_id}")
         dist.init_process_group(
             "nccl",
             rank=local_rank,
             world_size=self.world_size,
-            device_id=self.device_id,
+            device_id=self.device,
         )
         init_distributed_environment(
             rank=dist.get_rank(), world_size=dist.get_world_size())
@@ -47,7 +48,7 @@ class RayWorker:
         initialize_model_parallel(
             sequence_parallel_degree=dist.get_world_size(),
             ring_degree=1,
-            ulysses_degree=2,
+            ulysses_degree=1,
         )
     """
     Just Placeholder for now, since without USP it is just
