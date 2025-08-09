@@ -10,6 +10,9 @@ import folder_paths
 from comfy import sd, sample, utils
 
 from .wan.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
+from .wan.distributed.fsdp import shard_model
+
+from functools import partial
 
 import raylight
 
@@ -19,20 +22,18 @@ from xfuser.core.distributed import (
 
 
 class RayWorker:
-    def __init__(self, local_rank, world_size):
+    def __init__(self, local_rank, world_size, device_id):
         self.model = None
         self.model_type = None
         self.local_rank = local_rank
         self.world_size = world_size
-        # Unused
-        self.device_id = None
-        self.decode_type = None
-        self.decode_args = None
+        self.device_id = device_id
+
         self.use_fsdp = None
-        self.use_xdit = None
         self.ulysses_degree = None
         self.ring_degree = None
-        self.cfg_parallel = None
+
+        # TO DO, Actual error checking to determine total rank_nums is equal to world size
 
         dist.init_process_group(
             "nccl",
@@ -64,6 +65,13 @@ class RayWorker:
         print("PATCHED USP")
 
         return None
+
+    def patch_fsdp(self):
+        print("Initializing FSDP")
+        shard_fn = partial(shard_model, device_id=self.device_id)
+        self.model.model.diffusion_model = shard_fn(self.model.model.diffusion_model)
+        print("FSDP APPLIED")
+
 
     """
     instance_RayWorker.load_unet.remote(*args, **kwargs)
@@ -190,7 +198,8 @@ class RayInitializer:
                     name=f"RayWorker:{local_rank}"
                 ).remote(
                     local_rank=local_rank,
-                    world_size=world_size
+                    world_size=world_size,
+                    device_id=0
                 )
             )
 
@@ -358,6 +367,10 @@ class XFuserKSamplerAdvanced:
         # TEST USP
         for actor in ray_actors:
             actor.patch_usp.remote()
+
+        # TEST FSDP
+        for actor in ray_actors:
+            actor.patch_fsdp.remote()
 
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
