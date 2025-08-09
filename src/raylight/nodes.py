@@ -173,14 +173,7 @@ class XFuserUNETLoader:
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
         for actor in ray_actors:
-            parallel_dict = ray.get(actor.get_parallel_dict.remote())
             actor.load_unet.remote(unet_path, model_options=model_options)
-
-            if parallel_dict["is_xdit"]:
-                actor.patch_usp.remote()
-
-            if parallel_dict["is_fsdp"]:
-                actor.patch_fsdp.remote()
 
         return (ray_actors,)
 
