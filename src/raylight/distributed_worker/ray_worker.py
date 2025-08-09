@@ -4,13 +4,13 @@ import torch
 import torch.distributed as dist
 import comfy
 
+# Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
 
 from ..wan.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
 from ..wan.distributed.fsdp import shard_model
 
 from ..distributed_worker import context_parallel as cp
-from ..distributed_worker.globals import is_use_xdit, get_usp_config
 
 from functools import partial
 
@@ -22,16 +22,14 @@ from xfuser.core.distributed import (
 
 
 class RayWorker:
-    def __init__(self, local_rank, world_size, device_id):
+    def __init__(self, local_rank, world_size, device_id, parallel_dict):
         self.model = None
         self.model_type = None
         self.local_rank = local_rank
         self.world_size = world_size
         self.device_id = device_id
 
-        self.use_fsdp = None
-        self.ulysses_degree = None
-        self.ring_degree = None
+        self.parallel_dict = parallel_dict
 
         # TO DO, Actual error checking to determine total rank_nums is equal to world size
         self.device = torch.device(f"cuda:{self.device_id}")
@@ -41,13 +39,19 @@ class RayWorker:
             world_size=self.world_size,
             device_id=self.device,
         )
+        pg = dist.group.WORLD
+        cp.set_cp_group(pg, list(range(world_size)), local_rank)
 
         # From mochi-xdit, xdit, pipelines.py
-        if is_use_xdit():
+        # I dont use globals since it does not work as module
+        if self.parallel_dict["is_xdit"]:
             cp_rank, cp_size = cp.get_cp_rank_size()
+            ulysses_degree = self.parallel_dict["ulysses_degree"]
+            ring_degree = self.parallel_dict["ring_degree"]
 
-            ulysses_degree, ring_degree, cfg_parallel = get_usp_config()
+            print(f"XDiT is enable, with {ring_degree=}, {ulysses_degree=}")
             init_distributed_environment(rank=cp_rank, world_size=cp_size)
+
             if ulysses_degree is None and ring_degree is None:
                 print(f"No usp config, use default config: ulysses_degree={cp_size}, ring_degree=1, CFG parallel false")
                 initialize_model_parallel(
@@ -66,6 +70,12 @@ class RayWorker:
                     ring_degree=ring_degree,
                     ulysses_degree=ulysses_degree,
                 )
+
+    def get_parallel_dict(self):
+        return self.parallel_dict
+
+    def set_parallel_dict(self, parallel_dict):
+        self.parallel_dict = parallel_dict
 
     def patch_usp(self):
         print("Initializing USP")

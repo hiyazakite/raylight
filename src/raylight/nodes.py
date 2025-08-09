@@ -9,7 +9,6 @@ import folder_paths
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
 from .distributed_worker.ray_worker import RayWorker
-from .distributed_worker.globals import set_use_xdit, set_usp_config
 
 
 class RayInitializer:
@@ -19,8 +18,9 @@ class RayInitializer:
             "required": {
                 "ray_cluster_address": ("STRING", {"default": "local"}),
                 "ray_cluster_namespace": ("STRING", {"default": "default"}),
-                "ulysses_degree": ("INT", {"default": 2, "tooltip": "degree of Ulyssess attention"}),
+                "ulysses_degree": ("INT", {"default": 2, "tooltip": "degree of Ulyssess attention, prefer this than ring"}),
                 "ring_degree": ("INT", {"default": 1, "tooltip": "degree of ring attention"}),
+                "FSDP": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -29,19 +29,32 @@ class RayInitializer:
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
-    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, ring_degree):
+    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, ring_degree, FSDP):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be edited
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
+        self.parallel_dict = dict()
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
-        if ulysses_degree > 1 or ring_degree > 1:
-            set_use_xdit(True)
-            set_usp_config(ulysses_degree, ring_degree, cfg_parallel=False)
-
         world_size = torch.cuda.device_count()
+        if ulysses_degree * ring_degree != world_size:
+            raise ValueError(f"ERROR, num_gpus: {world_size}, is not match with {ulysses_degree=} * {ring_degree=}")
+
+        if ulysses_degree > 1 or ring_degree > 1:
+            self.parallel_dict["is_xdit"] = True
+            self.parallel_dict["ulysses_degree"] = ulysses_degree
+            self.parallel_dict["ring_degree"] = ulysses_degree
+            if FSDP:
+                self.parallel_dict["is_fsdp"] = True
+            else:
+                self.parallel_dict["is_fsdp"] = False
+                self.parallel_dict["is_dumb_parallel"] = True
+        else:
+            self.parallel_dict["is_xdit"] = False
+            self.parallel_dict["is_fsdp"] = False
+
         try:
             # Shut down so if comfy user try another workflow it will not cause
             # error
@@ -62,7 +75,7 @@ class RayInitializer:
         for local_rank in range(world_size):
             actors.append(
                 RemoteActor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                    local_rank=local_rank, world_size=world_size, device_id=0
+                    local_rank=local_rank, world_size=world_size, device_id=0, parallel_dict=self.parallel_dict
                 )
             )
 
@@ -160,7 +173,15 @@ class XFuserUNETLoader:
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
         for actor in ray_actors:
+            parallel_dict = ray.get(actor.get_parallel_dict.remote())
             actor.load_unet.remote(unet_path, model_options=model_options)
+
+            if parallel_dict["is_xdit"]:
+                actor.patch_usp.remote()
+
+            if parallel_dict["is_fsdp"]:
+                actor.patch_fsdp.remote()
+
         return (ray_actors,)
 
 
@@ -230,14 +251,6 @@ class XFuserKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
     ):
-        # TEST USP
-        for actor in ray_actors:
-            actor.patch_usp.remote()
-
-        # TEST FSDP
-        for actor in ray_actors:
-            actor.patch_fsdp.remote()
-
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
