@@ -39,13 +39,13 @@ class RayInitializer:
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = torch.cuda.device_count()
-        if ulysses_degree * ring_degree != world_size:
-            raise ValueError(f"ERROR, num_gpus: {world_size}, is not match with {ulysses_degree=} * {ring_degree=}")
+        if (ulysses_degree * ring_degree) > world_size:
+            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} * {ring_degree=}")
 
         if ulysses_degree > 1 or ring_degree > 1:
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
-            self.parallel_dict["ring_degree"] = ulysses_degree
+            self.parallel_dict["ring_degree"] = ring_degree
             if FSDP:
                 self.parallel_dict["is_fsdp"] = True
             else:
