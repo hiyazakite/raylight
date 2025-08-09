@@ -1,160 +1,15 @@
-import types
+import raylight
 import os
 
 import ray
 import torch
-import torch.distributed as dist
 import comfy
 import folder_paths
 
+# Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
-
-from .wan.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
-from .wan.distributed.fsdp import shard_model
-
-from functools import partial
-
-import raylight
-
-from xfuser.core.distributed import (
-            init_distributed_environment,
-            initialize_model_parallel,)
-
-
-class RayWorker:
-    def __init__(self, local_rank, world_size, device_id):
-        self.model = None
-        self.model_type = None
-        self.local_rank = local_rank
-        self.world_size = world_size
-        self.device_id = device_id
-
-        self.use_fsdp = None
-        self.ulysses_degree = None
-        self.ring_degree = None
-
-        # TO DO, Actual error checking to determine total rank_nums is equal to world size
-
-        self.device = torch.device(f"cuda:{self.device_id}")
-        dist.init_process_group(
-            "nccl",
-            rank=local_rank,
-            world_size=self.world_size,
-            device_id=self.device,
-        )
-        init_distributed_environment(
-            rank=dist.get_rank(), world_size=dist.get_world_size())
-
-        initialize_model_parallel(
-            sequence_parallel_degree=dist.get_world_size(),
-            ring_degree=1,
-            ulysses_degree=1,
-        )
-    """
-    Just Placeholder for now, since without USP it is just
-    using both gpu to sample different latent
-    """
-
-    def patch_usp(self):
-        print("Initializing USP")
-        for block in self.model.model.diffusion_model.blocks:
-            block.self_attn.forward = types.MethodType(
-                usp_attn_forward, block.self_attn)
-        self.model.model.diffusion_model.forward_orig = types.MethodType(
-            usp_dit_forward, self.model.model.diffusion_model
-        )
-        print("PATCHED USP")
-
-        return None
-
-    def patch_fsdp(self):
-        print("Initializing FSDP")
-        shard_fn = partial(shard_model, device_id=self.device_id)
-        self.model.model.diffusion_model = shard_fn(self.model.model.diffusion_model)
-        print("FSDP APPLIED")
-
-
-    """
-    instance_RayWorker.load_unet.remote(*args, **kwargs)
-    """
-
-    def load_unet(self, unet_path, model_options):
-        self.model = comfy.sd.load_diffusion_model(
-            unet_path, model_options=model_options
-        )
-        return self.model.size
-
-    """
-    instance_RayWorker.load_lora.remote(*args, **kwargs)
-    """
-
-    def load_lora(self, lora, strength_model):
-        self.model = comfy.sd.load_lora_for_models(
-            self.model, None, lora, strength_model, 0
-        )[0]
-        return self.model
-
-    """
-    instance_RayWorker.common_ksampler.remote(*args, **kwargs)
-    """
-
-    def common_ksampler(
-        self,
-        seed,
-        steps,
-        cfg,
-        sampler_name,
-        scheduler,
-        positive,
-        negative,
-        latent,
-        denoise=1.0,
-        disable_noise=False,
-        start_step=None,
-        last_step=None,
-        force_full_denoise=False,
-    ):
-        latent_image = latent["samples"]
-        latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
-
-        if disable_noise:
-            noise = torch.zeros(
-                latent_image.size(),
-                dtype=latent_image.dtype,
-                layout=latent_image.layout,
-                device="cpu",
-            )
-        else:
-            batch_inds = latent["batch_index"] if "batch_index" in latent else None
-            noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
-
-        noise_mask = None
-        if "noise_mask" in latent:
-            noise_mask = latent["noise_mask"]
-
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-        samples = comfy.sample.sample(
-            self.model,
-            noise,
-            steps,
-            cfg,
-            sampler_name,
-            scheduler,
-            positive,
-            negative,
-            latent_image,
-            denoise=denoise,
-            disable_noise=disable_noise,
-            start_step=start_step,
-            last_step=last_step,
-            force_full_denoise=force_full_denoise,
-            noise_mask=noise_mask,
-            disable_pbar=disable_pbar,
-            seed=seed,
-        )
-        out = latent.copy()
-        out["samples"] = samples
-        return (out,)
+from .distributed_worker.ray_worker import RayWorker
+from .distributed_worker.globals import set_use_xdit, set_usp_config
 
 
 class RayInitializer:
@@ -164,6 +19,8 @@ class RayInitializer:
             "required": {
                 "ray_cluster_address": ("STRING", {"default": "local"}),
                 "ray_cluster_namespace": ("STRING", {"default": "default"}),
+                "ulysses_degree": ("INT", {"default": 2, "tooltip": "degree of Ulyssess attention"}),
+                "ring_degree": ("INT", {"default": 1, "tooltip": "degree of ring attention"}),
             }
         }
 
@@ -172,16 +29,24 @@ class RayInitializer:
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
-    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace):
+    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, ring_degree):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be edited
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 
+        # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
+        if ulysses_degree > 1 or ring_degree > 1:
+            set_use_xdit(True)
+            set_usp_config(ulysses_degree, ring_degree, cfg_parallel=False)
+
         world_size = torch.cuda.device_count()
         try:
+            # Shut down so if comfy user try another workflow it will not cause
+            # error
             ray.shutdown()
+
             ray.init(
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
@@ -196,17 +61,10 @@ class RayInitializer:
         actors = []
         for local_rank in range(world_size):
             actors.append(
-                RemoteActor.options(
-                    num_gpus=1,
-                    name=f"RayWorker:{local_rank}"
-                ).remote(
-                    local_rank=local_rank,
-                    world_size=world_size,
-                    device_id=0
+                RemoteActor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+                    local_rank=local_rank, world_size=world_size, device_id=0
                 )
             )
-
-
 
         return (actors,)
 
@@ -283,8 +141,8 @@ class XFuserUNETLoader:
             }
         }
 
-    RETURN_TYPES = ("RAY_ACTORS", "STRING")
-    RETURN_NAMES = ("ray_actors", "model_size")
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
     FUNCTION = "load_ray_unet"
 
     CATEGORY = "Raylight"
@@ -347,7 +205,10 @@ class XFuserKSamplerAdvanced:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT",)
+    RETURN_TYPES = (
+        "LATENT",
+        "LATENT",
+    )
     FUNCTION = "ray_sample"
 
     CATEGORY = "Raylight"
@@ -386,21 +247,23 @@ class XFuserKSamplerAdvanced:
 
         final_sample = []
         for additional_noise, actor in enumerate(ray_actors):
-            final_sample.append(actor.common_ksampler.remote(
-                noise_seed,
-                steps,
-                cfg,
-                sampler_name,
-                scheduler,
-                positive,
-                negative,
-                latent_image,
-                denoise=denoise,
-                disable_noise=disable_noise,
-                start_step=start_at_step,
-                last_step=end_at_step,
-                force_full_denoise=force_full_denoise,
-            ))
+            final_sample.append(
+                actor.common_ksampler.remote(
+                    noise_seed,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    positive,
+                    negative,
+                    latent_image,
+                    denoise=denoise,
+                    disable_noise=disable_noise,
+                    start_step=start_at_step,
+                    last_step=end_at_step,
+                    force_full_denoise=force_full_denoise,
+                )
+            )
 
         return (ray.get(final_sample[0])[0],)
 
