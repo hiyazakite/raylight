@@ -173,15 +173,15 @@ class XFuserUNETLoader:
             model_options["dtype"] = torch.float8_e5m2
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
-        parallel_dicts = ray.get([actor.get_parallel_dict.remote() for actor in ray_actors])
 
         for actor in ray_actors:
             parallel_dict = ray.get(actor.get_parallel_dict.remote())
-            actor.load_unet.remote(unet_path, model_options=model_options)
+            ray.get(actor.load_unet.remote(unet_path, model_options=model_options))
 
             if parallel_dict["is_xdit"]:
                 actor.patch_usp.remote()
 
+            # THIS IS ACTUALLY BAD, komikndr, loading FSDP twice!!!!
             if parallel_dict["is_fsdp"]:
                 actor.patch_fsdp.remote()
 

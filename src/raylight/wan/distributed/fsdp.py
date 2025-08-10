@@ -19,6 +19,7 @@ def shard_model(
 ):
     """Wrap only model.blocks in FSDP, avoiding dtype conflicts."""
     for i, block in enumerate(model.blocks):
+        print("SHARDING THE MODEL....")
         model.blocks[i] = FSDP(
             module=block,
             process_group=process_group,

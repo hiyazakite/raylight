@@ -20,6 +20,21 @@ from xfuser.core.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+import comfy.patcher_extension as pe
+
+def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
+    print(f"[RANK] in fsdp_inject_callback: device_to={device_to}, full_load={full_load}")
+
+    import torch.distributed as dist
+    if dist.is_initialized() and dist.get_rank() == 0:
+        print(f"[Rank 0] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
+        model_patcher.model.diffusion_model = shard_model(
+            model_patcher.model.diffusion_model,
+            device_id=torch.cuda.current_device()
+        )
+    if dist.is_initialized():
+        dist.barrier()
+
 
 
 class RayWorker:
@@ -97,6 +112,14 @@ class RayWorker:
         self.model.model.diffusion_model = shard_fn(self.model.model.diffusion_model)
         print("FSDP APPLIED")
         return None
+
+    def patch_fsdp(self):
+        self.model.add_callback(
+            pe.CallbacksMP.ON_LOAD,
+            fsdp_inject_callback,
+        )
+        print("FSDP injection callback registered")
+        print(f"{pe.get_all_callbacks(pe.CallbacksMP.ON_LOAD, {})=}")
 
     def load_unet(self, unet_path, model_options):
         self.model = comfy.sd.load_diffusion_model(
