@@ -7,6 +7,8 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 
 
+from torch.distributed.fsdp import fully_shard
+
 def shard_model(
     model,
     device_id,
@@ -32,5 +34,19 @@ def shard_model(
             device_id=device_id,
             sync_module_states=sync_module_states
         )
+
+    return model
+
+
+def shard_model_fsdp2(
+    model,
+    device_id,
+    process_group=None,
+    sync_module_states=True,
+):
+    for block in model.blocks:
+        print("SHARDING THE MODEL....")
+        fully_shard(block)
+    fully_shard(model)
 
     return model

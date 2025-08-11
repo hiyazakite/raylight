@@ -1,5 +1,6 @@
 import types
 import os
+import gc
 
 import torch
 import torch.distributed as dist
@@ -8,7 +9,6 @@ import comfy
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
 
-from ..wan.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
 from ..wan.distributed.fsdp import shard_model
 
 from ..distributed_worker import context_parallel as cp
@@ -21,6 +21,9 @@ from xfuser.core.distributed import (
     initialize_model_parallel,
 )
 import comfy.patcher_extension as pe
+
+from comfy import model_base
+
 
 def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
     print(f"[RANK] in fsdp_inject_callback: device_to={device_to}, full_load={full_load}")
@@ -35,6 +38,36 @@ def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_p
     if dist.is_initialized():
         dist.barrier()
 
+
+def usp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
+    base_model = model_patcher.model
+
+    if isinstance(base_model, model_base.WAN21) or isinstance(base_model, model_base.WAN22):
+        from ..wan.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
+        model = base_model.diffusion_model
+        print("Initializing USP")
+        for block in model.blocks:
+            block.self_attn.forward = types.MethodType(
+                usp_attn_forward, block.self_attn
+            )
+        model.forward_orig = types.MethodType(
+            usp_dit_forward, model
+        )
+        comfy.model_management.soft_empty_cache()
+        gc.collect
+        print("USP APPLIED")
+
+    # PlaceHolder For now
+    elif isinstance(base_model, model_base.Flux):
+        from ..flux.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
+        model = base_model.diffusion_model
+
+    elif isinstance(base_model, model_base.QwenImageTransformer2DModel):
+        from ..qwen_image.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
+        model = base_model.diffusion_model
+
+    else:
+        print(f"Model: {type(base_model).__name__}, is not yet supported for USP Parallelism")
 
 
 class RayWorker:
@@ -94,17 +127,24 @@ class RayWorker:
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
 
-    def patch_usp(self):
-        print("Initializing USP")
-        for block in self.model.model.diffusion_model.blocks:
-            block.self_attn.forward = types.MethodType(
-                usp_attn_forward, block.self_attn
-            )
-        self.model.model.diffusion_model.forward_orig = types.MethodType(
-            usp_dit_forward, self.model.model.diffusion_model
+#    def patch_usp(self):
+#        print("Initializing USP")
+#        for block in self.model.model.diffusion_model.blocks:
+#            block.self_attn.forward = types.MethodType(
+#                usp_attn_forward, block.self_attn
+#            )
+#        self.model.model.diffusion_model.forward_orig = types.MethodType(
+#            usp_dit_forward, self.model.model.diffusion_model
+#        )
+#        print("USP APPLIED")
+#        return None
+
+    def patch_usp_callback(self):
+        self.model.add_callback(
+            pe.CallbacksMP.ON_LOAD,
+            usp_inject_callback,
         )
-        print("USP APPLIED")
-        return None
+        print("USP injection registered")
 
     def patch_fsdp(self):
         print("Initializing FSDP")
