@@ -21,6 +21,8 @@ class RayInitializer:
                 "ulysses_degree": ("INT", {"default": 2, "tooltip": "degree of Ulyssess attention, prefer this than ring"}),
                 "ring_degree": ("INT", {"default": 1, "tooltip": "degree of ring attention"}),
                 "FSDP": ("BOOLEAN", {"default": False}),
+                "DEBUG_USP": ("BOOLEAN", {"default": False}),
+                "DEBUG_FSDP": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -29,7 +31,7 @@ class RayInitializer:
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
-    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, ring_degree, FSDP):
+    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, ring_degree, FSDP, DEBUG_USP, DEBUG_FSDP):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be edited
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
@@ -54,6 +56,15 @@ class RayInitializer:
         else:
             self.parallel_dict["is_xdit"] = False
             self.parallel_dict["is_fsdp"] = False
+
+        # DEBUG FOR SINGLE GPU
+        if DEBUG_USP:
+            self.parallel_dict["is_xdit"] = True
+            self.parallel_dict["ulysses_degree"] = 1
+            self.parallel_dict["ring_degree"] = 1
+
+        if DEBUG_FSDP:
+            self.parallel_dict["is_fsdp"] = True
 
         try:
             # Shut down so if comfy user try another workflow it will not cause

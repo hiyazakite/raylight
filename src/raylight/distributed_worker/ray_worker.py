@@ -12,6 +12,7 @@ from comfy import sd, sample, utils
 from ..wan.distributed.fsdp import shard_model
 
 from ..distributed_worker import context_parallel as cp
+from ..distributed_worker.meta_loader import load_diffusion_model_meta
 
 from functools import partial
 
@@ -24,6 +25,8 @@ import comfy.patcher_extension as pe
 
 from comfy import model_base
 
+
+from ..wan.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
 
 def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
     print(f"[RANK] in fsdp_inject_callback: device_to={device_to}, full_load={full_load}")
@@ -53,9 +56,6 @@ def usp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_pa
         model.forward_orig = types.MethodType(
             usp_dit_forward, model
         )
-        comfy.model_management.soft_empty_cache()
-        gc.collect
-        print("USP APPLIED")
 
     # PlaceHolder For now
     elif isinstance(base_model, model_base.Flux):
@@ -139,7 +139,7 @@ class RayWorker:
 #        print("USP APPLIED")
 #        return None
 
-    def patch_usp_callback(self):
+    def patch_usp(self):
         self.model.add_callback(
             pe.CallbacksMP.ON_LOAD,
             usp_inject_callback,
@@ -155,16 +155,17 @@ class RayWorker:
 
     def patch_fsdp(self):
         self.model.add_callback(
-            pe.CallbacksMP.ON_LOAD,
+            pe.CallbacksMP.ON_DETACH,
             fsdp_inject_callback,
         )
         print("FSDP injection callback registered")
         print(f"{pe.get_all_callbacks(pe.CallbacksMP.ON_LOAD, {})=}")
 
     def load_unet(self, unet_path, model_options):
-        self.model = comfy.sd.load_diffusion_model(
+        self.model = load_diffusion_model_meta(
             unet_path, model_options=model_options
         )
+
         print(f"{self.model.load_device=}")
         print(f"{self.model.offload_device=}")
         return None

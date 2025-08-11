@@ -7,6 +7,22 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup.
 
 
 
+DEBUG Notes
+T5+VAE		    7.5
+ModelBF16	    2.8
+
+832x480x65
+Non USP Ray 	15.2
+Normal 		    14
+USP Ray		    18
+
+
+16x16x1
+Non USP Ray	    11.2
+Normal		    10.2
+USP Ray         15.1
+
+
 ## Quickstart
 
 1. Install [ComfyUI](https://docs.comfy.org/get_started).
@@ -48,7 +64,7 @@ If you wish to share this custom node with others in the community, you can publ
 
 You need to make an account on https://registry.comfy.org and create an API key token.
 
-- [ ] Go to the [registry](https://registry.comfy.org). Login and create a publisher id (everything after the `@` sign on your registry profile). 
+- [ ] Go to the [registry](https://registry.comfy.org). Login and create a publisher id (everything after the `@` sign on your registry profile).
 - [ ] Add the publisher id into the pyproject.toml file.
 - [ ] Create an api key on the Registry for publishing from Github. [Instructions](https://docs.comfy.org/registry/publishing#create-an-api-key-for-publishing).
 - [ ] Add it to your Github Repository Secrets as `REGISTRY_ACCESS_TOKEN`.
