@@ -161,14 +161,12 @@ class RayWorker:
         print("FSDP injection callback registered")
         print(f"{pe.get_all_callbacks(pe.CallbacksMP.ON_LOAD, {})=}")
 
-    def load_unet(self, unet_path, model_options):
-        self.model = load_diffusion_model_meta(
-            unet_path, model_options=model_options
-        )
+    def set_model(self, model):
+        model.clone()
+        self.model = model
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
 
-        print(f"{self.model.load_device=}")
-        print(f"{self.model.offload_device=}")
-        return None
 
     def load_lora(self, lora, strength_model):
         self.model = comfy.sd.load_lora_for_models(

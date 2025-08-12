@@ -1,5 +1,6 @@
 import raylight
 import os
+import gc
 
 import ray
 import torch
@@ -295,11 +296,34 @@ class XFuserKSamplerAdvanced:
         return (ray.get(final_sample[0])[0],)
 
 
+class RegisterModelToRay:
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "ray_actors": (
+                    "RAY_ACTORS",
+                    {"tooltip": "Ray Actor to submit the model into"})
+            },
+        }
+    RETURN_TYPES = ("MODEL",)
+    CATEGORY = "Raylight"
+    FUNCTION = "register_model"
+
+    def register_model(self, model, ray_actors):
+        for actor in ray_actors:
+            ray.get(actor.set_model(model))
+
+
+
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "XFuserUNETLoader": XFuserUNETLoader,
     "XFuserLoraLoaderModelOnly": XFuserLoraLoaderModelOnly,
     "RayInitializer": RayInitializer,
+    "RegisterModelToRay": RegisterModelToRay
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -307,4 +331,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserUNETLoader": "Load Diffusion Model (Ray)",
     "XFuserLoraLoaderModelOnly": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
+    "RegisterModelToRay": "Model to Ray Workers"
 }
