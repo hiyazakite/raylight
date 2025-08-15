@@ -79,18 +79,25 @@ class RayWorker:
         self.device_id = device_id
 
         self.parallel_dict = parallel_dict
-
-        # TO DO, Actual error checking to determine total rank_nums is equal to world size
         self.device = torch.device(f"cuda:{self.device_id}")
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
-        dist.init_process_group(
-            "nccl",
-            rank=local_rank,
-            world_size=self.world_size,
-            device_id=self.device,
-        )
-        pg = dist.group.WORLD
-        cp.set_cp_group(pg, list(range(world_size)), local_rank)
+
+        if self.model is not None:
+            self.is_model_load = True
+        else:
+            self.is_model_load = False
+
+        if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
+            dist.init_process_group(
+                "nccl",
+                rank=local_rank,
+                world_size=self.world_size,
+                device_id=self.device,
+            )
+            pg = dist.group.WORLD
+            cp.set_cp_group(pg, list(range(world_size)), local_rank)
+        else:
+            print(f"Running Ray in normal seperate sampler with: {world_size} number of workers")
 
         # From mochi-xdit, xdit, pipelines.py
         # I dont use globals since it does not work as module
@@ -99,7 +106,7 @@ class RayWorker:
             ulysses_degree = self.parallel_dict["ulysses_degree"]
             ring_degree = self.parallel_dict["ring_degree"]
 
-            print(f"XDiT is enable, with {ring_degree=}, {ulysses_degree=}")
+            print("XDiT is enable")
             init_distributed_environment(rank=cp_rank, world_size=cp_size)
 
             if ulysses_degree is None and ring_degree is None:
@@ -127,6 +134,12 @@ class RayWorker:
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
 
+    def get_local_rank(self):
+        return self.local_rank
+
+    def is_model_loaded(self):
+        return self.is_model_load
+
 #    def patch_usp(self):
 #        print("Initializing USP")
 #        for block in self.model.model.diffusion_model.blocks:
@@ -138,6 +151,12 @@ class RayWorker:
 #        )
 #        print("USP APPLIED")
 #        return None
+
+    def delete_model(self):
+        del self.model
+        self.model = None
+        comfy.model_management.unload()
+        gc.collect()
 
     def patch_usp(self):
         self.model.add_callback(
@@ -161,18 +180,20 @@ class RayWorker:
         print("FSDP injection callback registered")
         print(f"{pe.get_all_callbacks(pe.CallbacksMP.ON_LOAD, {})=}")
 
+    def load_unet(self, unet_path, model_options):
+        self.model = load_diffusion_model_meta(
+            unet_path, model_options=model_options
+        )
+
+        print(f"{self.model.load_device=}")
+        print(f"{self.model.offload_device=}")
+        return None
+
     def set_model(self, model):
         model.clone()
         self.model = model
         comfy.model_management.soft_empty_cache()
         gc.collect()
-
-
-    def load_lora(self, lora, strength_model):
-        self.model = comfy.sd.load_lora_for_models(
-            self.model, None, lora, strength_model, 0
-        )[0]
-        return self.model
 
     def common_ksampler(
         self,

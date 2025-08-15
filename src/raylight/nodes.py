@@ -34,7 +34,7 @@ class RayInitializer:
 
     def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, ring_degree, FSDP, DEBUG_USP, DEBUG_FSDP):
         # THIS IS PYTORCH DIST ADDRESS
-        # (TODO) Change so it can be edited
+        # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
@@ -96,62 +96,6 @@ class RayInitializer:
         return (actors,)
 
 
-class XFuserLoraLoaderModelOnly:
-    def __init__(self):
-        self.loaded_lora = None
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "ray_actors": (
-                    "RAY_ACTORS",
-                    {"tooltip": "Ray Actor to submit the model into"},
-                ),
-                "lora_name": (
-                    folder_paths.get_filename_list("loras"),
-                    {"tooltip": "The name of the LoRA."},
-                ),
-                "strength_model": (
-                    "FLOAT",
-                    {
-                        "default": 1.0,
-                        "min": -100.0,
-                        "max": 100.0,
-                        "step": 0.01,
-                        "tooltip": "How strongly to modify the diffusion model. This value can be negative.",
-                    },
-                ),
-            }
-        }
-
-    RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
-    FUNCTION = "load_lora"
-    CATEGORY = "Raylight"
-
-    def load_lora(self, ray_actors, lora_name, strength_model):
-        if strength_model == 0:
-            return (ray_actors,)
-
-        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        lora = None
-        if self.loaded_lora is not None:
-            if self.loaded_lora[0] == lora_path:
-                lora = self.loaded_lora[1]
-            else:
-                self.loaded_lora = None
-
-        if lora is None:
-            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-            self.loaded_lora = (lora_path, lora)
-
-        for actor in ray_actors:
-            actor.load_lora.remote(lora, strength_model)
-
-        return (ray_actors,)
-
-
 class XFuserUNETLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -193,7 +137,6 @@ class XFuserUNETLoader:
             if parallel_dict["is_xdit"]:
                 actor.patch_usp.remote()
 
-            # THIS IS ACTUALLY BAD, komikndr, loading FSDP twice!!!!
             if parallel_dict["is_fsdp"]:
                 actor.patch_fsdp.remote()
 
@@ -297,7 +240,6 @@ class XFuserKSamplerAdvanced:
 
 
 class RegisterModelToRay:
-
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -308,20 +250,34 @@ class RegisterModelToRay:
                     {"tooltip": "Ray Actor to submit the model into"})
             },
         }
-    RETURN_TYPES = ("MODEL",)
+    RETURN_TYPES = ("RAY_ACTORS",)
     CATEGORY = "Raylight"
     FUNCTION = "register_model"
 
     def register_model(self, model, ray_actors):
+        parallel_dict = ray.get(ray_actors.get_parallel_dict)
         for actor in ray_actors:
-            ray.get(actor.set_model(model))
 
+            if parallel_dict["is_fsdp"]:
+                if ray.get(actor.get_local_rank) == 0:
+                    ray.get(actor.set_model(model))
+                else:
+                    ray.get(actor.set_model(model.model.to("meta")))
+
+                ray.get(actor.patch_fsdp.remote())
+
+            if parallel_dict["is_xdit"]:
+                if ray.get(actor.is_model_load) is False:
+                    ray.get(actor.set_model(model))
+
+                ray.get(actor.patch_usp.remote())
+
+        return (ray_actors,)
 
 
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "XFuserUNETLoader": XFuserUNETLoader,
-    "XFuserLoraLoaderModelOnly": XFuserLoraLoaderModelOnly,
     "RayInitializer": RayInitializer,
     "RegisterModelToRay": RegisterModelToRay
 }
@@ -329,7 +285,6 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserKSamplerAdvanced": "XFuser KSampler Advanced",
     "XFuserUNETLoader": "Load Diffusion Model (Ray)",
-    "XFuserLoraLoaderModelOnly": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
     "RegisterModelToRay": "Model to Ray Workers"
 }
