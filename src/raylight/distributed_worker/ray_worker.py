@@ -192,8 +192,7 @@ class RayWorker:
     def set_model(self, model):
         model.clone()
         self.model = model
-        comfy.model_management.soft_empty_cache()
-        gc.collect()
+        return None
 
     def common_ksampler(
         self,

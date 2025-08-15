@@ -187,6 +187,8 @@ class XFuserKSamplerAdvanced:
     RETURN_TYPES = (
         "LATENT",
         "LATENT",
+        "LATENT",
+        "LATENT",
     )
     FUNCTION = "ray_sample"
 
@@ -216,27 +218,27 @@ class XFuserKSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
 
-        final_sample = []
-        for additional_noise, actor in enumerate(ray_actors):
-            final_sample.append(
-                actor.common_ksampler.remote(
-                    noise_seed,
-                    steps,
-                    cfg,
-                    sampler_name,
-                    scheduler,
-                    positive,
-                    negative,
-                    latent_image,
-                    denoise=denoise,
-                    disable_noise=disable_noise,
-                    start_step=start_at_step,
-                    last_step=end_at_step,
-                    force_full_denoise=force_full_denoise,
-                )
+        futures = [
+            actor.common_ksampler.remote(
+                noise_seed,
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                positive,
+                negative,
+                latent_image,
+                denoise=denoise,
+                disable_noise=disable_noise,
+                start_step=start_at_step,
+                last_step=end_at_step,
+                force_full_denoise=force_full_denoise,
             )
+            for actor in ray_actors
+        ]
 
-        return (ray.get(final_sample[0])[0],)
+        results = ray.get(futures)
+        return tuple(result[0] for result in results[0:4])
 
 
 class RegisterModelToRay:
@@ -251,26 +253,27 @@ class RegisterModelToRay:
             },
         }
     RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
     CATEGORY = "Raylight"
     FUNCTION = "register_model"
 
     def register_model(self, model, ray_actors):
-        parallel_dict = ray.get(ray_actors.get_parallel_dict)
+        # Any worker share the same parallel_dict from init
+        parallel_dict = ray.get(ray_actors[0].get_parallel_dict.remote())
         for actor in ray_actors:
 
             if parallel_dict["is_fsdp"]:
-                if ray.get(actor.get_local_rank) == 0:
-                    ray.get(actor.set_model(model))
+                if ray.get(actor.get_local_rank.remote()) == 0:
+                    ray.get(actor.set_model.remote(model))
                 else:
-                    ray.get(actor.set_model(model.model.to("meta")))
-
+                    ray.get(actor.set_model.remote(model.model.to("meta")))
                 ray.get(actor.patch_fsdp.remote())
 
-            if parallel_dict["is_xdit"]:
-                if ray.get(actor.is_model_load) is False:
-                    ray.get(actor.set_model(model))
+            elif ray.get(actor.is_model_loaded.remote()) is False:
+                ray.get(actor.set_model.remote(model))
 
-                ray.get(actor.patch_usp.remote())
+                if parallel_dict["is_xdit"]:
+                    ray.get(actor.patch_usp.remote())
 
         return (ray_actors,)
 
