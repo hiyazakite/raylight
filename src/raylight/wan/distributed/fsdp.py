@@ -20,8 +20,8 @@ def shard_model(
     sync_module_states=True,
 ):
     """Wrap only model.blocks in FSDP, avoiding dtype conflicts."""
+    print("SHARDING THE MODEL....")
     for i, block in enumerate(model.blocks):
-        print("SHARDING THE MODEL....")
         model.blocks[i] = FSDP(
             module=block,
             process_group=process_group,
@@ -34,19 +34,5 @@ def shard_model(
             device_id=device_id,
             sync_module_states=sync_module_states
         )
-
-    return model
-
-
-def shard_model_fsdp2(
-    model,
-    device_id,
-    process_group=None,
-    sync_module_states=True,
-):
-    for block in model.blocks:
-        print("SHARDING THE MODEL....")
-        fully_shard(block)
-    fully_shard(model)
 
     return model

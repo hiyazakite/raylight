@@ -38,6 +38,9 @@ def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_p
             model_patcher.model.diffusion_model,
             device_id=torch.cuda.current_device()
         )
+
+    comfy.model_management.soft_empty_cache
+    gc.collect()
     if dist.is_initialized():
         dist.barrier()
 
@@ -174,7 +177,7 @@ class RayWorker:
 
     def patch_fsdp(self):
         self.model.add_callback(
-            pe.CallbacksMP.ON_DETACH,
+            pe.CallbacksMP.ON_LOAD,
             fsdp_inject_callback,
         )
         print("FSDP injection callback registered")
@@ -192,7 +195,8 @@ class RayWorker:
     def set_model(self, model):
         model.clone()
         self.model = model
-        return None
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
 
     def common_ksampler(
         self,

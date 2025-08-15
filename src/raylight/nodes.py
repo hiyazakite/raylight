@@ -268,6 +268,8 @@ class RegisterModelToRay:
                 else:
                     ray.get(actor.set_model.remote(model.model.to("meta")))
                 ray.get(actor.patch_fsdp.remote())
+                if parallel_dict["is_xdit"]:
+                    ray.get(actor.patch_usp.remote())
 
             elif ray.get(actor.is_model_loaded.remote()) is False:
                 ray.get(actor.set_model.remote(model))
