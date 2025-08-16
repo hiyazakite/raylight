@@ -49,15 +49,15 @@ def usp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_pa
     base_model = model_patcher.model
 
     if isinstance(base_model, model_base.WAN21) or isinstance(base_model, model_base.WAN22):
-        from ..wan.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
+        from ..wan.distributed.ulysses_context_parallel import sp_attn_forward, sp_dit_forward
         model = base_model.diffusion_model
         print("Initializing USP")
         for block in model.blocks:
             block.self_attn.forward = types.MethodType(
-                usp_attn_forward, block.self_attn
+                sp_attn_forward, block.self_attn
             )
         model.forward_orig = types.MethodType(
-            usp_dit_forward, model
+            sp_dit_forward, model
         )
 
     # PlaceHolder For now
@@ -104,32 +104,32 @@ class RayWorker:
 
         # From mochi-xdit, xdit, pipelines.py
         # I dont use globals since it does not work as module
-        if self.parallel_dict["is_xdit"]:
-            cp_rank, cp_size = cp.get_cp_rank_size()
-            ulysses_degree = self.parallel_dict["ulysses_degree"]
-            ring_degree = self.parallel_dict["ring_degree"]
-
-            print("XDiT is enable")
-            init_distributed_environment(rank=cp_rank, world_size=cp_size)
-
-            if ulysses_degree is None and ring_degree is None:
-                print(f"No usp config, use default config: ulysses_degree={cp_size}, ring_degree=1, CFG parallel false")
-                initialize_model_parallel(
-                    sequence_parallel_degree=world_size,
-                    ring_degree=1,
-                    ulysses_degree=cp_size,
-                )
-            else:
-                if ulysses_degree is None:
-                    ulysses_degree = world_size // ring_degree
-                if ring_degree is None:
-                    ring_degree = world_size // ulysses_degree
-                print(f"Use usp config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, CFG parallel false")
-                initialize_model_parallel(
-                    sequence_parallel_degree=world_size,
-                    ring_degree=ring_degree,
-                    ulysses_degree=ulysses_degree,
-                )
+#        if self.parallel_dict["is_xdit"]:
+#            cp_rank, cp_size = cp.get_cp_rank_size()
+#            ulysses_degree = self.parallel_dict["ulysses_degree"]
+#            ring_degree = self.parallel_dict["ring_degree"]
+#
+#            print("XDiT is enable")
+#            init_distributed_environment(rank=cp_rank, world_size=cp_size)
+#
+#            if ulysses_degree is None and ring_degree is None:
+#                print(f"No usp config, use default config: ulysses_degree={cp_size}, ring_degree=1, CFG parallel false")
+#                initialize_model_parallel(
+#                    sequence_parallel_degree=world_size,
+#                    ring_degree=1,
+#                    ulysses_degree=cp_size,
+#                )
+#            else:
+#                if ulysses_degree is None:
+#                    ulysses_degree = world_size // ring_degree
+#                if ring_degree is None:
+#                    ring_degree = world_size // ulysses_degree
+#                print(f"Use usp config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, CFG parallel false")
+#                initialize_model_parallel(
+#                    sequence_parallel_degree=world_size,
+#                    ring_degree=ring_degree,
+#                    ulysses_degree=ulysses_degree,
+#                )
 
     def get_parallel_dict(self):
         return self.parallel_dict
@@ -193,10 +193,12 @@ class RayWorker:
         return None
 
     def set_model(self, model):
-        model.clone()
+        model = model.clone()
+        model.model = model.model.to(self.device)
         self.model = model
         comfy.model_management.soft_empty_cache()
         gc.collect()
+        self.is_model_load = True
 
     def common_ksampler(
         self,

@@ -258,24 +258,29 @@ class RegisterModelToRay:
     FUNCTION = "register_model"
 
     def register_model(self, model, ray_actors):
+        # Meta tensor is a must, if not, it will OOM entire system for large model
+        model.model = model.model.to("meta")
         # Any worker share the same parallel_dict from init
         parallel_dict = ray.get(ray_actors[0].get_parallel_dict.remote())
-        for actor in ray_actors:
+        tasks = []
 
+        for actor in ray_actors:
             if parallel_dict["is_fsdp"]:
                 if ray.get(actor.get_local_rank.remote()) == 0:
-                    ray.get(actor.set_model.remote(model))
+                    tasks.append(actor.set_model.remote(model))
                 else:
-                    ray.get(actor.set_model.remote(model.model.to("meta")))
-                ray.get(actor.patch_fsdp.remote())
+                    tasks.append(actor.set_model.remote(model.model.to("meta")))
+                tasks.append(actor.patch_fsdp.remote())
                 if parallel_dict["is_xdit"]:
-                    ray.get(actor.patch_usp.remote())
+                    tasks.append(actor.patch_usp.remote())
 
             elif ray.get(actor.is_model_loaded.remote()) is False:
-                ray.get(actor.set_model.remote(model))
-
+                tasks.append(actor.set_model.remote(model))
                 if parallel_dict["is_xdit"]:
-                    ray.get(actor.patch_usp.remote())
+                    tasks.append(actor.patch_usp.remote())
+
+        # Barrier until all tasks finish
+        ray.get(tasks)
 
         return (ray_actors,)
 
