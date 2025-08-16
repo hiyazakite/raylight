@@ -16,31 +16,23 @@ from ..distributed_worker.meta_loader import load_diffusion_model_meta
 
 from functools import partial
 
-
-from xfuser.core.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
 import comfy.patcher_extension as pe
 
 from comfy import model_base
 
 
-from ..wan.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
-
 def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
-    print(f"[RANK] in fsdp_inject_callback: device_to={device_to}, full_load={full_load}")
-
     import torch.distributed as dist
     if dist.is_initialized() and dist.get_rank() == 0:
-        print(f"[Rank 0] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
+        if dist.get_rank() != 0:
+            model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to("meta")
+
+        print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
         model_patcher.model.diffusion_model = shard_model(
             model_patcher.model.diffusion_model,
-            device_id=torch.cuda.current_device()
+            device_id=torch.cuda.current_device(),  # CHange this into device_to
         )
 
-    comfy.model_management.soft_empty_cache
-    gc.collect()
     if dist.is_initialized():
         dist.barrier()
 
@@ -155,18 +147,13 @@ class RayWorker:
 #        print("USP APPLIED")
 #        return None
 
-    def delete_model(self):
-        del self.model
-        self.model = None
-        comfy.model_management.unload()
-        gc.collect()
-
     def patch_usp(self):
         self.model.add_callback(
             pe.CallbacksMP.ON_LOAD,
             usp_inject_callback,
         )
         print("USP injection registered")
+
 
     def patch_fsdp(self):
         print("Initializing FSDP")
