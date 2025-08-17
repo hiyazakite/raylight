@@ -29,6 +29,7 @@ class RayInitializer:
 
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
+    OUTPUT_IS_LIST = (True,)
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
@@ -42,6 +43,7 @@ class RayInitializer:
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = torch.cuda.device_count()
+        world_size = 2
         if (ulysses_degree * ring_degree) > world_size:
             raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} * {ring_degree=}")
 
@@ -82,18 +84,18 @@ class RayInitializer:
             raise RuntimeError(f"Ray connection failed: {e}")
 
         RemoteActor = ray.remote(RayWorker)
-        actors = []
+        ray_actors = []
         for local_rank in range(world_size):
-            actors.append(
-                RemoteActor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+            ray_actors.append(
+                RemoteActor.options(num_cpus=1, name=f"RayWorker:{local_rank}").remote(
                     local_rank=local_rank, world_size=world_size, device_id=0, parallel_dict=self.parallel_dict
                 )
             )
 
-        for actor in actors:
+        for actor in ray_actors:
             ray.get(actor.__ray_ready__.remote())
 
-        return (actors,)
+        return (ray_actors,)
 
 
 class XFuserUNETLoader:
@@ -140,7 +142,7 @@ class XFuserUNETLoader:
             if parallel_dict["is_fsdp"]:
                 actor.patch_fsdp.remote()
 
-        return (ray_actors,)
+        return (tuple(ray_actors),)
 
 
 class XFuserKSamplerAdvanced:

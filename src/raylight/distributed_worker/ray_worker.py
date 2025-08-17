@@ -9,17 +9,13 @@ import comfy
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
 
-from ..wan.distributed.fsdp import shard_model, shard_model_fsdp2
+from ..wan.distributed.fsdp import shard_model_fsdp2
 
-from ..distributed_worker import context_parallel as cp
 from ..distributed_worker.meta_loader import load_diffusion_model_meta
-
-from functools import partial
 
 import comfy.patcher_extension as pe
 
 from comfy import model_base
-
 
 
 def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
@@ -29,10 +25,6 @@ def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_p
             model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to("meta")
 
         print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
-        #model_patcher.model.diffusion_model = shard_model(
-        #    model_patcher.model.diffusion_model,
-        #    device_id=torch.cuda.current_device(),  # CHange this into device_to
-        #)
         model_patcher.model = shard_model_fsdp2(
             model_patcher.model,
         )
@@ -93,8 +85,6 @@ class RayWorker:
                 world_size=self.world_size,
                 device_id=self.device,
             )
-            pg = dist.group.WORLD
-            cp.set_cp_group(pg, list(range(world_size)), local_rank)
         else:
             print(f"Running Ray in normal seperate sampler with: {world_size} number of workers")
 
@@ -139,32 +129,12 @@ class RayWorker:
     def is_model_loaded(self):
         return self.is_model_load
 
-#    def patch_usp(self):
-#        print("Initializing USP")
-#        for block in self.model.model.diffusion_model.blocks:
-#            block.self_attn.forward = types.MethodType(
-#                usp_attn_forward, block.self_attn
-#            )
-#        self.model.model.diffusion_model.forward_orig = types.MethodType(
-#            usp_dit_forward, self.model.model.diffusion_model
-#        )
-#        print("USP APPLIED")
-#        return None
-
     def patch_usp(self):
         self.model.add_callback(
             pe.CallbacksMP.ON_LOAD,
             usp_inject_callback,
         )
         print("USP injection registered")
-
-
-    def patch_fsdp(self):
-        print("Initializing FSDP")
-        shard_fn = partial(shard_model, device_id=self.device_id)
-        self.model.model.diffusion_model = shard_fn(self.model.model.diffusion_model)
-        print("FSDP APPLIED")
-        return None
 
     def patch_fsdp(self):
         self.model.add_callback(
