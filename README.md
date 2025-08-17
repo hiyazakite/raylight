@@ -7,20 +7,33 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup.
 
 
 
-DEBUG Notes
-T5+VAE		    7.5
-ModelBF16	    2.8
+## DEBUG Notes
+### Wan T2V 1.3B (bf16) — 1×3090
 
-832x480x65
-Non USP Ray 	15.2
-Normal 		    14
-USP Ray		    18
+| Setup                        | VRAM (GB) |
+|------------------------------|-----------|
+| Non-Ulysses                  | 4.6       |
+| Ulysses                      | 5.1       |
+| XDiT Ring + Ulysses          | 9.2       |
+| Ulysses + Sync Module FSDP   | 9.7       |
+| Ulysses + Unsync Module FSDP | 5.2       |
 
 
-16x16x1
-Non USP Ray	    11.2
-Normal		    10.2
-USP Ray         15.1
+### Wan T2V 14B (fp8) — 1×3090
+
+| Setup                        | VRAM (GB)         |
+|------------------------------|-------------------|
+| Non-Ulysses                  | 15.5              |
+| Ulysses                      | 15.9              |
+| Ulysses + Sync Module FSDP   | OOM (Pred. 47.3)  |
+| Ulysses + Unsync Module FSDP | OOM (Pred. 31.8)  |
+| XDiT Ring + Ulysses          | OOM               |
+
+
+### Notes
+- FSDP OOM in single-device 14B model caused by:
+  - Sync Module FSDP: model is first loaded into CUDA, then sharded (not tested on dual GPU).
+  - Lowest possible dtype for FSDP params is **bf16**, hence doubled size compared to fp8.
 
 
 ## Quickstart
