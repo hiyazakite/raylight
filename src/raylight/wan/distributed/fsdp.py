@@ -1,7 +1,11 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
+# For FSDP1
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+
+# For FSDP2
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy,CPUOffloadPolicy
 
 
 def shard_model(
@@ -13,7 +17,7 @@ def shard_model(
 ):
     model.blocks = model.blocks.to("cpu")
 
-    # fp8 is not currently supported in FSDP, if param_dtype = model.dtype
+    # fp8 is not currently supported in FSDP1, if param_dtype = model.dtype
     # It would resulted into "ufunc_add_CUDA" not implemented for 'Float8_e4m3fn'
     param_dtype = torch.bfloat16
     reduce_dtype = torch.float32,
@@ -34,4 +38,29 @@ def shard_model(
             use_orig_params=True
         )
 
+    return model
+
+
+def shard_model_fsdp2(model):
+    diffusion_model = model.diffusion_model
+
+    # Collect params we want to ignore (everything except blocks)
+    ignored_params = set()
+    for name, param in diffusion_model.named_parameters():
+        if not name.startswith("blocks."):
+            ignored_params.add(param)
+
+    # Shard only the blocks
+    for i, block in enumerate(diffusion_model.blocks):
+        diffusion_model.blocks[i] = fully_shard(
+            module=block,
+            mp_policy=MixedPrecisionPolicy(),
+            reshard_after_forward=True,
+            offload_policy=CPUOffloadPolicy()
+        )
+
+    # Root wrap with ignored params
+    fully_shard(diffusion_model, ignored_params=ignored_params)
+
+    print("SHARD COMPLETE")
     return model

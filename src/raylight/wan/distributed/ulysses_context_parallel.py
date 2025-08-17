@@ -159,8 +159,8 @@ def sp_dit_forward(
             )
 
     # For FSDP sake
-    x = self.head(x.to(e[0].dtype), e)
-    # x = self.head(x, e)
+    # x = self.head(x.to(e[0].dtype), e)
+    x = self.head(x, e)
 
     # Context Parallel
     x = gather_forward(x, dim=1)

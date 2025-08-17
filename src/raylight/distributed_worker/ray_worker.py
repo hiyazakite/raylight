@@ -9,7 +9,7 @@ import comfy
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
 
-from ..wan.distributed.fsdp import shard_model
+from ..wan.distributed.fsdp import shard_model, shard_model_fsdp2
 
 from ..distributed_worker import context_parallel as cp
 from ..distributed_worker.meta_loader import load_diffusion_model_meta
@@ -21,6 +21,7 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 
+
 def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
     import torch.distributed as dist
     if dist.is_initialized() and dist.get_rank() == 0:
@@ -28,9 +29,12 @@ def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_p
             model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to("meta")
 
         print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
-        model_patcher.model.diffusion_model = shard_model(
-            model_patcher.model.diffusion_model,
-            device_id=torch.cuda.current_device(),  # CHange this into device_to
+        #model_patcher.model.diffusion_model = shard_model(
+        #    model_patcher.model.diffusion_model,
+        #    device_id=torch.cuda.current_device(),  # CHange this into device_to
+        #)
+        model_patcher.model = shard_model_fsdp2(
+            model_patcher.model,
         )
 
     if dist.is_initialized():
