@@ -5,7 +5,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 
 # For FSDP2
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy,CPUOffloadPolicy
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 
 
 def shard_model(
@@ -56,7 +56,6 @@ def shard_model_fsdp2(model):
             module=block,
             mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
-            offload_policy=CPUOffloadPolicy()
         )
 
     # Root wrap with ignored params
