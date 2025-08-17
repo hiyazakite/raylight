@@ -47,15 +47,18 @@ def usp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_pa
         model.forward_orig = types.MethodType(
             sp_dit_forward, model
         )
+        dist.barrier()
 
     # PlaceHolder For now
     elif isinstance(base_model, model_base.Flux):
         from ..flux.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
         model = base_model.diffusion_model
+        dist.barrier()
 
     elif isinstance(base_model, model_base.QwenImageTransformer2DModel):
         from ..qwen_image.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
         model = base_model.diffusion_model
+        dist.barrier()
 
     else:
         print(f"Model: {type(base_model).__name__}, is not yet supported for USP Parallelism")

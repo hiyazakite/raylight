@@ -129,8 +129,6 @@ def sp_dit_forward(
 
     # Context Parallel
     x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
-    e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
-    e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})

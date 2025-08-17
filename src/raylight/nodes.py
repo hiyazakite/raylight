@@ -1,6 +1,5 @@
 import raylight
 import os
-import gc
 
 import ray
 import torch
@@ -43,14 +42,12 @@ class RayInitializer:
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = torch.cuda.device_count()
-        world_size = 2
-        if (ulysses_degree * ring_degree) > world_size:
-            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} * {ring_degree=}")
+        if world_size < ulysses_degree:
+            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=}")
 
-        if ulysses_degree > 1 or ring_degree > 1:
+        if ulysses_degree > 1:
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
-            self.parallel_dict["ring_degree"] = ring_degree
             if FSDP:
                 self.parallel_dict["is_fsdp"] = True
             else:
@@ -64,14 +61,12 @@ class RayInitializer:
         if DEBUG_USP:
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = 1
-            self.parallel_dict["ring_degree"] = 1
 
         if DEBUG_FSDP:
             self.parallel_dict["is_fsdp"] = True
 
         try:
-            # Shut down so if comfy user try another workflow it will not cause
-            # error
+            # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
             ray.init(
                 ray_cluster_address,
@@ -87,7 +82,7 @@ class RayInitializer:
         ray_actors = []
         for local_rank in range(world_size):
             ray_actors.append(
-                RemoteActor.options(num_cpus=1, name=f"RayWorker:{local_rank}").remote(
+                RemoteActor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
                     local_rank=local_rank, world_size=world_size, device_id=0, parallel_dict=self.parallel_dict
                 )
             )
@@ -132,17 +127,24 @@ class XFuserUNETLoader:
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
+        parallel_dict = ray.get(ray_actors[0].get_parallel_dict.remote())
+        loaded_futures = []
+        patched_futures = []
         for actor in ray_actors:
-            parallel_dict = ray.get(actor.get_parallel_dict.remote())
-            ray.get(actor.load_unet.remote(unet_path, model_options=model_options))
+            loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
 
+        ray.get(loaded_futures)
+
+        for actor in ray_actors:
             if parallel_dict["is_xdit"]:
-                actor.patch_usp.remote()
+                patched_futures.append(actor.patch_usp.remote())
 
             if parallel_dict["is_fsdp"]:
-                actor.patch_fsdp.remote()
+                patched_futures.append(actor.patch_fsdp.remote())
 
-        return (tuple(ray_actors),)
+        ray.get(patched_futures)
+
+        return (ray_actors,)
 
 
 class XFuserKSamplerAdvanced:
