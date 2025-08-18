@@ -1,21 +1,34 @@
 import types
 import os
 import gc
+import asyncio
+
+import ray
 
 import torch
 import torch.distributed as dist
-import comfy
 
-# Must manually insert comfy package or ray cannot import raylight to cluster
-from comfy import sd, sample, utils
+import comfy
+from comfy import sd, sample, utils  # Must manually insert comfy package or ray cannot import raylight to cluster
+import comfy.patcher_extension as pe
+from comfy import model_base
 
 from ..wan.distributed.fsdp import shard_model_fsdp2
-
 from ..distributed_worker.meta_loader import load_diffusion_model_meta
 
-import comfy.patcher_extension as pe
 
-from comfy import model_base
+class SignalWorker:
+    def __init__(self):
+        self.ready_event = asyncio.Event()
+
+    def send(self, clear=False):
+        self.ready_event.set()
+        if clear:
+            self.ready_event.clear()
+
+    async def wait(self, should_wait=True):
+        if should_wait:
+            await self.ready_event.wait()
 
 
 def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
@@ -71,6 +84,7 @@ class RayWorker:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device_id = device_id
+        self.noise_add = 0
 
         self.parallel_dict = parallel_dict
         self.device = torch.device(f"cuda:{self.device_id}")
@@ -90,6 +104,7 @@ class RayWorker:
             )
         else:
             print(f"Running Ray in normal seperate sampler with: {world_size} number of workers")
+            self.noise_add = 1
 
         # From mochi-xdit, xdit, pipelines.py
         # I dont use globals since it does not work as module
@@ -166,6 +181,7 @@ class RayWorker:
 
     def common_ksampler(
         self,
+        signal,
         seed,
         steps,
         cfg,
@@ -180,6 +196,7 @@ class RayWorker:
         last_step=None,
         force_full_denoise=False,
     ):
+        ray.get(signal.wait.remote())
         latent_image = latent["samples"]
         latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
 
@@ -192,7 +209,7 @@ class RayWorker:
             )
         else:
             batch_inds = latent["batch_index"] if "batch_index" in latent else None
-            noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+            noise = comfy.sample.prepare_noise(latent_image, seed + self.noise_add, batch_inds)
 
         noise_mask = None
         if "noise_mask" in latent:
@@ -221,3 +238,5 @@ class RayWorker:
         out = latent.copy()
         out["samples"] = samples
         return (out,)
+
+

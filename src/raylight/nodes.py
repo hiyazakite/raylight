@@ -8,7 +8,7 @@ import folder_paths
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
-from .distributed_worker.ray_worker import RayWorker
+from .distributed_worker.ray_worker import RayWorker, SignalWorker
 
 
 class RayInitializer:
@@ -18,8 +18,7 @@ class RayInitializer:
             "required": {
                 "ray_cluster_address": ("STRING", {"default": "local"}),
                 "ray_cluster_namespace": ("STRING", {"default": "default"}),
-                "ulysses_degree": ("INT", {"default": 2, "tooltip": "degree of Ulyssess attention, prefer this than ring"}),
-                "ring_degree": ("INT", {"default": 1, "tooltip": "degree of ring attention"}),
+                "ulysses_degree": ("INT", {"default": 2, "tooltip": "degree of Ulyssess attention"}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "DEBUG_USP": ("BOOLEAN", {"default": False}),
                 "DEBUG_FSDP": ("BOOLEAN", {"default": False}),
@@ -28,11 +27,10 @@ class RayInitializer:
 
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
-    OUTPUT_IS_LIST = (True,)
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
-    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, ring_degree, FSDP, DEBUG_USP, DEBUG_FSDP):
+    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, FSDP, DEBUG_USP, DEBUG_FSDP):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
@@ -78,16 +76,26 @@ class RayInitializer:
             ray.init(runtime_env={"py_modules": [raylight]})
             raise RuntimeError(f"Ray connection failed: {e}")
 
-        RemoteActor = ray.remote(RayWorker)
-        ray_actors = []
+        ray_actors = dict()
+
+        signal_actor = ray.remote(SignalWorker)
+        signal_actor.options(num_cpus=0, name="SignalWorker").remote()
+        ray_actors["signal":signal_actor]
+
+        gpu_actor = ray.remote(RayWorker)
+        gpu_actors = []
         for local_rank in range(world_size):
-            ray_actors.append(
-                RemoteActor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                    local_rank=local_rank, world_size=world_size, device_id=0, parallel_dict=self.parallel_dict
+            gpu_actors.append(
+                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+                    local_rank=local_rank,
+                    world_size=world_size,
+                    device_id=0,
+                    parallel_dict=self.parallel_dict,
                 )
             )
+        ray_actors["workers":gpu_actors]
 
-        for actor in ray_actors:
+        for actor in ray_actors["workers"]:
             ray.get(actor.__ray_ready__.remote())
 
         return (ray_actors,)
@@ -127,15 +135,17 @@ class XFuserUNETLoader:
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
-        parallel_dict = ray.get(ray_actors[0].get_parallel_dict.remote())
+        gpu_actors = ray_actors["workers"]
+
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         loaded_futures = []
         patched_futures = []
-        for actor in ray_actors:
+        for actor in gpu_actors:
             loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
 
         ray.get(loaded_futures)
 
-        for actor in ray_actors:
+        for actor in gpu_actors:
             if parallel_dict["is_xdit"]:
                 patched_futures.append(actor.patch_usp.remote())
 
@@ -222,8 +232,11 @@ class XFuserKSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
 
+        signal_actor = ray_actors["signal"]
+        gpu_actors = ray_actors["workers"]
         futures = [
             actor.common_ksampler.remote(
+                signal_actor,
                 noise_seed,
                 steps,
                 cfg,
@@ -238,9 +251,10 @@ class XFuserKSamplerAdvanced:
                 last_step=end_at_step,
                 force_full_denoise=force_full_denoise,
             )
-            for actor in ray_actors
+            for actor in gpu_actors
         ]
 
+        ray.get(signal_actor.send.remote())
         results = ray.get(futures)
         return tuple(result[0] for result in results[0:4])
 
