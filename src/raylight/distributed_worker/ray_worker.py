@@ -179,6 +179,11 @@ class RayWorker:
         print(f"{self.model.offload_device=}")
         return None
 
+    def load_lora(self, lora, strength_model):
+        self.model = comfy.sd.load_lora_for_models(
+            self.model, None, lora, strength_model, 0
+        )[0]
+
     def set_model(self, model):
         model = model.clone()
         model.model = model.model.to(self.device)

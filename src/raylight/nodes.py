@@ -41,13 +41,15 @@ class RayInitializer:
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = torch.cuda.device_count()
-        if world_size < ulysses_degree:
-            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=}")
+        if world_size < ulysses_degree * ring_degree:
+            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}")
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["is_dumb_parallel"] = True
 
+        ulysses_degree = 1
+        ring_degree = 1
         if ulysses_degree > 1 or ring_degree > 1:
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
@@ -153,6 +155,64 @@ class XFuserUNETLoader:
         return (ray_actors,)
 
 
+class XFuserLoraLoaderModelOnly:
+    def __init__(self):
+        self.loaded_lora = None
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": (
+                    "RAY_ACTORS",
+                    {"tooltip": "Ray Actor to submit the model into"},
+                ),
+                "lora_name": (
+                    folder_paths.get_filename_list("loras"),
+                    {"tooltip": "The name of the LoRA."},
+                ),
+                "strength_model": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": -100.0,
+                        "max": 100.0,
+                        "step": 0.01,
+                        "tooltip": "How strongly to modify the diffusion model. This value can be negative.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
+    FUNCTION = "load_lora"
+    CATEGORY = "Raylight"
+
+    def load_lora(self, ray_actors, lora_name, strength_model):
+        gpu_actors = ray_actors["workers"]
+
+        if strength_model == 0:
+            return (ray_actors,)
+
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora = None
+        if self.loaded_lora is not None:
+            if self.loaded_lora[0] == lora_path:
+                lora = self.loaded_lora[1]
+            else:
+                self.loaded_lora = None
+
+        if lora is None:
+            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            self.loaded_lora = (lora_path, lora)
+
+        for actor in gpu_actors:
+            ray.get(actor.load_lora.remote(lora, strength_model))
+
+        return (ray_actors,)
+
+
 class XFuserKSamplerAdvanced:
     @classmethod
     def INPUT_TYPES(s):
@@ -221,6 +281,8 @@ class XFuserKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
     ):
+        if sampler_name in ["uni_pc", "uni_pc_bh2"]:
+            raise ValueError(f"ERROR, {sampler_name} is currently in fixing since it can causes OOM")
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
@@ -252,60 +314,16 @@ class XFuserKSamplerAdvanced:
         return tuple(result[0] for result in results[0:4])
 
 
-class RegisterModelToRay:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "ray_actors": (
-                    "RAY_ACTORS",
-                    {"tooltip": "Ray Actor to submit the model into"})
-            },
-        }
-    RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
-    CATEGORY = "Raylight"
-    FUNCTION = "register_model"
-
-    def register_model(self, model, ray_actors):
-        # Meta tensor is a must, if not, it will OOM entire system for large model
-        model.model = model.model.to("meta")
-        # Any worker share the same parallel_dict from init
-        parallel_dict = ray.get(ray_actors[0].get_parallel_dict.remote())
-        tasks = []
-
-        for actor in ray_actors:
-            if parallel_dict["is_fsdp"]:
-                if ray.get(actor.get_local_rank.remote()) == 0:
-                    tasks.append(actor.set_model.remote(model))
-                else:
-                    tasks.append(actor.set_model.remote(model.model.to("meta")))
-                tasks.append(actor.patch_fsdp.remote())
-                if parallel_dict["is_xdit"]:
-                    tasks.append(actor.patch_usp.remote())
-
-            elif ray.get(actor.is_model_loaded.remote()) is False:
-                tasks.append(actor.set_model.remote(model))
-                if parallel_dict["is_xdit"]:
-                    tasks.append(actor.patch_usp.remote())
-
-        # Barrier until all tasks finish
-        ray.get(tasks)
-
-        return (ray_actors,)
-
-
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "XFuserUNETLoader": XFuserUNETLoader,
+    "XFuserLoraLoaderModelOnly": XFuserLoraLoaderModelOnly,
     "RayInitializer": RayInitializer,
-    "RegisterModelToRay": RegisterModelToRay
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserKSamplerAdvanced": "XFuser KSampler Advanced",
     "XFuserUNETLoader": "Load Diffusion Model (Ray)",
+    "XFuserLoraLoaderModelOnly": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
-    "RegisterModelToRay": "Model to Ray Workers"
 }
