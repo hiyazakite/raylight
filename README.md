@@ -31,22 +31,22 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup.
 
 
 
-### Wan T2V 14B (fp8) — 1×RTX2000 ADA NONE
-## 480x832 x 33F
+### Wan T2V 14B (fp8) — 1×RTX 2000 ADA
+### 480×832 × 33F
 
-| Setup                        | VRAM (GB)         |
-|------------------------------|-------------------|
-| Normal                       | OOM               |
+| Setup   | VRAM (GB) |
+|---------|-----------|
+| Normal  | OOM       |
 
-### Wan T2V 14B (fp8) — 2×RTX2000ADA
+---
 
-| Setup                        | VRAM (GB)         |
-|------------------------------|-------------------|
-| Ulysses                      | 15.8 (Near OOM)   |
-| FSDP                         | 12.8              |
-| Ulysses + FSDP2              | 10.25             |
+### Wan T2V 14B (fp8) — 2×RTX 2000 ADA
 
-
+| Setup           | VRAM (GB) / Device |
+|-----------------|--------------------|
+| Ulysses         | 15.8 (Near OOM)    |
+| FSDP            | 12.8               |
+| Ulysses + FSDP2 | 10.25              |
 
 
 ### Notes
