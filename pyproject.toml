@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "raylight"
 version = "0.1.0"
-description = "Boilerplate for multigpu capability in comfyui using ray"
+description = "Enable multi gpu capability in Comfy UI"
 authors = [
   {name = "Micko Lesmana", email = "mickolesmana@gmail.com"}
 ]
