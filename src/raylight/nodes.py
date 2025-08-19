@@ -18,7 +18,8 @@ class RayInitializer:
             "required": {
                 "ray_cluster_address": ("STRING", {"default": "local"}),
                 "ray_cluster_namespace": ("STRING", {"default": "default"}),
-                "ulysses_degree": ("INT", {"default": 2, "tooltip": "degree of Ulyssess attention"}),
+                "ulysses_degree": ("INT", {"default": 2}),
+                "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "DEBUG_USP": ("BOOLEAN", {"default": False}),
                 "DEBUG_FSDP": ("BOOLEAN", {"default": False}),
@@ -30,7 +31,7 @@ class RayInitializer:
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
-    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, FSDP, DEBUG_USP, DEBUG_FSDP):
+    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, ring_degree, FSDP, DEBUG_USP, DEBUG_FSDP):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
@@ -47,9 +48,10 @@ class RayInitializer:
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["is_dumb_parallel"] = True
 
-        if ulysses_degree > 1:
+        if ulysses_degree > 1 or ring_degree > 1:
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
+            self.parallel_dict["ring_degree"] = ring_degree
 
         if FSDP:
             self.parallel_dict["is_fsdp"] = True

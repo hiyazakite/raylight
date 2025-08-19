@@ -1,9 +1,6 @@
 import types
 import os
 import gc
-import asyncio
-
-import ray
 
 import torch
 import torch.distributed as dist
@@ -14,6 +11,7 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 from ..wan.distributed.fsdp import shard_model_fsdp2
+import raylight.distributed_worker.context_parallel as cp
 
 
 # Temp solution, should be init to meta first then load_state_dict, CPU for now
@@ -23,6 +21,8 @@ from ..wan.distributed.fsdp import shard_model_fsdp2
 def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
     import torch.distributed as dist
     model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to("cpu")
+
+    # Idk if this is usefull
     comfy.model_management.soft_empty_cache()
     gc.collect()
     print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
@@ -39,17 +39,16 @@ def usp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_pa
     base_model = model_patcher.model
 
     if isinstance(base_model, model_base.WAN21) or isinstance(base_model, model_base.WAN22):
-        from ..wan.distributed.ulysses_context_parallel import sp_attn_forward, sp_dit_forward
+        from ..wan.distributed.xdit_context_parallel import usp_attn_forward, usp_dit_forward
         model = base_model.diffusion_model
         print("Initializing USP")
         for block in model.blocks:
             block.self_attn.forward = types.MethodType(
-                sp_attn_forward, block.self_attn
+                usp_attn_forward, block.self_attn
             )
         model.forward_orig = types.MethodType(
-            sp_dit_forward, model
+            usp_dit_forward, model
         )
-        dist.barrier()
 
     # PlaceHolder For now
     elif isinstance(base_model, model_base.Flux):
@@ -89,8 +88,9 @@ class RayWorker:
                 "nccl",
                 rank=local_rank,
                 world_size=self.world_size,
-                device_id=self.device,
             )
+            pg = dist.group.WORLD
+            cp.set_cp_group(pg, list(range(world_size)), local_rank)
 
             print("Running NCCL COMM pre-run")
 
@@ -113,36 +113,36 @@ class RayWorker:
 
         else:
             print(f"Running Ray in normal seperate sampler with: {world_size} number of workers")
-            self.noise_add = 1
+            self.noise_add = self.local_rank
 
         # From mochi-xdit, xdit, pipelines.py
         # I dont use globals since it does not work as module
-#        if self.parallel_dict["is_xdit"]:
-#            cp_rank, cp_size = cp.get_cp_rank_size()
-#            ulysses_degree = self.parallel_dict["ulysses_degree"]
-#            ring_degree = self.parallel_dict["ring_degree"]
-#
-#            print("XDiT is enable")
-#            init_distributed_environment(rank=cp_rank, world_size=cp_size)
-#
-#            if ulysses_degree is None and ring_degree is None:
-#                print(f"No usp config, use default config: ulysses_degree={cp_size}, ring_degree=1, CFG parallel false")
-#                initialize_model_parallel(
-#                    sequence_parallel_degree=world_size,
-#                    ring_degree=1,
-#                    ulysses_degree=cp_size,
-#                )
-#            else:
-#                if ulysses_degree is None:
-#                    ulysses_degree = world_size // ring_degree
-#                if ring_degree is None:
-#                    ring_degree = world_size // ulysses_degree
-#                print(f"Use usp config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, CFG parallel false")
-#                initialize_model_parallel(
-#                    sequence_parallel_degree=world_size,
-#                    ring_degree=ring_degree,
-#                    ulysses_degree=ulysses_degree,
-#                )
+        if self.parallel_dict["is_xdit"]:
+            from xfuser.core.distributed import (
+                init_distributed_environment,
+                initialize_model_parallel,
+            )
+            cp_rank, cp_size = cp.get_cp_rank_size()
+            ulysses_degree = self.parallel_dict["ulysses_degree"]
+            ring_degree = self.parallel_dict["ring_degree"]
+
+            print("XDiT is enable")
+            init_distributed_environment(rank=cp_rank, world_size=cp_size)
+
+            if ulysses_degree is None and ring_degree is None:
+                print(f"No usp config, use default config: ulysses_degree={cp_size}, ring_degree=1")
+                initialize_model_parallel(
+                    sequence_parallel_degree=world_size,
+                    ring_degree=1,
+                    ulysses_degree=cp_size,
+                )
+            else:
+                print(f"Use usp config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}")
+                initialize_model_parallel(
+                    sequence_parallel_degree=world_size,
+                    ring_degree=ring_degree,
+                    ulysses_degree=ulysses_degree,
+                )
 
     def get_parallel_dict(self):
         return self.parallel_dict
@@ -161,7 +161,7 @@ class RayWorker:
             pe.CallbacksMP.ON_LOAD,
             usp_inject_callback,
         )
-        print("Ulyssess registered")
+        print("USP registered")
 
     def patch_fsdp(self):
         self.model.add_callback(
@@ -169,7 +169,6 @@ class RayWorker:
             fsdp_inject_callback,
         )
         print("FSDP registered")
-        print(f"{pe.get_all_callbacks(pe.CallbacksMP.ON_LOAD, {})=}")
 
     def load_unet(self, unet_path, model_options):
         self.model = comfy.sd.load_diffusion_model(
