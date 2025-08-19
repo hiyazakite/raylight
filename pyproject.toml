@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "raylight"
-version = "0.0.1"
+version = "0.1.0"
 description = "Boilerplate for multigpu capability in comfyui using ray"
 authors = [
   {name = "Micko Lesmana", email = "mickolesmana@gmail.com"}
 ]
 readme = "README.md"
-license = {text = "GNU General Public License v3"}
+license = {file = "LICENSE"}
 classifiers = []
 dependencies = [
 
