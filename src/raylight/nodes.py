@@ -77,11 +77,6 @@ class RayInitializer:
             raise RuntimeError(f"Ray connection failed: {e}")
 
         ray_actors = dict()
-
-        signal_actor = ray.remote(SignalWorker)
-        signal_actor.options(num_cpus=0, name="SignalWorker").remote()
-        ray_actors["signal":signal_actor]
-
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
         for local_rank in range(world_size):
@@ -232,11 +227,9 @@ class XFuserKSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
 
-        signal_actor = ray_actors["signal"]
         gpu_actors = ray_actors["workers"]
         futures = [
             actor.common_ksampler.remote(
-                signal_actor,
                 noise_seed,
                 steps,
                 cfg,
@@ -254,7 +247,6 @@ class XFuserKSamplerAdvanced:
             for actor in gpu_actors
         ]
 
-        ray.get(signal_actor.send.remote())
         results = ray.get(futures)
         return tuple(result[0] for result in results[0:4])
 

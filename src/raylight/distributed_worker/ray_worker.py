@@ -17,20 +17,6 @@ from ..wan.distributed.fsdp import shard_model_fsdp2
 from ..distributed_worker.meta_loader import load_diffusion_model_meta
 
 
-class SignalWorker:
-    def __init__(self):
-        self.ready_event = asyncio.Event()
-
-    def send(self, clear=False):
-        self.ready_event.set()
-        if clear:
-            self.ready_event.clear()
-
-    async def wait(self, should_wait=True):
-        if should_wait:
-            await self.ready_event.wait()
-
-
 def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
     import torch.distributed as dist
     if dist.is_initialized() and dist.get_rank() == 0:
@@ -106,6 +92,11 @@ class RayWorker:
             print(f"Running Ray in normal seperate sampler with: {world_size} number of workers")
             self.noise_add = 1
 
+        x = torch.ones(1, device=self.device) * (self.local_rank + 1)
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        result = x.item()
+        print(f"Collective: {self.local_rankrank}, {result}")
+
         # From mochi-xdit, xdit, pipelines.py
         # I dont use globals since it does not work as module
 #        if self.parallel_dict["is_xdit"]:
@@ -152,14 +143,14 @@ class RayWorker:
             pe.CallbacksMP.ON_LOAD,
             usp_inject_callback,
         )
-        print("USP injection registered")
+        print("Ulyssess registered")
 
     def patch_fsdp(self):
         self.model.add_callback(
             pe.CallbacksMP.ON_LOAD,
             fsdp_inject_callback,
         )
-        print("FSDP injection callback registered")
+        print("FSDP registered")
         print(f"{pe.get_all_callbacks(pe.CallbacksMP.ON_LOAD, {})=}")
 
     def load_unet(self, unet_path, model_options):
@@ -181,7 +172,6 @@ class RayWorker:
 
     def common_ksampler(
         self,
-        signal,
         seed,
         steps,
         cfg,
@@ -196,7 +186,6 @@ class RayWorker:
         last_step=None,
         force_full_denoise=False,
     ):
-        ray.get(signal.wait.remote())
         latent_image = latent["samples"]
         latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
 
