@@ -14,22 +14,25 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 from ..wan.distributed.fsdp import shard_model_fsdp2
-from ..distributed_worker.meta_loader import load_diffusion_model_meta
 
 
+# Temp solution, should be init to meta first then load_state_dict, CPU for now
+# ERROR: Change scale_weight to a 1D tensor with numel equal to 1.,
+# inside transformer of scaled_model there are scale_weight tensors that are 0 dim,
+# for now use non scaled model
 def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
     import torch.distributed as dist
-    if dist.is_initialized() and dist.get_rank() == 0:
-        if dist.get_rank() != 0:
-            model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to("meta")
-
-        print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
-        model_patcher.model = shard_model_fsdp2(
-            model_patcher.model,
-        )
-
-    if dist.is_initialized():
-        dist.barrier()
+    model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to("cpu")
+    comfy.model_management.soft_empty_cache()
+    gc.collect()
+    print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
+    model_patcher.model = shard_model_fsdp2(
+        model_patcher.model,
+    )
+    model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to(device_to)
+    comfy.model_management.soft_empty_cache()
+    gc.collect()
+    dist.barrier()
 
 
 def usp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
@@ -88,14 +91,29 @@ class RayWorker:
                 world_size=self.world_size,
                 device_id=self.device,
             )
+
+            print("Running NCCL COMM pre-run")
+
+            # Each rank contributes rank+1
+            x = torch.ones(1, device=self.device) * (self.local_rank + 1)
+            dist.all_reduce(x, op=dist.ReduceOp.SUM)
+            result = x.item()
+
+            # Expected sum = N(N+1)/2
+            expected = self.world_size * (self.world_size + 1) // 2
+
+            if abs(result - expected) > 1e-3:
+                raise RuntimeError(
+                    f"[Rank {self.local_rank}] COMM test failed: "
+                    f"got {result}, expected {expected}. "
+                    f"world_size may be mismatched!"
+                )
+            else:
+                print(f"[Rank {self.local_rank}] COMM test passed ✅ (result={result})")
+
         else:
             print(f"Running Ray in normal seperate sampler with: {world_size} number of workers")
             self.noise_add = 1
-
-        x = torch.ones(1, device=self.device) * (self.local_rank + 1)
-        dist.all_reduce(x, op=dist.ReduceOp.SUM)
-        result = x.item()
-        print(f"Collective: {self.local_rankrank}, {result}")
 
         # From mochi-xdit, xdit, pipelines.py
         # I dont use globals since it does not work as module
@@ -154,7 +172,7 @@ class RayWorker:
         print(f"{pe.get_all_callbacks(pe.CallbacksMP.ON_LOAD, {})=}")
 
     def load_unet(self, unet_path, model_options):
-        self.model = load_diffusion_model_meta(
+        self.model = comfy.sd.load_diffusion_model(
             unet_path, model_options=model_options
         )
 

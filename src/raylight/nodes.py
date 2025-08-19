@@ -8,7 +8,7 @@ import folder_paths
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
-from .distributed_worker.ray_worker import RayWorker, SignalWorker
+from .distributed_worker.ray_worker import RayWorker
 
 
 class RayInitializer:
@@ -43,17 +43,16 @@ class RayInitializer:
         if world_size < ulysses_degree:
             raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=}")
 
+        self.parallel_dict["is_xdit"] = False
+        self.parallel_dict["is_fsdp"] = False
+        self.parallel_dict["is_dumb_parallel"] = True
+
         if ulysses_degree > 1:
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
-            if FSDP:
-                self.parallel_dict["is_fsdp"] = True
-            else:
-                self.parallel_dict["is_fsdp"] = False
-                self.parallel_dict["is_dumb_parallel"] = True
-        else:
-            self.parallel_dict["is_xdit"] = False
-            self.parallel_dict["is_fsdp"] = False
+
+        if FSDP:
+            self.parallel_dict["is_fsdp"] = True
 
         # DEBUG FOR SINGLE GPU
         if DEBUG_USP:
@@ -88,7 +87,7 @@ class RayInitializer:
                     parallel_dict=self.parallel_dict,
                 )
             )
-        ray_actors["workers":gpu_actors]
+        ray_actors["workers"] = gpu_actors
 
         for actor in ray_actors["workers"]:
             ray.get(actor.__ray_ready__.remote())

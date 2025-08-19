@@ -30,10 +30,30 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup.
 | XDiT Ring + Ulysses          | OOM               |
 
 
+
+### Wan T2V 14B (fp8) — 1×RTX2000 ADA NONE
+## 480x832 x 33F
+
+| Setup                        | VRAM (GB)         |
+|------------------------------|-------------------|
+| Normal                       | OOM               |
+
+### Wan T2V 14B (fp8) — 2×RTX2000ADA
+
+| Setup                        | VRAM (GB)         |
+|------------------------------|-------------------|
+| Ulysses                      | 15.8 (Near OOM)   |
+| FSDP                         | 12.8              |
+| Ulysses + FSDP2              | 10.25             |
+
+
+
+
 ### Notes
 - FSDP OOM in single-device 14B model caused by:
   - Sync Module FSDP: model is first loaded into CUDA, then sharded (not tested on dual GPU).
   - Lowest possible dtype for FSDP params is **bf16**, hence doubled size compared to fp8.
+- FSDP 2 is now available and can do fp8 calculation but need to convert scalar tensor into 1D tensor
 
 
 ## Quickstart
