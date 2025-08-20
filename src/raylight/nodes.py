@@ -131,7 +131,7 @@ class RayUNETLoader:
 
     CATEGORY = "Raylight"
 
-    def load_ray_unet(self, ray_actors, unet_name, weight_dtype, lora):
+    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora):
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn
@@ -143,7 +143,7 @@ class RayUNETLoader:
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
-        gpu_actors = ray_actors["workers"]
+        gpu_actors = ray_actors_init["workers"]
 
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         loaded_futures = []
@@ -170,7 +170,7 @@ class RayUNETLoader:
 
         ray.get(patched_futures)
 
-        return (ray_actors,)
+        return (ray_actors_init,)
 
 
 class RayLoraLoader:
@@ -203,12 +203,12 @@ class RayLoraLoader:
     FUNCTION = "load_lora"
     CATEGORY = "Raylight"
 
-    def load_lora(self, ray_actors, lora_name, strength_model, prev_lora):
+    def load_lora(self, lora_name, strength_model, prev_ray_lora=None):
         loras_list = []
 
         if strength_model == 0.0:
-            if prev_lora is not None:
-                loras_list.extend(prev_lora)
+            if prev_ray_lora is not None:
+                loras_list.extend(prev_ray_lora)
             return (loras_list,)
 
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
@@ -217,8 +217,8 @@ class RayLoraLoader:
             "strength_model": strength_model,
         }
 
-        if prev_lora is not None:
-            loras_list.extend(prev_lora)
+        if prev_ray_lora is not None:
+            loras_list.extend(prev_ray_lora)
 
         loras_list.append(lora)
         return (loras_list,)

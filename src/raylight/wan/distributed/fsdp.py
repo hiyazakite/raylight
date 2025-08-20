@@ -1,4 +1,3 @@
-# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
 # For FSDP1
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -8,6 +7,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 
 
+# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 # Not being used!
 def shard_model(
     model,

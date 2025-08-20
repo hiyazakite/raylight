@@ -76,6 +76,7 @@ def apply_rope_sp(xq, xk, freqs_cis):
     return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
 
 
+# TODO, implement full USP including context and not only latent tensor
 def usp_dit_forward(
     self,
     x,
@@ -162,9 +163,7 @@ def usp_dit_forward(
                 x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len
             )
 
-    # For FSDP sake
-    x = self.head(x.to(e[0].dtype), e)
-    # x = self.head(x, e)
+    x = self.head(x, e)
 
     # Context Parallel
     x = get_sp_group().all_gather(x, dim=1)
