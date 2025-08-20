@@ -5,6 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "raylight"
 version = "0.1.0"
+repository = "raylight"
 description = "Enable multi gpu capability in Comfy UI"
 authors = [
   {name = "Micko Lesmana", email = "mickolesmana@gmail.com"}
@@ -31,11 +32,13 @@ dev = [
 [project.urls]
 bugs = "https://github.com/komikndr/raylight/issues"
 homepage = "https://github.com/komikndr/raylight"
+Repository = "https://github.com/komikndr/raylight"
 
 
 [tool.comfy]
 PublisherId = "komikndr"
 DisplayName = "raylight"
+repository = "https://github.com/komikndr/raylight"
 Icon = ""
 
 

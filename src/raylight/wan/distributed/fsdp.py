@@ -45,24 +45,25 @@ def shard_model(
 def shard_model_fsdp2(model):
     diffusion_model = model.diffusion_model
 
+    # Shard only the blocks, since other modules have different dtype
     # Collect params we want to ignore (everything except blocks)
     ignored_params = set()
     for name, param in diffusion_model.named_parameters():
         if not name.startswith("blocks."):
             ignored_params.add(param)
 
-    # Shard only the blocks, since other modules have different dtype
     # And also blocks is the most compute heavy part
-    for i, block in enumerate(diffusion_model.blocks):
-        if not isinstance(block, FSDPModule):
-            diffusion_model.blocks[i] = fully_shard(
-                module=block,
-                mp_policy=MixedPrecisionPolicy(),
-                reshard_after_forward=True,
-            )
+    with torch.no_grad():
+        for i, block in enumerate(diffusion_model.blocks):
+            if not isinstance(block, FSDPModule):
+                diffusion_model.blocks[i] = fully_shard(
+                    module=block,
+                    mp_policy=MixedPrecisionPolicy(),
+                    reshard_after_forward=True,
+                )
 
-    # Root wrap with ignored params
-    fully_shard(diffusion_model, ignored_params=ignored_params)
+        # Model root wrap with ignored params
+        fully_shard(diffusion_model, ignored_params=ignored_params)
 
     print("SHARD COMPLETE")
     return model
