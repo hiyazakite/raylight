@@ -131,7 +131,7 @@ class RayUNETLoader:
 
     CATEGORY = "Raylight"
 
-    def load_ray_unet(self, ray_actors, unet_name, weight_dtype):
+    def load_ray_unet(self, ray_actors, unet_name, weight_dtype, lora):
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn
@@ -150,10 +150,16 @@ class RayUNETLoader:
         patched_futures = []
         for actor in gpu_actors:
             loaded_futures.append(
+                actor.set_lora_list.remote(lora)
+            )
+        ray.get(loaded_futures)
+        loaded_futures = []
+        for actor in gpu_actors:
+            loaded_futures.append(
                 actor.load_unet.remote(unet_path, model_options=model_options)
             )
-
         ray.get(loaded_futures)
+        loaded_futures = []
 
         for actor in gpu_actors:
             if parallel_dict["is_xdit"]:
@@ -188,7 +194,7 @@ class RayLoraLoader:
                 ),
             },
             "optional": {
-                "prev_lora": ("RAY_LORA", {"default": None})
+                "prev_ray_lora": ("RAY_LORA", {"default": None})
             }
         }
 
@@ -197,30 +203,25 @@ class RayLoraLoader:
     FUNCTION = "load_lora"
     CATEGORY = "Raylight"
 
-    def load_lora(self, ray_actors, lora_name, strength_model):
+    def load_lora(self, ray_actors, lora_name, strength_model, prev_lora):
         loras_list = []
+
+        if strength_model == 0.0:
+            if prev_lora is not None:
+                loras_list.extend(prev_lora)
+            return (loras_list,)
+
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora = {
+            "path": lora_path,
+            "strength_model": strength_model,
+        }
 
+        if prev_lora is not None:
+            loras_list.extend(prev_lora)
 
-        if strength_model == 0:
-            return (ray_actors,)
-
-
-        lora = None
-        if self.loaded_lora_path is not None:
-            if self.loaded_lora_path == lora_path:
-                lora = self.loaded_lora_path
-            else:
-                self.loaded_lora_path = None
-
-        if lora is None:
-            for actor in gpu_actors:
-                self.loaded_lora_path = ray.get(
-                    actor.load_lora.remote(lora_path, strength_model)
-                )
-
-        gpu_actors = ray_actors["workers"]
-        return (ray_actors,)
+        loras_list.append(lora)
+        return (loras_list,)
 
 
 class XFuserKSamplerAdvanced:
@@ -251,16 +252,16 @@ class XFuserKSamplerAdvanced:
                 ),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "ray_actors": (
+                    "RAY_ACTORS",
+                    {"tooltip": "Ray Actor to submit the model into"},
+                ),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
                 "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
                 "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
                 "return_with_leftover_noise": (["disable", "enable"],),
-                "ray_actors": (
-                    "RAY_ACTORS",
-                    {"tooltip": "Ray Actor to submit the model into"},
-                ),
             }
         }
 

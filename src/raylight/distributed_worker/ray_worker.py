@@ -6,7 +6,11 @@ import torch
 import torch.distributed as dist
 
 import comfy
-from comfy import sd, sample, utils  # Must manually insert comfy package or ray cannot import raylight to cluster
+from comfy import (
+    sd,
+    sample,
+    utils,
+)  # Must manually insert comfy package or ray cannot import raylight to cluster
 import comfy.patcher_extension as pe
 from comfy import model_base
 
@@ -19,49 +23,74 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 # ERROR: Change scale_weight to a 1D tensor with numel equal to 1.,
 # inside transformer of scaled_model there are scale_weight tensors that are 0 dim,
 # for now use non scaled model
-def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
+def fsdp_inject_callback(
+    model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load
+):
     import torch.distributed as dist
-    model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to("cpu")
+
+    model_patcher.model.diffusion_model.blocks = (
+        model_patcher.model.diffusion_model.blocks.to("cpu")
+    )
 
     # Idk if this is usefull
-    print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
+    print(
+        f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}"
+    )
     model_patcher.model = shard_model_fsdp2(
         model_patcher.model,
     )
-    model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to(device_to)
+    model_patcher.model.diffusion_model.blocks = (
+        model_patcher.model.diffusion_model.blocks.to(device_to)
+    )
     comfy.model_management.soft_empty_cache()
     gc.collect()
     dist.barrier()
 
 
-def usp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
+def usp_inject_callback(
+    model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load
+):
     base_model = model_patcher.model
 
-    if isinstance(base_model, model_base.WAN21) or isinstance(base_model, model_base.WAN22):
-        from ..wan.distributed.xdit_context_parallel import usp_attn_forward, usp_dit_forward
+    if isinstance(base_model, model_base.WAN21) or isinstance(
+        base_model, model_base.WAN22
+    ):
+        from ..wan.distributed.xdit_context_parallel import (
+            usp_attn_forward,
+            usp_dit_forward,
+        )
+
         model = base_model.diffusion_model
         print("Initializing USP")
         for block in model.blocks:
             block.self_attn.forward = types.MethodType(
                 usp_attn_forward, block.self_attn
             )
-        model.forward_orig = types.MethodType(
-            usp_dit_forward, model
-        )
+        model.forward_orig = types.MethodType(usp_dit_forward, model)
 
     # PlaceHolder For now
     elif isinstance(base_model, model_base.Flux):
-        from ..flux.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
+        from ..flux.distributed.xdit_context_parallel import (
+            usp_dit_forward,
+            usp_attn_forward,
+        )
+
         model = base_model.diffusion_model
         dist.barrier()
 
     elif isinstance(base_model, model_base.QwenImageTransformer2DModel):
-        from ..qwen_image.distributed.xdit_context_parallel import usp_dit_forward, usp_attn_forward
+        from ..qwen_image.distributed.xdit_context_parallel import (
+            usp_dit_forward,
+            usp_attn_forward,
+        )
+
         model = base_model.diffusion_model
         dist.barrier()
 
     else:
-        print(f"Model: {type(base_model).__name__}, is not yet supported for USP Parallelism")
+        print(
+            f"Model: {type(base_model).__name__}, is not yet supported for USP Parallelism"
+        )
 
 
 class RayWorker:
@@ -111,7 +140,9 @@ class RayWorker:
                 print(f"[Rank {self.local_rank}] COMM test passed ✅ (result={result})")
 
         else:
-            print(f"Running Ray in normal seperate sampler with: {world_size} number of workers")
+            print(
+                f"Running Ray in normal seperate sampler with: {world_size} number of workers"
+            )
             self.noise_add = self.local_rank
 
         # From mochi-xdit, xdit, pipelines.py
@@ -121,6 +152,7 @@ class RayWorker:
                 init_distributed_environment,
                 initialize_model_parallel,
             )
+
             cp_rank, cp_size = cp.get_cp_rank_size()
             ulysses_degree = self.parallel_dict["ulysses_degree"]
             ring_degree = self.parallel_dict["ring_degree"]
@@ -129,14 +161,18 @@ class RayWorker:
             init_distributed_environment(rank=cp_rank, world_size=cp_size)
 
             if ulysses_degree is None and ring_degree is None:
-                print(f"No usp config, use default config: ulysses_degree={cp_size}, ring_degree=1")
+                print(
+                    f"No usp config, use default config: ulysses_degree={cp_size}, ring_degree=1"
+                )
                 initialize_model_parallel(
                     sequence_parallel_degree=world_size,
                     ring_degree=1,
                     ulysses_degree=cp_size,
                 )
             else:
-                print(f"Use usp config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}")
+                print(
+                    f"Use usp config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}"
+                )
                 initialize_model_parallel(
                     sequence_parallel_degree=world_size,
                     ring_degree=ring_degree,
@@ -173,19 +209,25 @@ class RayWorker:
         self.model = comfy.sd.load_diffusion_model(
             unet_path, model_options=model_options
         )
-        return None
+        if self.lora_list is not None:
+            self.load_lora()
 
-    def load_lora(self, lora_path, strength_model):
-        lora = None
-        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-        if isinstance(self.model.model, DTensor):
-            lora = distribute_tensor(lora)
+    def set_lora_list(self, lora):
+        self.lora_list = lora
 
-        self.loaded_lora = (lora_path, lora)
-        self.model, loaded_lora_path = comfy.sd.load_lora_for_models(
-            self.model, None, lora, strength_model, 0
-        )
-        return loaded_lora_path
+    def get_lora_list(self,):
+        return self.lora_list
+
+    def load_lora(self,):
+        for lora in self.lora_list:
+            lora_path = lora["path"]
+            strength_model = lora["strength_model"]
+            lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            self.model = comfy.sd.load_lora_for_models(
+                self.model, None, lora_model, strength_model, 0
+            )[0]
+
+            del lora_model
 
     def common_ksampler(
         self,
@@ -215,7 +257,9 @@ class RayWorker:
             )
         else:
             batch_inds = latent["batch_index"] if "batch_index" in latent else None
-            noise = comfy.sample.prepare_noise(latent_image, seed + self.noise_add, batch_inds)
+            noise = comfy.sample.prepare_noise(
+                latent_image, seed + self.noise_add, batch_inds
+            )
 
         noise_mask = None
         if "noise_mask" in latent:
