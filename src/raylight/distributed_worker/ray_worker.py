@@ -12,6 +12,7 @@ from comfy import model_base
 
 from ..wan.distributed.fsdp import shard_model_fsdp2
 import raylight.distributed_worker.context_parallel as cp
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 
 # Temp solution, should be init to meta first then load_state_dict, CPU for now
@@ -23,8 +24,6 @@ def fsdp_inject_callback(model_patcher, device_to, lowvram_model_memory, force_p
     model_patcher.model.diffusion_model.blocks = model_patcher.model.diffusion_model.blocks.to("cpu")
 
     # Idk if this is usefull
-    comfy.model_management.soft_empty_cache()
-    gc.collect()
     print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
     model_patcher.model = shard_model_fsdp2(
         model_patcher.model,
@@ -176,11 +175,17 @@ class RayWorker:
         )
         return None
 
-    def load_lora(self, lora, strength_model):
+    def load_lora(self, lora_path, strength_model):
+        lora = None
+        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        if isinstance(self.model.model, DTensor):
+            lora = distribute_tensor(lora)
 
-        self.model = comfy.sd.load_lora_for_models(
+        self.loaded_lora = (lora_path, lora)
+        self.model, loaded_lora_path = comfy.sd.load_lora_for_models(
             self.model, None, lora, strength_model, 0
-        )[0]
+        )
+        return loaded_lora_path
 
     def common_ksampler(
         self,

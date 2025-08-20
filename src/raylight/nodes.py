@@ -26,12 +26,21 @@ class RayInitializer:
             }
         }
 
-    RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_TYPES = ("RAY_ACTORS_INIT",)
+    RETURN_NAMES = ("ray_actors_init",)
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
-    def spawn_actor(self, ray_cluster_address, ray_cluster_namespace, ulysses_degree, ring_degree, FSDP, DEBUG_USP, DEBUG_FSDP):
+    def spawn_actor(
+        self,
+        ray_cluster_address,
+        ray_cluster_namespace,
+        ulysses_degree,
+        ring_degree,
+        FSDP,
+        DEBUG_USP,
+        DEBUG_FSDP,
+    ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
@@ -42,7 +51,9 @@ class RayInitializer:
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = torch.cuda.device_count()
         if world_size < ulysses_degree * ring_degree:
-            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}")
+            raise ValueError(
+                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}"
+            )
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
@@ -97,7 +108,7 @@ class RayInitializer:
         return (ray_actors,)
 
 
-class XFuserUNETLoader:
+class RayUNETLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -106,11 +117,12 @@ class XFuserUNETLoader:
                 "weight_dtype": (
                     ["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],
                 ),
-                "ray_actors": (
-                    "RAY_ACTORS",
+                "ray_actors_init": (
+                    "RAY_ACTORS_INIT",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
-            }
+            },
+            "optional": {"lora": ("RAY_LORA", {"default": None})},
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
@@ -137,7 +149,9 @@ class XFuserUNETLoader:
         loaded_futures = []
         patched_futures = []
         for actor in gpu_actors:
-            loaded_futures.append(actor.load_unet.remote(unet_path, model_options=model_options))
+            loaded_futures.append(
+                actor.load_unet.remote(unet_path, model_options=model_options)
+            )
 
         ray.get(loaded_futures)
 
@@ -153,18 +167,11 @@ class XFuserUNETLoader:
         return (ray_actors,)
 
 
-class XFuserLoraLoaderModelOnly:
-    def __init__(self):
-        self.loaded_lora_path = None
-
+class RayLoraLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": (
-                    "RAY_ACTORS",
-                    {"tooltip": "Ray Actor to submit the model into"},
-                ),
                 "lora_name": (
                     folder_paths.get_filename_list("loras"),
                     {"tooltip": "The name of the LoRA."},
@@ -179,21 +186,25 @@ class XFuserLoraLoaderModelOnly:
                         "tooltip": "How strongly to modify the diffusion model. This value can be negative.",
                     },
                 ),
+            },
+            "optional": {
+                "prev_lora": ("RAY_LORA", {"default": None})
             }
         }
 
-    RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_TYPES = ("RAY_LORA",)
+    RETURN_NAMES = ("ray_lora",)
     FUNCTION = "load_lora"
     CATEGORY = "Raylight"
 
     def load_lora(self, ray_actors, lora_name, strength_model):
-        gpu_actors = ray_actors["workers"]
+        loras_list = []
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+
 
         if strength_model == 0:
             return (ray_actors,)
 
-        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
 
         lora = None
         if self.loaded_lora_path is not None:
@@ -204,8 +215,11 @@ class XFuserLoraLoaderModelOnly:
 
         if lora is None:
             for actor in gpu_actors:
-                self.loaded_lora_path = ray.get(actor.load_lora.remote(lora, strength_model))
+                self.loaded_lora_path = ray.get(
+                    actor.load_lora.remote(lora_path, strength_model)
+                )
 
+        gpu_actors = ray_actors["workers"]
         return (ray_actors,)
 
 
@@ -277,8 +291,6 @@ class XFuserKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
     ):
-        if sampler_name in ["uni_pc", "uni_pc_bh2"]:
-            raise ValueError(f"ERROR, {sampler_name} is currently in fixing since it can causes OOM")
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False
@@ -312,14 +324,14 @@ class XFuserKSamplerAdvanced:
 
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
-    "XFuserUNETLoader": XFuserUNETLoader,
-    "XFuserLoraLoaderModelOnly": XFuserLoraLoaderModelOnly,
+    "RayUNETLoader": RayUNETLoader,
+    "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserKSamplerAdvanced": "XFuser KSampler Advanced",
-    "XFuserUNETLoader": "Load Diffusion Model (Ray)",
-    "XFuserLoraLoaderModelOnly": "Load Lora Model (Ray)",
+    "RayUNETLoader": "Load Diffusion Model (Ray)",
+    "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
 }
