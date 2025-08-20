@@ -5,7 +5,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 
 # For FSDP2
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, FSDPModule
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 
 
 # Not being used!
@@ -53,17 +53,16 @@ def shard_model_fsdp2(model):
             ignored_params.add(param)
 
     # And also blocks is the most compute heavy part
-    with torch.no_grad():
-        for i, block in enumerate(diffusion_model.blocks):
-            if not isinstance(block, FSDPModule):
-                diffusion_model.blocks[i] = fully_shard(
-                    module=block,
-                    mp_policy=MixedPrecisionPolicy(),
-                    reshard_after_forward=True,
-                )
+    for i, block in enumerate(diffusion_model.blocks):
+        if "FSDP" not in block.__class__.__name__:
+            diffusion_model.blocks[i] = fully_shard(
+                module=block,
+                mp_policy=MixedPrecisionPolicy(),
+                reshard_after_forward=True,
+            )
 
-        # Model root wrap with ignored params
-        fully_shard(diffusion_model, ignored_params=ignored_params)
+    # Model root wrap with ignored params
+    fully_shard(diffusion_model, ignored_params=ignored_params)
 
     print("SHARD COMPLETE")
     return model

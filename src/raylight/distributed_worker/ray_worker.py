@@ -174,23 +174,13 @@ class RayWorker:
         self.model = comfy.sd.load_diffusion_model(
             unet_path, model_options=model_options
         )
-
-        print(f"{self.model.load_device=}")
-        print(f"{self.model.offload_device=}")
         return None
 
     def load_lora(self, lora, strength_model):
+
         self.model = comfy.sd.load_lora_for_models(
             self.model, None, lora, strength_model, 0
         )[0]
-
-    def set_model(self, model):
-        model = model.clone()
-        model.model = model.model.to(self.device)
-        self.model = model
-        comfy.model_management.soft_empty_cache()
-        gc.collect()
-        self.is_model_load = True
 
     def common_ksampler(
         self,
@@ -227,27 +217,26 @@ class RayWorker:
             noise_mask = latent["noise_mask"]
 
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-        samples = comfy.sample.sample(
-            self.model,
-            noise,
-            steps,
-            cfg,
-            sampler_name,
-            scheduler,
-            positive,
-            negative,
-            latent_image,
-            denoise=denoise,
-            disable_noise=disable_noise,
-            start_step=start_step,
-            last_step=last_step,
-            force_full_denoise=force_full_denoise,
-            noise_mask=noise_mask,
-            disable_pbar=disable_pbar,
-            seed=seed,
-        )
-        out = latent.copy()
-        out["samples"] = samples
+        with torch.no_grad():
+            samples = comfy.sample.sample(
+                self.model,
+                noise,
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                positive,
+                negative,
+                latent_image,
+                denoise=denoise,
+                disable_noise=disable_noise,
+                start_step=start_step,
+                last_step=last_step,
+                force_full_denoise=force_full_denoise,
+                noise_mask=noise_mask,
+                disable_pbar=disable_pbar,
+                seed=seed,
+            )
+            out = latent.copy()
+            out["samples"] = samples
         return (out,)
-
-

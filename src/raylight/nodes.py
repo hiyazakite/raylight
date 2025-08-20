@@ -155,7 +155,7 @@ class XFuserUNETLoader:
 
 class XFuserLoraLoaderModelOnly:
     def __init__(self):
-        self.loaded_lora = None
+        self.loaded_lora_path = None
 
     @classmethod
     def INPUT_TYPES(s):
@@ -194,19 +194,17 @@ class XFuserLoraLoaderModelOnly:
             return (ray_actors,)
 
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+
         lora = None
-        if self.loaded_lora is not None:
-            if self.loaded_lora[0] == lora_path:
-                lora = self.loaded_lora[1]
+        if self.loaded_lora_path is not None:
+            if self.loaded_lora_path == lora_path:
+                lora = self.loaded_lora_path
             else:
-                self.loaded_lora = None
+                self.loaded_lora_path = None
 
         if lora is None:
-            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
-            self.loaded_lora = (lora_path, lora)
-
-        for actor in gpu_actors:
-            ray.get(actor.load_lora.remote(lora, strength_model))
+            for actor in gpu_actors:
+                self.loaded_lora_path = ray.get(actor.load_lora.remote(lora, strength_model))
 
         return (ray_actors,)
 
