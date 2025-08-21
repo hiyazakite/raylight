@@ -47,7 +47,8 @@ class RayInitializer:
         self.parallel_dict = dict()
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
-        if world_size := torch.cuda.device_count() == 0:
+        world_size = torch.cuda.device_count()
+        if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree:
             raise ValueError(
