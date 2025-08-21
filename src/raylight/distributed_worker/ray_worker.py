@@ -1,6 +1,7 @@
 import types
 import os
 import gc
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -118,6 +119,7 @@ class RayWorker:
                 "nccl",
                 rank=local_rank,
                 world_size=self.world_size,
+                timeout=timedelta(minutes=1)
             )
             pg = dist.group.WORLD
             cp.set_cp_group(pg, list(range(world_size)), local_rank)
