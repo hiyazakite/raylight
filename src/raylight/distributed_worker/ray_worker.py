@@ -297,4 +297,9 @@ class RayWorker:
             )
             out = latent.copy()
             out["samples"] = samples
+
+        # Temporary for reducing change of OOM before VAE
+        self.model.model = self.model.model.to("cpu")
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
         return (out,)
