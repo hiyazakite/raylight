@@ -47,7 +47,8 @@ class RayInitializer:
         self.parallel_dict = dict()
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
-        world_size = torch.cuda.device_count()
+        if world_size := torch.cuda.device_count() == 0:
+            raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree:
             raise ValueError(
                 f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}"
@@ -126,7 +127,7 @@ class RayUNETLoader:
 
     CATEGORY = "Raylight"
 
-    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora):
+    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn
