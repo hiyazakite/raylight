@@ -14,9 +14,7 @@ from comfy import (
 import comfy.patcher_extension as pe
 from comfy import model_base
 
-from ..wan.distributed.fsdp import shard_model_fsdp2
 import raylight.distributed_worker.context_parallel as cp
-from torch.distributed.tensor import DTensor, distribute_tensor
 
 
 # Temp solution, should be init to meta first then load_state_dict, CPU for now
@@ -26,22 +24,26 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 def fsdp_inject_callback(
     model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load
 ):
-    import torch.distributed as dist
+    print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
+    if isinstance(model_patcher.model, model_base.WAN21) or isinstance(model_patcher.model, model_base.WAN22):
+        from ..wan.distributed.fsdp import shard_model_fsdp2
+        model_patcher.model = shard_model_fsdp2(model_patcher.model, device_to)
 
-    model_patcher.model.diffusion_model.blocks = (
-        model_patcher.model.diffusion_model.blocks.to("cpu")
-    )
+    elif isinstance(model_patcher.model, model_base.Flux):
+        from ..flux.distributed.fsdp import shard_model_fsdp2
+        model_patcher.model = shard_model_fsdp2(model_patcher.model, device_to)
 
-    # Idk if this is usefull
-    print(
-        f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}"
-    )
-    model_patcher.model = shard_model_fsdp2(
-        model_patcher.model,
-    )
-    model_patcher.model.diffusion_model.blocks = (
-        model_patcher.model.diffusion_model.blocks.to(device_to)
-    )
+    elif isinstance(model_patcher.model, model_base.QwenImage):
+        from ..qwen_image.distributed.fsdp import shard_model_fsdp2
+        model_patcher.model = shard_model_fsdp2(model_patcher.model, device_to)
+
+    elif isinstance(model_patcher.model, model_base.HunyuanVideo):
+        from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
+        model_patcher.model = shard_model_fsdp2(model_patcher.model, device_to)
+
+    else:
+        raise ValueError(f"{type(model_patcher.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
+
     comfy.model_management.soft_empty_cache()
     gc.collect()
     dist.barrier()

@@ -2,7 +2,7 @@
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 
 
-def shard_model_fsdp2(model):
+def shard_model_fsdp2(model, device_to):
     diffusion_model = model.diffusion_model
 
     # Shard only the blocks, since other modules have different dtype
@@ -13,6 +13,8 @@ def shard_model_fsdp2(model):
             ignored_params.add(param)
 
     # And also blocks is the most compute heavy part
+    diffusion_model.single_blocks = diffusion_model.single_blocks.to("cpu")
+    diffusion_model.double_blocks = diffusion_model.double_blocks.to("cpu")
     for i, block in enumerate(diffusion_model.single_blocks):
         if "FSDP" not in block.__class__.__name__:
             diffusion_model.single_blocks[i] = fully_shard(
@@ -20,6 +22,7 @@ def shard_model_fsdp2(model):
                 mp_policy=MixedPrecisionPolicy(),
                 reshard_after_forward=True,
             )
+    diffusion_model.single_blocks = diffusion_model.single_blocks.to(device_to)
 
     for i, block in enumerate(diffusion_model.double_blocks):
         if "FSDP" not in block.__class__.__name__:
@@ -28,9 +31,11 @@ def shard_model_fsdp2(model):
                 mp_policy=MixedPrecisionPolicy(),
                 reshard_after_forward=True,
             )
+    diffusion_model.double_blocks = diffusion_model.double_blocks.to(device_to)
 
     # Model root wrap with ignored params
     fully_shard(diffusion_model, ignored_params=ignored_params)
+    model.diffusion_model = diffusion_model
 
     print("SHARD COMPLETE")
     return model

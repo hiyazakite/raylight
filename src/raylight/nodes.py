@@ -22,7 +22,6 @@ class RayInitializer:
                 "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "DEBUG_USP": ("BOOLEAN", {"default": False}),
-                "DEBUG_FSDP": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -39,7 +38,6 @@ class RayInitializer:
         ring_degree,
         FSDP,
         DEBUG_USP,
-        DEBUG_FSDP,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
@@ -71,9 +69,6 @@ class RayInitializer:
         if DEBUG_USP:
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = 1
-
-        if DEBUG_FSDP:
-            self.parallel_dict["is_fsdp"] = True
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error
