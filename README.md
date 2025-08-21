@@ -2,8 +2,13 @@
 
 Raylight. Using Ray Worker to manage multi GPU sampler setup.
 
-
+## Wan T2V 1.3B
 <img width="1918" height="887" alt="image" src="https://github.com/user-attachments/assets/57b7cdf5-ebd5-4902-bccd-fa7bbfe9ef8b" />
+
+https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
+
+## Wan T2V 14B on RTX 2000 ADA ≈ RTX 4060 TI 16GB
+<img width="1117" height="716" alt="Screenshot 2025-08-20 125936" src="https://github.com/user-attachments/assets/b2ea1621-4be1-4925-8f4a-3ff9542c6415" />
 
 ## DEBUG Notes
 
