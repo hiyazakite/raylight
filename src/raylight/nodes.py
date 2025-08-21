@@ -66,6 +66,7 @@ class RayInitializer:
 
         if FSDP:
             self.parallel_dict["is_fsdp"] = True
+            self.parallel_dict["is_fsdp_wrapped"] = False
 
         # DEBUG FOR SINGLE GPU
         if DEBUG_USP:

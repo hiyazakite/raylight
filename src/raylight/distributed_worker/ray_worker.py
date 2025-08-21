@@ -106,6 +106,7 @@ class RayWorker:
         self.noise_add = 0
 
         self.parallel_dict = parallel_dict
+        self.parallel_dict["is_fsdp_wrapped"] = False
         self.device = torch.device(f"cuda:{self.device_id}")
 
         if self.model is not None:
@@ -203,11 +204,15 @@ class RayWorker:
         print("USP registered")
 
     def patch_fsdp(self):
-        self.model.add_callback(
-            pe.CallbacksMP.ON_LOAD,
-            fsdp_inject_callback,
-        )
-        print("FSDP registered")
+        if self.parallel_dict["is_fsdp_wrapped"] is False:
+            self.model.add_callback(
+                pe.CallbacksMP.ON_LOAD,
+                fsdp_inject_callback,
+            )
+            self.parallel_dict["is_fsdp_wrapped"] = True
+            print("FSDP registered")
+        else:
+            print("FSDP already registered, skipping wrapping")
 
     def load_unet(self, unet_path, model_options):
         self.model = comfy.sd.load_diffusion_model(
