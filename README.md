@@ -1,6 +1,6 @@
 # Raylight
 
-Raylight. Using Ray Worker to manage multi GPU sampler setup.
+Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT XFuser to implement sequence parallelism 
 
 ## Wan T2V 1.3B
 <img width="1918" height="887" alt="image" src="https://github.com/user-attachments/assets/57b7cdf5-ebd5-4902-bccd-fa7bbfe9ef8b" />
