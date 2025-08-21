@@ -9,7 +9,7 @@ def shard_model_fsdp2(model, device_to):
     # Collect params we want to ignore (everything except blocks)
     ignored_params = set()
     for name, param in diffusion_model.named_parameters():
-        if (not name.startswith("single_blocks.")) or (not name.startswith("double_blocks.")):
+        if (not name.startswith("single_blocks.")) and (not name.startswith("double_blocks.")):
             ignored_params.add(param)
 
     # And also blocks is the most compute heavy part

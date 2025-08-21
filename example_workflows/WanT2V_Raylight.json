@@ -1,8 +1,8 @@
 {
   "id": "b590dcc4-90de-4786-b0a4-6b9020fb3eb3",
   "revision": 0,
-  "last_node_id": 32,
-  "last_link_id": 30,
+  "last_node_id": 34,
+  "last_link_id": 34,
   "nodes": [
     {
       "id": 20,
@@ -31,7 +31,7 @@
           "type": "CONDITIONING",
           "slot_index": 0,
           "links": [
-            20
+            33
           ]
         }
       ],
@@ -57,7 +57,7 @@
         46
       ],
       "flags": {},
-      "order": 15,
+      "order": 16,
       "mode": 0,
       "inputs": [
         {
@@ -98,7 +98,7 @@
         78
       ],
       "flags": {},
-      "order": 16,
+      "order": 17,
       "mode": 0,
       "inputs": [
         {
@@ -141,7 +141,7 @@
         453.8443908691406
       ],
       "flags": {},
-      "order": 17,
+      "order": 18,
       "mode": 0,
       "inputs": [
         {
@@ -187,7 +187,7 @@
           "type": "CONDITIONING",
           "slot_index": 0,
           "links": [
-            19
+            31
           ]
         }
       ],
@@ -309,30 +309,6 @@
       "bgcolor": "#653"
     },
     {
-      "id": 26,
-      "type": "Note",
-      "pos": [
-        632.332275390625,
-        -2.2029402256011963
-      ],
-      "size": [
-        213.0511016845703,
-        102.49275970458984
-      ],
-      "flags": {},
-      "order": 4,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Glosarry",
-      "properties": {},
-      "widgets_values": [
-        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
       "id": 28,
       "type": "Note",
       "pos": [
@@ -344,7 +320,7 @@
         292.4241943359375
       ],
       "flags": {},
-      "order": 5,
+      "order": 4,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -355,50 +331,6 @@
       ],
       "color": "#432",
       "bgcolor": "#653"
-    },
-    {
-      "id": 8,
-      "type": "RayUNETLoader",
-      "pos": [
-        954.1246948242188,
-        339.85400390625
-      ],
-      "size": [
-        270,
-        102
-      ],
-      "flags": {},
-      "order": 13,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "ray_actors_init",
-          "type": "RAY_ACTORS_INIT",
-          "link": 6
-        },
-        {
-          "name": "lora",
-          "shape": 7,
-          "type": "RAY_LORA",
-          "link": 30
-        }
-      ],
-      "outputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "links": [
-            14
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayUNETLoader"
-      },
-      "widgets_values": [
-        "Wan2_1-T2V-1_3B_bf16.safetensors",
-        "default"
-      ]
     },
     {
       "id": 16,
@@ -412,7 +344,7 @@
         61.84592056274414
       ],
       "flags": {},
-      "order": 6,
+      "order": 5,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -451,7 +383,7 @@
         106
       ],
       "flags": {},
-      "order": 7,
+      "order": 6,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -482,6 +414,50 @@
       ]
     },
     {
+      "id": 8,
+      "type": "RayUNETLoader",
+      "pos": [
+        954.1246948242188,
+        339.85400390625
+      ],
+      "size": [
+        270,
+        102
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "link": 6
+        },
+        {
+          "name": "lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": 30
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            14
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayUNETLoader"
+      },
+      "widgets_values": [
+        "wan14.safetensors",
+        "default"
+      ]
+    },
+    {
       "id": 1,
       "type": "RayInitializer",
       "pos": [
@@ -493,7 +469,7 @@
         202
       ],
       "flags": {},
-      "order": 8,
+      "order": 7,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -511,12 +487,81 @@
       "widgets_values": [
         "local",
         "default",
-        0,
-        0,
+        2,
+        1,
         true,
-        false,
         false
       ]
+    },
+    {
+      "id": 33,
+      "type": "easy cleanGpuUsed",
+      "pos": [
+        1387.1341552734375,
+        527.9064331054688
+      ],
+      "size": [
+        157.38925170898438,
+        26
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "type": "*",
+          "link": 31
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            32
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "easy cleanGpuUsed"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 34,
+      "type": "easy cleanGpuUsed",
+      "pos": [
+        1389.572021484375,
+        651.3615112304688
+      ],
+      "size": [
+        157.38925170898438,
+        26
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "type": "*",
+          "link": 33
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            34
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "easy cleanGpuUsed"
+      },
+      "widgets_values": []
     },
     {
       "id": 14,
@@ -530,7 +575,7 @@
         334
       ],
       "flags": {},
-      "order": 14,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
@@ -541,12 +586,12 @@
         {
           "name": "positive",
           "type": "CONDITIONING",
-          "link": 19
+          "link": 32
         },
         {
           "name": "negative",
           "type": "CONDITIONING",
-          "link": 20
+          "link": 34
         },
         {
           "name": "latent_image",
@@ -587,7 +632,7 @@
         "randomize",
         4,
         1,
-        "euler",
+        "uni_pc",
         "simple",
         0,
         10000,
@@ -595,18 +640,18 @@
       ]
     },
     {
-      "id": 32,
+      "id": 31,
       "type": "RayLoraLoader",
       "pos": [
-        633.7437133789062,
-        762.65380859375
+        622.13916015625,
+        600.903564453125
       ],
       "size": [
         270,
         82
       ],
       "flags": {},
-      "order": 9,
+      "order": 8,
       "mode": 0,
       "inputs": [
         {
@@ -614,45 +659,6 @@
           "shape": 7,
           "type": "RAY_LORA",
           "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "ray_lora",
-          "type": "RAY_LORA",
-          "links": [
-            29
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayLoraLoader"
-      },
-      "widgets_values": [
-        "Wan2_1_self_forcing_dmd_1_3B_lora_rank_32_fp16.safetensors",
-        1
-      ]
-    },
-    {
-      "id": 31,
-      "type": "RayLoraLoader",
-      "pos": [
-        631.8856811523438,
-        615.5230712890625
-      ],
-      "size": [
-        270,
-        82
-      ],
-      "flags": {},
-      "order": 12,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "prev_ray_lora",
-          "shape": 7,
-          "type": "RAY_LORA",
-          "link": 29
         }
       ],
       "outputs": [
@@ -668,9 +674,33 @@
         "Node name for S&R": "RayLoraLoader"
       },
       "widgets_values": [
-        "Studio_Ghibli_LORA_1_3B.safetensors",
+        "lx14.safetensors",
         1
       ]
+    },
+    {
+      "id": 26,
+      "type": "Note",
+      "pos": [
+        632.332275390625,
+        -2.2029402256011963
+      ],
+      "size": [
+        213.0511016845703,
+        102.49275970458984
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Glosarry",
+      "properties": {},
+      "widgets_values": [
+        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
     }
   ],
   "links": [
@@ -715,22 +745,6 @@
       "LATENT"
     ],
     [
-      19,
-      17,
-      0,
-      14,
-      1,
-      "CONDITIONING"
-    ],
-    [
-      20,
-      20,
-      0,
-      14,
-      2,
-      "CONDITIONING"
-    ],
-    [
       21,
       21,
       0,
@@ -763,33 +777,57 @@
       "VAE"
     ],
     [
-      29,
-      32,
-      0,
-      31,
-      0,
-      "RAY_LORA"
-    ],
-    [
       30,
       31,
       0,
       8,
       1,
       "RAY_LORA"
+    ],
+    [
+      31,
+      17,
+      0,
+      33,
+      0,
+      "*"
+    ],
+    [
+      32,
+      33,
+      0,
+      14,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      33,
+      20,
+      0,
+      34,
+      0,
+      "*"
+    ],
+    [
+      34,
+      34,
+      0,
+      14,
+      2,
+      "CONDITIONING"
     ]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.9849732675807644,
+      "scale": 0.8954302432552405,
       "offset": [
-        -351.57337105937773,
-        -212.974150220415
+        -703.8326839919522,
+        -226.500541955868
       ]
     },
-    "frontendVersion": "1.25.8"
+    "frontendVersion": "1.25.9"
   },
   "version": 0.4
 }

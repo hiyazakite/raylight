@@ -1,6 +1,42 @@
 # Raylight
 
-Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT XFuser to implement sequence parallelism 
+Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT XFuser to implement sequence parallelism
+
+
+## RTM, Known Issues
+- Scroll further down for the installation guide.
+- If NCCL communication fails before running (e.g., watchdog timeout), set the following environment variables:
+  ```bash
+  export NCCL_P2P_DISABLE=1
+  export NCCL_SHM_DISABLE=1
+  ```
+- Windows is not tested; I only have access to Linux cloud multi-GPU environments.
+- If the initial model is larger than your VRAM, there is a high chance of an OOM error. This is currently the top priority fix.
+- The tested model is the WanModel variant. The next model to be supported will be determined by usage popularity (Flux, Qwen, Hunyuan).
+- Non-DiT models are not supported.
+- Target hardware is 16GB vram and above. I will try to lower down to 12GB, but no promise for now
+- Tested on PyTorch 2.7 - 2.8 CU128
+- FLASH ATTENTION IS A MUST IF USING USP
+- Example WF just open from your comfyui menu and browse templates
+
+## Supported Models
+
+| Model             | USP | FSDP |
+|-------------------|-----|------|
+| Wan 1.3B T2V      | ✅  | ✅   |
+| Wan 14B T2V       | ✅  | ✅   |
+| Wan 14B I2V       | ❓  | ❓   |
+| Flux Dev          | ❌  | ✅   |
+| Flux Konteks      | ❌  | ❓   |
+| Flux ControlNet   | ❌  | ❌   |
+| Qwen Image        | ❌  | ❓   |
+| Hunyuan Video     | ❌  | ❓   |
+
+**Legend:**
+- ✅ = Supported
+- ❌ = Not currently supported
+- ❓ = Maybe work?
+
 
 ## Wan T2V 1.3B
 <img width="1918" height="887" alt="image" src="https://github.com/user-attachments/assets/57b7cdf5-ebd5-4902-bccd-fa7bbfe9ef8b" />
@@ -62,51 +98,19 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
 - **FSDP2** is now available and can do fp8 calculation, but needs scalar tensors converted into 1D tensors.
 
 
-## Quickstart
+## Installation
 
-1. Install [ComfyUI](https://docs.comfy.org/get_started).
-1. Install [ComfyUI-Manager](https://github.com/ltdrdata/ComfyUI-Manager)
-1. Look up this extension in ComfyUI-Manager. If you are installing manually, clone this repository under `ComfyUI/custom_nodes`.
-1. Restart ComfyUI.
-
-# Features
-
-- A list of features
-
-## Develop
-
-To install the dev dependencies and pre-commit (will run the ruff hook), do:
-
-```bash
-cd raylight
-pip install -e .[dev]
-pre-commit install
-```
-
-The `-e` flag above will result in a "live" install, in the sense that any changes you make to your node extension will automatically be picked up the next time you run ComfyUI.
-
-## Writing custom nodes
-
-An example custom node is located in [node.py](src/raylight/nodes.py). To learn more, read the [docs](https://docs.comfy.org/essentials/custom_node_overview).
-
-
-## Tests
-
-This repo contains unit tests written in Pytest in the `tests/` directory. It is recommended to unit test your custom node.
-
-- [build-pipeline.yml](.github/workflows/build-pipeline.yml) will run pytest and linter on any open PRs
-- [validate.yml](.github/workflows/validate.yml) will run [node-diff](https://github.com/Comfy-Org/node-diff) to check for breaking changes
-
-## Publishing to Registry
-
-If you wish to share this custom node with others in the community, you can publish it to the registry. We've already auto-populated some fields in `pyproject.toml` under `tool.comfy`, but please double-check that they are correct.
-
-You need to make an account on https://registry.comfy.org and create an API key token.
-
-- [ ] Go to the [registry](https://registry.comfy.org). Login and create a publisher id (everything after the `@` sign on your registry profile).
-- [ ] Add the publisher id into the pyproject.toml file.
-- [ ] Create an api key on the Registry for publishing from Github. [Instructions](https://docs.comfy.org/registry/publishing#create-an-api-key-for-publishing).
-- [ ] Add it to your Github Repository Secrets as `REGISTRY_ACCESS_TOKEN`.
-
-A Github action will run on every git push. You can also run the Github action manually. Full instructions [here](https://docs.comfy.org/registry/publishing). Join our [discord](https://discord.com/invite/comfyorg) if you have any questions!
-
+1. Clone this repository under `ComfyUI/custom_nodes`.
+2. `cd raylight`
+3. Install dependencies:
+   your_python_env - pip install -r requirements.txt
+4. Install FlashAttention:
+   - Option A (NOT recommended due to long build time):
+     pip install flash-attn --no-build-isolation
+   - Option B (recommended, use prebuilt wheel):
+     For Torch 2.8:
+       `wget https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.3.14/flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl -O flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl`
+       `pip install flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl`
+     For other versions, check:
+        https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/
+5. Restart ComfyUI.
