@@ -280,7 +280,9 @@ class RayWorker:
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
 
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
+        if self.local_rank == 0:
+            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
         with torch.no_grad():
             samples = comfy.sample.sample(
                 self.model,

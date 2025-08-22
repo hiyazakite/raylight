@@ -114,3 +114,8 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
      For other versions, check:
         https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/
 5. Restart ComfyUI.
+
+
+## Support
+[PayPal](https://paypal.me/Komikndr)
+Thanks for the support :)
