@@ -1,6 +1,7 @@
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.fsdp import FSDPModule
 
+
 def shard_model_fsdp2(model, device_to):
     diffusion_model = model.diffusion_model
 

@@ -205,6 +205,7 @@ class RayWorker:
         print("USP registered")
 
     def patch_fsdp(self):
+        self.model.load = types.MethodType(rayload, self.model)
         if self.parallel_dict["is_fsdp_wrapped"] is False:
             self.model.add_callback(
                 pe.CallbacksMP.ON_LOAD,
@@ -301,7 +302,7 @@ class RayWorker:
             out["samples"] = samples
 
         # Temporary for reducing change of OOM before VAE
-        self.model.model = self.model.model.to("cpu")
+        self.model.detach()
         comfy.model_management.soft_empty_cache()
         gc.collect()
         return (out,)
