@@ -157,12 +157,25 @@ class RayUNETLoader:
             )
         ray.get(loaded_futures)
         loaded_futures = []
-        for actor in gpu_actors:
-            loaded_futures.append(
-                actor.load_unet.remote(unet_path, model_options=model_options)
-            )
-        ray.get(loaded_futures)
-        loaded_futures = []
+
+        if parallel_dict["is_fsdp"] is True:
+            worker0 = ray.get_actor("RayWorker:0")
+            ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
+            meta_model = worker0.get_meta_model.remote()
+
+            for actor in gpu_actors:
+                if actor != worker0:
+                    loaded_futures.append(actor.set_meta_model.remote(meta_model))
+
+            ray.get(loaded_futures)
+            loaded_futures = []
+        else:
+            for actor in gpu_actors:
+                loaded_futures.append(
+                    actor.load_unet.remote(unet_path, model_options=model_options)
+                )
+            ray.get(loaded_futures)
+            loaded_futures = []
 
         for actor in gpu_actors:
             if parallel_dict["is_xdit"]:

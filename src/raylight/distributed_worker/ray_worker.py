@@ -219,6 +219,14 @@ class RayWorker:
         else:
             print("FSDP already registered, skipping wrapping")
 
+    def set_meta_model(self, model):
+        self.model = model
+
+    def get_meta_model(self):
+        m = self.model.clone()
+        m.model = m.model.to("meta")
+        return m
+
     def load_unet(self, unet_path, model_options):
         self.model = comfy.sd.load_diffusion_model(
             unet_path, model_options=model_options

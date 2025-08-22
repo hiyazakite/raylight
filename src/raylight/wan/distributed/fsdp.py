@@ -14,7 +14,6 @@ def shard_model_fsdp2(model, device_to):
                 ignored_params.add(param)
 
         # And also blocks is the most compute heavy part
-        diffusion_model.blocks = diffusion_model.blocks.to("cpu")
         for i, block in enumerate(diffusion_model.blocks):
             diffusion_model.blocks[i] = fully_shard(
                 module=block,
