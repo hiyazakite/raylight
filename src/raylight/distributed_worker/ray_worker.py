@@ -188,6 +188,9 @@ class RayWorker:
     def get_parallel_dict(self):
         return self.parallel_dict
 
+    def model_function_runner(self, fn, *args, **kwargs):
+        return fn(self.models, *args, **kwargs)
+
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
 
