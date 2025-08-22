@@ -55,6 +55,11 @@ class RayInitializer:
                 f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}"
             )
 
+        if FSDP is True and (world_size == 1):
+            raise ValueError(
+                "ERROR, FSDP cannot be use in single cuda/cudalike device"
+            )
+
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["is_dumb_parallel"] = True

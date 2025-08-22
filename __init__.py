@@ -19,6 +19,17 @@ if comfy_dir not in sys.path:
 
 from raylight.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
+# Extra nodes
+from raylight.extra.nodes_torch_compile import NODE_CLASS_MAPPINGS as COMPILE_NODE_CLASS_MAPPINGS
+from raylight.extra.nodes_torch_compile import NODE_DISPLAY_NAME_MAPPINGS as COMPILE_DISPLAY_NAME_MAPPINGS
+
+
+# CLASS
+NODE_CLASS_MAPPINGS.update(COMPILE_NODE_CLASS_MAPPINGS)
+
+
+# DISPLAY
+NODE_DISPLAY_NAME_MAPPINGS.update(COMPILE_DISPLAY_NAME_MAPPINGS)
 __all__ = [
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
