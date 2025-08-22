@@ -16,6 +16,7 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
+from .model_patcher_ray import load as rayload
 
 
 # Temp solution, should be init to meta first then load_state_dict, CPU for now
@@ -218,6 +219,7 @@ class RayWorker:
         self.model = comfy.sd.load_diffusion_model(
             unet_path, model_options=model_options
         )
+        self.model.load = rayload
         if self.lora_list is not None:
             self.load_lora()
 
