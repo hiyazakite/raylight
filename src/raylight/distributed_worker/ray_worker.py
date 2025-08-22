@@ -223,7 +223,6 @@ class RayWorker:
         self.model = comfy.sd.load_diffusion_model(
             unet_path, model_options=model_options
         )
-        self.model.load = rayload
         if self.lora_list is not None:
             self.load_lora()
 
