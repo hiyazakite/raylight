@@ -323,6 +323,8 @@ class RayWorker:
 
         # Get global rank 0 to empty its memory for VAE
         # Temp solution, since DistVAE exist
+        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
+            self.model.detach()
         comfy.model_management.soft_empty_cache()
         gc.collect()
         return (out,)
