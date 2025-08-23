@@ -2,9 +2,11 @@ import types
 import os
 import gc
 from datetime import timedelta
+import copy
 
 import torch
 import torch.distributed as dist
+import ray
 
 import comfy
 from comfy import (
@@ -208,8 +210,8 @@ class RayWorker:
         print("USP registered")
 
     def patch_fsdp(self):
-        self.model.load = types.MethodType(rayload, self.model)
         if self.parallel_dict["is_fsdp_wrapped"] is False:
+            self.model.load = types.MethodType(rayload, self.model)
             self.model.add_callback(
                 pe.CallbacksMP.ON_LOAD,
                 fsdp_inject_callback,
@@ -223,7 +225,10 @@ class RayWorker:
         self.model = model
 
     def get_meta_model(self):
-        m = self.model.clone()
+        # Any better idea? will this double the ram
+        # There is one. But i have to dive into comfyui model patcher to skip init
+        # the model
+        m = copy.deepcopy(self.model)
         m.model = m.model.to("meta")
         return m
 
@@ -267,6 +272,9 @@ class RayWorker:
         last_step=None,
         force_full_denoise=False,
     ):
+        device = next(self.model.model.diffusion_model.parameters(), None).device
+        print(f"diffusion_model is on {device}")
+        print(f"{self.model.model.device=}")
         latent_image = latent["samples"]
         latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
 
@@ -313,8 +321,8 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        # Temporary for reducing change of OOM before VAE
-        self.model.detach()
+        # Get global rank 0 to empty its memory for VAE
+        # Temp solution, since DistVAE exist
         comfy.model_management.soft_empty_cache()
         gc.collect()
         return (out,)

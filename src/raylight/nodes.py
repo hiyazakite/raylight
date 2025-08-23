@@ -55,10 +55,10 @@ class RayInitializer:
                 f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}"
             )
 
-        if FSDP is True and (world_size == 1):
-            raise ValueError(
-                "ERROR, FSDP cannot be use in single cuda/cudalike device"
-            )
+        #if FSDP is True and (world_size == 1):
+        #    raise ValueError(
+        #        "ERROR, FSDP cannot be use in single cuda/cudalike device"
+        #    )
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
@@ -161,7 +161,7 @@ class RayUNETLoader:
         if parallel_dict["is_fsdp"] is True:
             worker0 = ray.get_actor("RayWorker:0")
             ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
-            meta_model = worker0.get_meta_model.remote()
+            meta_model = ray.get(worker0.get_meta_model.remote())
 
             for actor in gpu_actors:
                 if actor != worker0:
