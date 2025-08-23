@@ -19,6 +19,7 @@ from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
 from .model_patcher_ray import load as rayload
+from .model_patcher_ray import detach as raydetach
 
 
 # Temp solution, should be init to meta first then load_state_dict, CPU for now
@@ -28,6 +29,7 @@ from .model_patcher_ray import load as rayload
 def fsdp_inject_callback(
     model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load
 ):
+    print("IF YOU GOT HERE BACKTRACE IS COMPLETE")
     print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
     if isinstance(model_patcher.model, model_base.WAN21) or isinstance(model_patcher.model, model_base.WAN22):
         from ..wan.distributed.fsdp import shard_model_fsdp2
@@ -211,6 +213,11 @@ class RayWorker:
 
     def patch_fsdp(self):
         if self.parallel_dict["is_fsdp_wrapped"] is False:
+
+            # if self.local_rank != 0:
+            #     self.model.detach = types.MethodType(raydetach, self.model)
+            self.model.detach = types.MethodType(raydetach, self.model)
+
             self.model.load = types.MethodType(rayload, self.model)
             self.model.add_callback(
                 pe.CallbacksMP.ON_LOAD,

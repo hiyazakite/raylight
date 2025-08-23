@@ -25,6 +25,16 @@ from comfy.patcher_extension import CallbacksMP
 from comfy.model_patcher import move_weight_functions
 
 
+def detach(self, unpatch_all=False):
+    self.eject_model()
+    self.model_patches_to(self.offload_device)
+    if unpatch_all:
+        self.unpatch_model(self.offload_device, unpatch_weights=unpatch_all)
+    for callback in self.get_all_callbacks(CallbacksMP.ON_DETACH):
+        callback(self, unpatch_all)
+    return self.model
+
+
 def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
     """
     Load all model modules to CPU.
