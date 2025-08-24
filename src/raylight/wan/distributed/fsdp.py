@@ -1,5 +1,7 @@
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.fsdp import FSDPModule
+from raylight.distributed_worker.model_utils import detect_dtype_mismatch
+import torch
 
 
 def shard_model_fsdp2(model, device_to):
@@ -15,11 +17,15 @@ def shard_model_fsdp2(model, device_to):
 
         # And also blocks is the most compute heavy part
         diffusion_model.blocks = diffusion_model.blocks.to("cpu")
+        ref_dtype = diffusion_model.blocks[0].self_attn.v.weight.dtype
         for i, block in enumerate(diffusion_model.blocks):
+            # This is for scaled model
+            ignored_block_params = detect_dtype_mismatch(block, ref_dtype)
             diffusion_model.blocks[i] = fully_shard(
                 module=block,
-                mp_policy=MixedPrecisionPolicy(),
+                mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.bfloat16),
                 reshard_after_forward=True,
+                ignored_params=ignored_block_params
             )
         diffusion_model.blocks = diffusion_model.blocks.to(device_to)
 

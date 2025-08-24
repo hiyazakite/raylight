@@ -210,15 +210,11 @@ class RayWorker:
 
     def patch_fsdp(self):
         self.model.load = types.MethodType(rayload, self.model)
-        if self.parallel_dict["is_fsdp_wrapped"] is False:
-            self.model.add_callback(
-                pe.CallbacksMP.ON_LOAD,
-                fsdp_inject_callback,
-            )
-            self.parallel_dict["is_fsdp_wrapped"] = True
-            print("FSDP registered")
-        else:
-            print("FSDP already registered, skipping wrapping")
+        self.model.add_callback(
+            pe.CallbacksMP.ON_LOAD,
+            fsdp_inject_callback,
+        )
+        print("FSDP registered")
 
     def load_unet(self, unet_path, model_options):
         self.model = comfy.sd.load_diffusion_model(
