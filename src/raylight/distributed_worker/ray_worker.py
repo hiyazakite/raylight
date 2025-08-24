@@ -5,6 +5,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+import ray
 
 import comfy
 from comfy import (
@@ -306,6 +307,8 @@ class RayWorker:
             out["samples"] = samples
 
         # Temporary for reducing change of OOM before VAE
+        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
+            self.model.detach()
         self.model.detach()
         comfy.model_management.soft_empty_cache()
         gc.collect()
