@@ -128,7 +128,7 @@ class RayWorker:
                 timeout=timedelta(minutes=1)
             )
             pg = dist.group.WORLD
-            cp.set_cp_group(pg, list(range(world_size)), local_rank)
+            cp.set_cp_group(pg, list(range(self.world_size)), local_rank)
 
             print("Running NCCL COMM pre-run")
 
@@ -151,7 +151,7 @@ class RayWorker:
 
         else:
             print(
-                f"Running Ray in normal seperate sampler with: {world_size} number of workers"
+                f"Running Ray in normal seperate sampler with: {self.world_size} number of workers"
             )
             self.noise_add = self.local_rank
 
@@ -175,7 +175,7 @@ class RayWorker:
                     f"No usp config, use default config: ulysses_degree={cp_size}, ring_degree=1"
                 )
                 initialize_model_parallel(
-                    sequence_parallel_degree=world_size,
+                    sequence_parallel_degree=self.world_size,
                     ring_degree=1,
                     ulysses_degree=cp_size,
                 )
@@ -184,7 +184,7 @@ class RayWorker:
                     f"Use usp config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}"
                 )
                 initialize_model_parallel(
-                    sequence_parallel_degree=world_size,
+                    sequence_parallel_degree=self.world_size,
                     ring_degree=ring_degree,
                     ulysses_degree=ulysses_degree,
                 )

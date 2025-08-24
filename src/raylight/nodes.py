@@ -18,6 +18,7 @@ class RayInitializer:
             "required": {
                 "ray_cluster_address": ("STRING", {"default": "local"}),
                 "ray_cluster_namespace": ("STRING", {"default": "default"}),
+                "GPU": ("INT", {"default": 2}),
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
@@ -34,6 +35,7 @@ class RayInitializer:
         self,
         ray_cluster_address,
         ray_cluster_namespace,
+        GPU,
         ulysses_degree,
         ring_degree,
         FSDP,
@@ -47,7 +49,10 @@ class RayInitializer:
         self.parallel_dict = dict()
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
-        world_size = torch.cuda.device_count()
+        world_size = GPU
+        max_world_size = torch.cuda.device_count()
+        if world_size > max_world_size:
+            raise ValueError("To many gpus")
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree:
