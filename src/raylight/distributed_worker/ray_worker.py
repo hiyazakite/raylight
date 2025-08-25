@@ -2,7 +2,6 @@ import types
 import os
 import gc
 from datetime import timedelta
-import copy
 
 import torch
 import torch.distributed as dist
@@ -18,8 +17,7 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
-from .model_patcher_ray import load as rayload
-from .model_patcher_ray import detach as raydetach
+# from .model_patcher_ray import detach as raydetach
 
 
 # Temp solution, should be init to meta first then load_state_dict, CPU for now
@@ -99,6 +97,9 @@ def usp_inject_callback(
         print(
             f"Model: {type(base_model).__name__}, is not yet supported for USP Parallelism"
         )
+
+# Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
+# the model need to be serialized, send to object store and can cause OOM !, so setter and getter is the pattern !
 
 
 class RayWorker:
@@ -213,24 +214,23 @@ class RayWorker:
         )
         print("USP registered")
 
-    def patch_fsdp(self):
-        self.model.load = types.MethodType(rayload, self.model)
-        self.model.add_callback(
-            pe.CallbacksMP.ON_LOAD,
-            fsdp_inject_callback,
-        )
-        print("FSDP registered")
+    # def patch_fsdp(self):
+    #     # self.model.load = types.MethodType(rayload, self.model)
+    #     self.model.add_callback(
+    #         pe.CallbacksMP.ON_LOAD,
+    #         fsdp_inject_callback,
+    #     )
+    #     print("FSDP registered")
 
     def set_meta_model(self, model):
         self.model = model
 
     def get_meta_model(self):
-        # Any better idea? will this double the ram
-        # There is one. But i have to dive into comfyui model patcher to skip init
-        # the model
-        m = copy.deepcopy(self.model)
-        m.model = m.model.to("meta")
-        return m
+        first_param_device = next(self.model.model.parameters()).device
+        if first_param_device == torch.device("meta"):
+            return self.model
+        else:
+            raise ValueError("Model recieved is not meta, can cause OOM in large model")
 
     def load_unet(self, unet_path, model_options):
         self.model = comfy.sd.load_diffusion_model(
@@ -238,6 +238,13 @@ class RayWorker:
         )
         if self.lora_list is not None:
             self.load_lora()
+
+        if self.parallel_dict["is_fsdp"] is True:
+            if self.local_rank == 0:
+                self.state_dict = self.model.model_state_dict()
+            self.model.model = self.model.model.to("meta")
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
 
     def set_lora_list(self, lora):
         self.lora_list = lora
@@ -256,15 +263,16 @@ class RayWorker:
 
             del lora_model
 
-    def fsdp_wrapper(self,):
+    def patch_fsdp(self,):
         print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
         if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
             from ..wan.distributed.fsdp import shard_model_fsdp2
-            self.model.model = shard_model_fsdp2(self.model.model, self.device)
+            self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
 
         comfy.model_management.soft_empty_cache()
         gc.collect()
         dist.barrier()
+        print("FSDP registered")
 
     def common_ksampler(
         self,
@@ -307,7 +315,7 @@ class RayWorker:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         if self.parallel_dict["is_fsdp"] is True:
-            self.fsdp_wrapper()
+            self.patch_fsdp()
 
         with torch.no_grad():
             samples = comfy.sample.sample(
