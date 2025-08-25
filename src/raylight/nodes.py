@@ -186,9 +186,6 @@ class RayUNETLoader:
             if parallel_dict["is_xdit"]:
                 patched_futures.append(actor.patch_usp.remote())
 
-            if parallel_dict["is_fsdp"]:
-                patched_futures.append(actor.patch_fsdp.remote())
-
         ray.get(patched_futures)
 
         return (ray_actors_init,)

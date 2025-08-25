@@ -125,7 +125,8 @@ class RayWorker:
                 "nccl",
                 rank=local_rank,
                 world_size=self.world_size,
-                timeout=timedelta(minutes=1)
+                timeout=timedelta(minutes=1),
+                device_id=self.device
             )
             pg = dist.group.WORLD
             cp.set_cp_group(pg, list(range(self.world_size)), local_rank)
@@ -254,6 +255,16 @@ class RayWorker:
 
             del lora_model
 
+    def fsdp_wrapper(self, ):
+        print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
+        if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
+            from ..wan.distributed.fsdp import shard_model_fsdp2
+            self.model.model = shard_model_fsdp2(self.model.model, self.device)
+
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
+        dist.barrier()
+
     def common_ksampler(
         self,
         seed,
@@ -270,32 +281,34 @@ class RayWorker:
         last_step=None,
         force_full_denoise=False,
     ):
-        device = next(self.model.model.diffusion_model.parameters(), None).device
-        print(f"diffusion_model is on {device}")
-        print(f"{self.model.model.device=}")
-        latent_image = latent["samples"]
-        latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
 
-        if disable_noise:
-            noise = torch.zeros(
-                latent_image.size(),
-                dtype=latent_image.dtype,
-                layout=latent_image.layout,
-                device="cpu",
-            )
-        else:
-            batch_inds = latent["batch_index"] if "batch_index" in latent else None
-            noise = comfy.sample.prepare_noise(
-                latent_image, seed + self.noise_add, batch_inds
-            )
+        if self.local_rank == 0:
+            latent_image = latent["samples"]
+            latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
 
-        noise_mask = None
-        if "noise_mask" in latent:
-            noise_mask = latent["noise_mask"]
+            if disable_noise:
+                noise = torch.zeros(
+                    latent_image.size(),
+                    dtype=latent_image.dtype,
+                    layout=latent_image.layout,
+                    device="cpu",
+                )
+            else:
+                batch_inds = latent["batch_index"] if "batch_index" in latent else None
+                noise = comfy.sample.prepare_noise(
+                    latent_image, seed + self.noise_add, batch_inds
+                )
+
+            noise_mask = None
+            if "noise_mask" in latent:
+                noise_mask = latent["noise_mask"]
+            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
-        if self.local_rank == 0:
-            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        if self.parallel_dict["is_fsdp"] is True:
+            self.fsdp_wrapper()
+
         with torch.no_grad():
             samples = comfy.sample.sample(
                 self.model,
