@@ -212,21 +212,12 @@ class RayWorker:
         print("USP registered")
 
     def patch_fsdp(self):
-        if self.parallel_dict["is_fsdp_wrapped"] is False:
-
-            # if self.local_rank != 0:
-            #     self.model.detach = types.MethodType(raydetach, self.model)
-            self.model.detach = types.MethodType(raydetach, self.model)
-
-            self.model.load = types.MethodType(rayload, self.model)
-            self.model.add_callback(
-                pe.CallbacksMP.ON_LOAD,
-                fsdp_inject_callback,
-            )
-            self.parallel_dict["is_fsdp_wrapped"] = True
-            print("FSDP registered")
-        else:
-            print("FSDP already registered, skipping wrapping")
+        self.model.load = types.MethodType(rayload, self.model)
+        self.model.add_callback(
+            pe.CallbacksMP.ON_LOAD,
+            fsdp_inject_callback,
+        )
+        print("FSDP registered")
 
     def set_meta_model(self, model):
         self.model = model
@@ -328,10 +319,10 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        # Get global rank 0 to empty its memory for VAE
-        # Temp solution, since DistVAE exist
+        # Temporary for reducing change of OOM before VAE
         if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
             self.model.detach()
+        self.model.detach()
         comfy.model_management.soft_empty_cache()
         gc.collect()
         return (out,)

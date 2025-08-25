@@ -16,6 +16,8 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+# This file only contains swapped function from ComfyUI model_patcher.py into raylight equivalent
+
 from __future__ import annotations
 
 import logging
