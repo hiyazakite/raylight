@@ -109,6 +109,7 @@ class RayWorker:
         self.world_size = world_size
         self.device_id = device_id
         self.noise_add = 0
+        self.state_dict = None
 
         self.parallel_dict = parallel_dict
         self.parallel_dict["is_fsdp_wrapped"] = False
@@ -255,7 +256,7 @@ class RayWorker:
 
             del lora_model
 
-    def fsdp_wrapper(self, ):
+    def fsdp_wrapper(self,):
         print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
         if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
             from ..wan.distributed.fsdp import shard_model_fsdp2
@@ -281,30 +282,29 @@ class RayWorker:
         last_step=None,
         force_full_denoise=False,
     ):
+        latent_image = latent["samples"]
+        latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
 
-        if self.local_rank == 0:
-            latent_image = latent["samples"]
-            latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
+        if disable_noise:
+            noise = torch.zeros(
+                latent_image.size(),
+                dtype=latent_image.dtype,
+                layout=latent_image.layout,
+                device="cpu",
+            )
+        else:
+            batch_inds = latent["batch_index"] if "batch_index" in latent else None
+            noise = comfy.sample.prepare_noise(
+                latent_image, seed + self.noise_add, batch_inds
+            )
 
-            if disable_noise:
-                noise = torch.zeros(
-                    latent_image.size(),
-                    dtype=latent_image.dtype,
-                    layout=latent_image.layout,
-                    device="cpu",
-                )
-            else:
-                batch_inds = latent["batch_index"] if "batch_index" in latent else None
-                noise = comfy.sample.prepare_noise(
-                    latent_image, seed + self.noise_add, batch_inds
-                )
-
-            noise_mask = None
-            if "noise_mask" in latent:
-                noise_mask = latent["noise_mask"]
-            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        noise_mask = None
+        if "noise_mask" in latent:
+            noise_mask = latent["noise_mask"]
 
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
+        if self.local_rank == 0:
+            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         if self.parallel_dict["is_fsdp"] is True:
             self.fsdp_wrapper()
