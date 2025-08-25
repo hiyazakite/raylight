@@ -264,15 +264,36 @@ class RayWorker:
             del lora_model
 
     def patch_fsdp(self,):
+        from torch.distributed.fsdp import FSDPModule
         print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
-        if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
-            from ..wan.distributed.fsdp import shard_model_fsdp2
-            self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
 
-        comfy.model_management.soft_empty_cache()
-        gc.collect()
-        dist.barrier()
-        print("FSDP registered")
+        if not isinstance(self.model.model.diffusion_model, FSDPModule):
+            if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
+                from ..wan.distributed.fsdp import shard_model_fsdp2
+                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
+
+            elif isinstance(self.model.model, model_base.Flux):
+                from ..flux.distributed.fsdp import shard_model_fsdp2
+                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
+
+            elif isinstance(self.model.model, model_base.QwenImage):
+                from ..qwen_image.distributed.fsdp import shard_model_fsdp2
+                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
+
+            elif isinstance(self.model.model, model_base.HunyuanVideo):
+                from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
+                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
+
+            else:
+                raise ValueError(f"{type(self.model.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
+
+            self.state_dict = None
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
+            dist.barrier()
+            print("FSDP registered")
+        else:
+            print("FSDP already registered, skip wrapping...")
 
     def common_ksampler(
         self,
