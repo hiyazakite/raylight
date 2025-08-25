@@ -42,8 +42,6 @@ def shard_model_fsdp2(model, device_to, model_state_dict):
 
     fully_shard(diffusion_model, ignored_params=ignored_params)
     ##################
-    param = next(diffusion_model.parameters())
-    inspect_tensor(param)
     ##################
     model.diffusion_model = diffusion_model
 
@@ -55,6 +53,8 @@ def shard_model_fsdp2(model, device_to, model_state_dict):
             broadcast_from_rank0=True,
         ),
     )
+    param = next(diffusion_model.parameters())
+    inspect_tensor(param)
 
     print("SHARD COMPLETE")
     return model

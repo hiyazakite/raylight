@@ -291,6 +291,10 @@ class RayWorker:
             comfy.model_management.soft_empty_cache()
             gc.collect()
             dist.barrier()
+
+            from ..wan.distributed.fsdp import inspect_tensor
+            param = next(self.model.model.diffusion_model.blocks.parameters())
+            inspect_tensor(param)
             print("FSDP registered")
         else:
             print("FSDP already registered, skip wrapping...")
