@@ -332,10 +332,11 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        # Temporary for reducing change of OOM before VAE
+        # torch alloc still have some residue if other rank not detach
+        # either detach all or just rank 0? possible speed lost in preparation step
+        # when model being brodcasted ?
         if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
             self.model.detach()
-        self.model.detach()
         comfy.model_management.soft_empty_cache()
         gc.collect()
         return (out,)
