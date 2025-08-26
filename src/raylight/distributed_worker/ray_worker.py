@@ -17,7 +17,7 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
-# from .model_patcher_ray import detach as raydetach
+from .model_patcher_ray import make_ray_patch_weight_to_device
 
 
 def usp_inject_callback(
@@ -85,6 +85,7 @@ class RayWorker:
         self.parallel_dict = parallel_dict
         self.parallel_dict["is_fsdp_wrapped"] = False
         self.device = torch.device(f"cuda:{self.device_id}")
+        self.device_mesh = None
 
         if self.model is not None:
             self.is_model_load = True
@@ -102,6 +103,7 @@ class RayWorker:
                 world_size=self.world_size,
                 timeout=timedelta(minutes=1),
             )
+            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
             pg = dist.group.WORLD
             cp.set_cp_group(pg, list(range(self.world_size)), local_rank)
 
@@ -225,6 +227,7 @@ class RayWorker:
             lora_path = lora["path"]
             strength_model = lora["strength_model"]
             lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            print(self.model.weight_wrapper_patches)
             self.model = comfy.sd.load_lora_for_models(
                 self.model, None, lora_model, strength_model, 0
             )[0]
@@ -259,10 +262,6 @@ class RayWorker:
             comfy.model_management.soft_empty_cache()
             gc.collect()
             dist.barrier()
-
-            from ..wan.distributed.fsdp import inspect_tensor
-            param = next(self.model.model.diffusion_model.blocks.parameters())
-            inspect_tensor(param)
             print("FSDP registered")
         else:
             print("FSDP already registered, skip wrapping...")
@@ -308,6 +307,10 @@ class RayWorker:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         if self.parallel_dict["is_fsdp"] is True:
+            self.model.patch_weight_to_device = types.MethodType(
+                make_ray_patch_weight_to_device(convert_dtensor=True, device_mesh=self.device_mesh),
+                self.model
+            )
             self.patch_fsdp()
 
         with torch.no_grad():
