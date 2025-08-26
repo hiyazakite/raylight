@@ -123,12 +123,14 @@ class RayWorker:
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
+            # dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
+
+            # NCCL USP error if we put device into dist.init_process_group
             dist.init_process_group(
                 "nccl",
                 rank=local_rank,
                 world_size=self.world_size,
                 timeout=timedelta(minutes=1),
-                device_id=self.device
             )
             pg = dist.group.WORLD
             cp.set_cp_group(pg, list(range(self.world_size)), local_rank)
