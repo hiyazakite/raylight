@@ -20,39 +20,6 @@ import raylight.distributed_worker.context_parallel as cp
 # from .model_patcher_ray import detach as raydetach
 
 
-# Temp solution, should be init to meta first then load_state_dict, CPU for now
-# ERROR: Change scale_weight to a 1D tensor with numel equal to 1.,
-# inside transformer of scaled_model there are scale_weight tensors that are 0 dim,
-# for now use non scaled model
-def fsdp_inject_callback(
-    model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load
-):
-    print("IF YOU GOT HERE BACKTRACE IS COMPLETE")
-    print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model_patcher.model.diffusion_model).__name__}")
-    if isinstance(model_patcher.model, model_base.WAN21) or isinstance(model_patcher.model, model_base.WAN22):
-        from ..wan.distributed.fsdp import shard_model_fsdp2
-        model_patcher.model = shard_model_fsdp2(model_patcher.model, device_to)
-
-    elif isinstance(model_patcher.model, model_base.Flux):
-        from ..flux.distributed.fsdp import shard_model_fsdp2
-        model_patcher.model = shard_model_fsdp2(model_patcher.model, device_to)
-
-    elif isinstance(model_patcher.model, model_base.QwenImage):
-        from ..qwen_image.distributed.fsdp import shard_model_fsdp2
-        model_patcher.model = shard_model_fsdp2(model_patcher.model, device_to)
-
-    elif isinstance(model_patcher.model, model_base.HunyuanVideo):
-        from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
-        model_patcher.model = shard_model_fsdp2(model_patcher.model, device_to)
-
-    else:
-        raise ValueError(f"{type(model_patcher.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
-
-    comfy.model_management.soft_empty_cache()
-    gc.collect()
-    dist.barrier()
-
-
 def usp_inject_callback(
     model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load
 ):
@@ -101,6 +68,9 @@ def usp_inject_callback(
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
 # the model need to be serialized, send to object store and can cause OOM !, so setter and getter is the pattern !
 
+
+# If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
+# If called from ray actor within. dist.barrier() become the sync.
 
 class RayWorker:
     def __init__(self, local_rank, world_size, device_id, parallel_dict):
@@ -216,16 +186,12 @@ class RayWorker:
         )
         print("USP registered")
 
-    # def patch_fsdp(self):
-    #     # self.model.load = types.MethodType(rayload, self.model)
-    #     self.model.add_callback(
-    #         pe.CallbacksMP.ON_LOAD,
-    #         fsdp_inject_callback,
-    #     )
-    #     print("FSDP registered")
-
     def set_meta_model(self, model):
-        self.model = model
+        first_param_device = next(model.model.parameters()).device
+        if first_param_device == torch.device("meta"):
+            self.model = model
+        else:
+            raise ValueError("Model being set is not meta, can cause OOM in large model")
 
     def get_meta_model(self):
         first_param_device = next(self.model.model.parameters()).device

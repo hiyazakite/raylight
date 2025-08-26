@@ -20,23 +20,47 @@
 
 from __future__ import annotations
 
+import collections
 import logging
 
+import torch
 
+import comfy
 from comfy.patcher_extension import CallbacksMP
-from comfy.model_patcher import move_weight_functions
+from comfy.model_patcher import (move_weight_functions,
+                                 get_key_weight,
+                                 string_to_seed)
 
 
-def detach(self, unpatch_all=False):
-    self.eject_model()
-    self.model_patches_to(self.offload_device)
-    if unpatch_all:
-        self.unpatch_model(self.offload_device, unpatch_weights=unpatch_all)
-    for callback in self.get_all_callbacks(CallbacksMP.ON_DETACH):
-        callback(self, unpatch_all)
-    return self.model
+def patch_weight_to_device(self, key, device_to=None, inplace_update=False, convert_dtensor=False):
+    if key not in self.patches:
+        return
+
+    weight, set_func, convert_func = get_key_weight(self.model, key)
+    inplace_update = self.weight_inplace_update or inplace_update
+
+    if key not in self.backup:
+        self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
+
+    if device_to is not None:
+        temp_weight = comfy.model_management.cast_to_device(weight, device_to, torch.float32, copy=True)
+    else:
+        temp_weight = weight.to(torch.float32, copy=True)
+    if convert_func is not None:
+        temp_weight = convert_func(temp_weight, inplace=True)
+
+    out_weight = comfy.lora.calculate_weight(self.patches[key], temp_weight, key)
+    if set_func is None:
+        out_weight = comfy.float.stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key))
+        if inplace_update:
+            comfy.utils.copy_to_param(self.model, key, out_weight)
+        else:
+            comfy.utils.set_attr_param(self.model, key, out_weight)
+    else:
+        set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
 
 
+# Currently unsused
 def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
     """
     Load all model modules to CPU.
