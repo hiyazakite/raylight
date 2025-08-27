@@ -4,7 +4,7 @@ from typing import Optional
 import torch
 from torch.distributed.tensor import DTensor
 import comfy.model_management
-from .base import WeightAdapterBase, weight_decompose
+from comfy.weight_adapter.base import WeightAdapterBase, weight_decompose
 
 
 class LoKrAdapter(WeightAdapterBase):

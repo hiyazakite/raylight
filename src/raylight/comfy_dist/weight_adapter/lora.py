@@ -4,7 +4,7 @@ from typing import Optional
 import torch
 from torch.distributed.tensor import DTensor
 import comfy.model_management
-from comfy.weight_adapter.base import (
+from .base import (
     WeightAdapterBase,
     WeightAdapterTrainBase,
     weight_decompose,

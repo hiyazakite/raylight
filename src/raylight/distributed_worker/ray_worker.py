@@ -228,9 +228,15 @@ class RayWorker:
             strength_model = lora["strength_model"]
             lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
             print(self.model.weight_wrapper_patches)
-            self.model = comfy.sd.load_lora_for_models(
-                self.model, None, lora_model, strength_model, 0
-            )[0]
+
+            if self.parallel_dict["is_fsdp"] is True:
+                self.model = comfy.sd.load_lora_for_models(
+                    self.model, None, lora_model, strength_model, 0
+                )[0]
+            else:
+                self.model = comfy.sd.load_lora_for_models(
+                    self.model, None, lora_model, strength_model, 0
+                )[0]
 
             del lora_model
 
