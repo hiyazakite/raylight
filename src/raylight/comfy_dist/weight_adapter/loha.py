@@ -60,7 +60,7 @@ class LoHaAdapter(WeightAdapterBase):
         function,
         intermediate_dtype=torch.float32,
         original_weight=None,
-
+        device_mesh=None,
     ):
         v = self.weights
         w1a = v[0]
@@ -97,7 +97,7 @@ class LoHaAdapter(WeightAdapterBase):
                 weight = weight_decompose(dora_scale, weight, lora_diff, alpha, strength, intermediate_dtype, function)
             else:
                 if isinstance(weight, DTensor):
-                    weight += function(((strength * alpha) * lora_diff).type(weight.dtype))
+                    weight += DTensor.from_local(function(((strength * alpha) * lora_diff).type(weight.dtype)), device_mesh)
                 else:
                     weight += function(((strength * alpha) * lora_diff).type(weight.dtype))
         except Exception as e:

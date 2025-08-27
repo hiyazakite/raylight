@@ -30,8 +30,6 @@ from comfy.model_patcher import (get_key_weight,
 from raylight import comfy_dist
 
 
-
-
 def patch_weight_to_device(self, key, device_to=None, inplace_update=False, convert_dtensor=False, device_mesh=None):
     if key not in self.patches:
         return
