@@ -17,7 +17,7 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
-from .model_patcher_ray import make_ray_patch_weight_to_device
+from raylight.comfy_dist.model_patcher import make_ray_patch_weight_to_device
 
 
 def usp_inject_callback(

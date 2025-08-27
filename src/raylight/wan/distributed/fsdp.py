@@ -1,22 +1,6 @@
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-from torch.distributed.fsdp import FSDPModule
-from raylight.distributed_worker.model_utils import detect_dtype_mismatch
+from raylight.distributed_worker.utils import detect_dtype_mismatch
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
-
-from torch.distributed._tensor import DTensor
-
-def inspect_tensor(t):
-    if isinstance(t, DTensor):
-        print("=== DTensor Info ===")
-        print("Global shape:", t.shape)        # logical (full) shape
-        print("Local shape:", t.to_local().shape)  # what this rank stores
-        print("Device mesh:", t.device_mesh)   # mesh object
-        print("Placement:", t.placements)      # how tensor is sharded (Shard, Replicate, etc.)
-        print("====================")
-    else:
-        print("Regular Tensor:", t.shape, t.device)
-
-# Example: pick any parameter
 
 
 def shard_model_fsdp2(model, device_to, model_state_dict):
@@ -41,8 +25,6 @@ def shard_model_fsdp2(model, device_to, model_state_dict):
         )
 
     fully_shard(diffusion_model, ignored_params=ignored_params)
-    ##################
-    ##################
     model.diffusion_model = diffusion_model
 
     set_model_state_dict(
