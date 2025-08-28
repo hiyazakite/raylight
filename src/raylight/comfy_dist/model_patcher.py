@@ -65,11 +65,9 @@ def patch_weight_to_device(self, key, device_to=None, inplace_update=False, conv
         set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
 
 
-def ray_patch_fsdp(self, device_to=None):
+def ray_patch_fsdp(self, model_state_dict, device_to=None):
     from torch.distributed.fsdp import FSDPModule
-    print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
-
-    model_state_dict = self.model.model_state_dict()
+    print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
 
     if not isinstance(self.model.diffusion_model, FSDPModule):
         if isinstance(self.model, model_base.WAN21) or isinstance(self.model, model_base.WAN22):
@@ -138,7 +136,10 @@ def load_fsdp(self, device_to=None, lowvram_model_memory=0, force_patch_weights=
 
             logging.info(f"Loaded completely on CPU: mem={mem_counter / (1024*1024):.2f} MB")
 
-        self.patch_fsdp()
+        if rank == 0:
+            model_state_dict = self.model_state_dict()
+            self.model.to("meta")
+        self.patch_fsdp(device_to, model_state_dict)
         self.model.device = cuda_device
         self.model.model_loaded_weight_memory = mem_counter
         self.model.current_weight_patches_uuid = self.patches_uuid

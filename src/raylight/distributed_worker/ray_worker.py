@@ -209,12 +209,6 @@ class RayWorker:
         if self.lora_list is not None:
             self.load_lora()
 
-        if self.parallel_dict["is_fsdp"] is True:
-            if self.local_rank != 0:
-                self.model.model = self.model.model.to("meta")
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
-
     def set_lora_list(self, lora):
         self.lora_list = lora
 
@@ -317,7 +311,7 @@ class RayWorker:
                 self.model
             )
             self.model.patch_fsdp = types.MethodType(
-                ray_patch_fsdp,
+                make_ray_load_fsdp(self.local_rank),
                 self.model
             )
 
