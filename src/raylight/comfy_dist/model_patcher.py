@@ -149,6 +149,7 @@ def load_fsdp(self, device_to=None, lowvram_model_memory=0, force_patch_weights=
 
         self.apply_hooks(self.forced_hooks, force_apply=True)
 
+
 def make_ray_load_fsdp(rank):
     # Factory function to wrap load_fsdp so it can be injected with rank
     def _ray_load_fsdp(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
@@ -161,6 +162,7 @@ def make_ray_load_fsdp(rank):
             rank=rank
         )
     return _ray_load_fsdp
+
 
 def make_ray_patch_weight_to_device(convert_dtensor=False, device_mesh=None):
     # Factory function to wrap ray_patch_weight_to_device with custom args.

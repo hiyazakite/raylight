@@ -169,6 +169,11 @@ class RayWorker:
     def get_parallel_dict(self):
         return self.parallel_dict
 
+    def clear_model(self):
+        self.model = None
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)
 

@@ -156,6 +156,14 @@ class RayUNETLoader:
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         loaded_futures = []
         patched_futures = []
+
+        for actor in gpu_actors:
+            loaded_futures.append(
+                actor.clear_model.remote()
+            )
+        ray.get(loaded_futures)
+        loaded_futures = []
+
         for actor in gpu_actors:
             loaded_futures.append(
                 actor.set_lora_list.remote(lora)
