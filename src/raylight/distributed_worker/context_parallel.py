@@ -49,4 +49,3 @@ def get_cp_group():
 
 def is_cp_active():
     return _CONTEXT_PARALLEL_GROUP is not None
-

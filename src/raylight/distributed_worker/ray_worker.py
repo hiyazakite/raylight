@@ -17,7 +17,7 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
-from raylight.comfy_dist.model_patcher import make_ray_patch_weight_to_device
+from raylight.comfy_dist.model_patcher import make_ray_load_fsdp, ray_patch_fsdp
 
 
 def usp_inject_callback(
@@ -210,9 +210,8 @@ class RayWorker:
             self.load_lora()
 
         if self.parallel_dict["is_fsdp"] is True:
-            if self.local_rank == 0:
-                self.state_dict = self.model.model_state_dict()
-            self.model.model = self.model.model.to("meta")
+            if self.local_rank != 0:
+                self.model.model = self.model.model.to("meta")
             comfy.model_management.soft_empty_cache()
             gc.collect()
 
@@ -313,11 +312,14 @@ class RayWorker:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         if self.parallel_dict["is_fsdp"] is True:
-            self.model.patch_weight_to_device = types.MethodType(
-                make_ray_patch_weight_to_device(convert_dtensor=True, device_mesh=self.device_mesh),
+            self.model.load = types.MethodType(
+                make_ray_load_fsdp(self.local_rank),
                 self.model
             )
-            self.patch_fsdp()
+            self.model.patch_fsdp = types.MethodType(
+                ray_patch_fsdp,
+                self.model
+            )
 
         with torch.no_grad():
             samples = comfy.sample.sample(
