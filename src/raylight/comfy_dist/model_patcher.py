@@ -32,8 +32,8 @@ from comfy.model_patcher import (get_key_weight,
                                  string_to_seed,
                                  move_weight_functions)
 
-from raylight import comfy_dist
 from comfy.patcher_extension import CallbacksMP
+from .lora import calculate_weight
 
 
 def patch_weight_to_device(self, key, device_to=None, inplace_update=False, convert_dtensor=False, device_mesh=None):
@@ -52,7 +52,7 @@ def patch_weight_to_device(self, key, device_to=None, inplace_update=False, conv
     if convert_func is not None:
         temp_weight = convert_func(temp_weight, inplace=True)
 
-    out_weight = comfy_dist.lora.calculate_weight(self.patches[key], temp_weight, key, device_mesh=device_mesh)
+    out_weight = calculate_weight(self.patches[key], temp_weight, key, device_mesh=device_mesh)
     if set_func is None:
         out_weight = comfy.float.stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key))
 

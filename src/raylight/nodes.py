@@ -157,6 +157,11 @@ class RayUNETLoader:
         loaded_futures = []
         patched_futures = []
 
+        # diff lora from instance need to be rebuild to not cause
+        # mem leak
+        # current_lora_list = ray.get(gpu_actors[0].get_lora_list.remote())
+        # if current_lora_list != lora:
+
         for actor in gpu_actors:
             loaded_futures.append(
                 actor.clear_model.remote()
