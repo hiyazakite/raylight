@@ -60,10 +60,10 @@ class RayInitializer:
                 f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}"
             )
 
-        #if FSDP is True and (world_size == 1):
-        #    raise ValueError(
-        #        "ERROR, FSDP cannot be use in single cuda/cudalike device"
-        #    )
+        if FSDP is True and (world_size == 1):
+            raise ValueError(
+                "ERROR, FSDP cannot be use in single cuda/cudalike device"
+            )
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
@@ -78,7 +78,6 @@ class RayInitializer:
             self.parallel_dict["is_fsdp"] = True
             self.parallel_dict["is_fsdp_wrapped"] = False
 
-        # DEBUG FOR SINGLE GPU
         if DEBUG_USP:
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = 1
@@ -140,6 +139,9 @@ class RayUNETLoader:
     CATEGORY = "Raylight"
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
+        gpu_actors = ray_actors_init["workers"]
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn
@@ -149,18 +151,17 @@ class RayUNETLoader:
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
 
+        if parallel_dict["is_fsdp"] is True and ("scale" in unet_name.lower()):
+            raise ValueError(
+                """Pre-FSDP filename check: Non uniform dtype FP8 transformer block is currently
+                not supported for Raylight FSDP implementation, especially Ampere architecture and below,
+                try non scaled model"""
+            )
+
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
-        gpu_actors = ray_actors_init["workers"]
-
-        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         loaded_futures = []
         patched_futures = []
-
-        # diff lora from instance need to be rebuild to not cause
-        # mem leak
-        # current_lora_list = ray.get(gpu_actors[0].get_lora_list.remote())
-        # if current_lora_list != lora:
 
         for actor in gpu_actors:
             loaded_futures.append(

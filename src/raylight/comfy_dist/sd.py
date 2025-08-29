@@ -1,6 +1,6 @@
 import logging
 
-import raylight.comfy_dist as comfy_dist
+from raylight import comfy_dist
 import comfy
 
 

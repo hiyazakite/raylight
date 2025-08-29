@@ -2,6 +2,7 @@ import types
 import os
 import gc
 from datetime import timedelta
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -18,7 +19,13 @@ from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
 from raylight.comfy_dist.model_patcher import make_ray_patch_weight_to_device
-from ..comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
+from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
+
+# see comment on init_process_group
+warnings.filterwarnings(
+    "ignore",
+    message="No device id is provided via `init_process_group` or `barrier`.*"
+)
 
 
 def usp_inject_callback(
@@ -95,8 +102,6 @@ class RayWorker:
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
-            # dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
-
             # NCCL USP error if we put device into dist.init_process_group
             dist.init_process_group(
                 "nccl",
@@ -345,9 +350,6 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        # torch alloc still have some residue if other rank not detach
-        # either detach all or just rank 0? possible speed lost in preparation step
-        # when model being brodcasted ?
         if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
             self.model.detach()
         comfy.model_management.soft_empty_cache()
