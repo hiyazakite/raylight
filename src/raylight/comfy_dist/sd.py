@@ -4,7 +4,7 @@ import raylight.comfy_dist as comfy_dist
 import comfy
 
 
-def load_lora_for_models(model, lora, strength_model, strength_clip):
+def load_lora_for_models(model, lora, strength_model):
     key_map = {}
     if model is not None:
         key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
