@@ -1,24 +1,14 @@
 # Raylight
 
-Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT XFuser to implement sequence parallelism
+Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser and FSDP to implement parallelism
 
 ## NOTICE
-**Main branch** is not affected, only **fsdp_metatensor branch**.
+In rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP.
+However, in most tests this issue does not appear, even with the same Docker setup....
 
-FSDP is currently undergoing a major overhaul in the fsdp_metatensor branch.  
-To support FP8 dtype models, it now requires FSDP2.  
+If memory leak cases continue to grow, I will force a reinitialization of the Ray worker.
 
-Additionally:
-- `sync_module_states=True/False` has been moved to DCP.  
-- State dicts are broadcast from rank 0 using `set_model_state_dict` with `broadcast_from_rank0=True`.  
-
-Since FSDP2 uses DTensor, every model mutation requires the tensor to be converted into a DTensor.  
-Because of this, LoRA is currently disabled.  
-
-The code is still messy but already working with the Wan model.  
-The remaining task is to reconsolidate Comfy LoRA libs into Comfy Distributed LoRA libs.
-
-
+In the meantime, if you encounter this issue, please restart Comfy.
 
 ## RTM, Known Issues
 - Scroll further down for the installation guide.
