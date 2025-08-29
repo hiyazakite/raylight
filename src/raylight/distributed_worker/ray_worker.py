@@ -18,6 +18,7 @@ from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
 from raylight.comfy_dist.model_patcher import make_ray_patch_weight_to_device
+from ..comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 
 
 def usp_inject_callback(
@@ -213,6 +214,12 @@ class RayWorker:
         )
         if self.lora_list is not None:
             self.load_lora()
+        if self.parallel_dict["is_fsdp"] is True:
+            if self.local_rank == 0:
+                self.state_dict = self.model.model_state_dict()
+            self.model.model = self.model.model.to("meta")
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
 
     def set_lora_list(self, lora):
         self.lora_list = lora
@@ -225,11 +232,15 @@ class RayWorker:
             lora_path = lora["path"]
             strength_model = lora["strength_model"]
             lora_model = comfy.utils.load_torch_file(lora_path, safe_load=True)
-            print(self.model.weight_wrapper_patches)
 
-            self.model = comfy.sd.load_lora_for_models(
-                self.model, None, lora_model, strength_model, 0
-            )[0]
+            if self.parallel_dict["is_fsdp"] is True:
+                self.model = ray_load_lora_for_models(
+                    self.model, lora_model, strength_model
+                )
+            else:
+                self.model = comfy.sd.load_lora_for_models(
+                    self.model, None, lora_model, strength_model, 0
+                )[0]
             del lora_model
 
     def patch_fsdp(self,):
