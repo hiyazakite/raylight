@@ -18,10 +18,9 @@ In the meantime, if you encounter this issue, please restart Comfy.
   export NCCL_SHM_DISABLE=1
   ```
 - Windows is not tested; I only have access to Linux cloud multi-GPU environments.
-- If the initial model is larger than your VRAM, there is a high chance of an OOM error. This is currently the top priority fix.
 - The tested model is the WanModel variant. The next model to be supported will be determined by usage popularity (Flux, Qwen, Hunyuan).
 - Non-DiT models are not supported.
-- Target hardware is 16GB vram and above. I will try to lower down to 12GB, but no promise for now
+- Target hardware is 16GB vram and above. I will try to lower down to 12GB.
 - Tested on PyTorch 2.7 - 2.8 CU128
 - FLASH ATTENTION IS A MUST IF USING USP
 - Example WF just open from your comfyui menu and browse templates
@@ -30,9 +29,12 @@ In the meantime, if you encounter this issue, please restart Comfy.
 
 | Model             | USP | FSDP |
 |-------------------|-----|------|
-| Wan 1.3B T2V      | ✅  | ✅   |
-| Wan 14B T2V       | ✅  | ✅   |
-| Wan 14B I2V       | ❓  | ❓   |
+| Wan2.1 1.3B T2V   | ✅  | ✅   |
+| Wan2.1 14B T2V    | ✅  | ✅   |
+| Wan2.1 14B I2V    | ✅  | ✅   |
+| Wan2.1 Vace       | ✅  | ❌   |
+| Wan2.2 5B TI2V    | ✅  | ✅   |
+| Wan2.2 14B I2V    | ✅  | ✅   |
 | Flux Dev          | ❌  | ✅   |
 | Flux Konteks      | ❌  | ❓   |
 | Flux ControlNet   | ❌  | ❌   |
@@ -43,6 +45,21 @@ In the meantime, if you encounter this issue, please restart Comfy.
 - ✅ = Supported
 - ❌ = Not currently supported
 - ❓ = Maybe work?
+
+**Notes:**
+- Non standard Wan variant (Phantom, S2V, etc...) is not tested
+
+## Scaled vs Non-Scaled Models
+
+| Model       | USP | FSDP |
+|-------------|-----|------|
+| Non-Scaled  | ✅  | ✅   |
+| Scaled      | ✅  | ⚠️    |
+
+**Notes:**
+- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.
+- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.
+
 
 
 ## Wan T2V 1.3B

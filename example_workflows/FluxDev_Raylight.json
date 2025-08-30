@@ -1,8 +1,8 @@
 {
   "id": "74d472ce-c2b2-4c7b-aabc-51b7428dee99",
   "revision": 0,
-  "last_node_id": 48,
-  "last_link_id": 73,
+  "last_node_id": 56,
+  "last_link_id": 74,
   "nodes": [
     {
       "id": 9,
@@ -16,7 +16,7 @@
         1060.3800048828125
       ],
       "flags": {},
-      "order": 12,
+      "order": 17,
       "mode": 0,
       "inputs": [
         {
@@ -70,86 +70,6 @@
       "bgcolor": "#535"
     },
     {
-      "id": 42,
-      "type": "RayInitializer",
-      "pos": [
-        -317.13653564453125,
-        92.05110931396484
-      ],
-      "size": [
-        291.400390625,
-        202
-      ],
-      "flags": {},
-      "order": 1,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "ray_actors_init",
-          "type": "RAY_ACTORS_INIT",
-          "links": [
-            65
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayInitializer"
-      },
-      "widgets_values": [
-        "local",
-        "default",
-        0,
-        0,
-        true,
-        false
-      ]
-    },
-    {
-      "id": 43,
-      "type": "RayUNETLoader",
-      "pos": [
-        15.791550636291504,
-        90.99999237060547
-      ],
-      "size": [
-        270,
-        102
-      ],
-      "flags": {},
-      "order": 4,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "ray_actors_init",
-          "type": "RAY_ACTORS_INIT",
-          "link": 65
-        },
-        {
-          "name": "lora",
-          "shape": 7,
-          "type": "RAY_LORA",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "links": [
-            66
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayUNETLoader"
-      },
-      "widgets_values": [
-        "flux.safetensors",
-        "default"
-      ]
-    },
-    {
       "id": 33,
       "type": "CLIPTextEncode",
       "pos": [
@@ -163,7 +83,7 @@
       "flags": {
         "collapsed": false
       },
-      "order": 6,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
@@ -204,13 +124,13 @@
         334
       ],
       "flags": {},
-      "order": 10,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
           "name": "ray_actors",
           "type": "RAY_ACTORS",
-          "link": 66
+          "link": null
         },
         {
           "name": "positive",
@@ -280,7 +200,7 @@
         46
       ],
       "flags": {},
-      "order": 11,
+      "order": 16,
       "mode": 0,
       "inputs": [
         {
@@ -321,7 +241,7 @@
         26
       ],
       "flags": {},
-      "order": 8,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
@@ -356,7 +276,7 @@
         58
       ],
       "flags": {},
-      "order": 7,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -394,7 +314,7 @@
         26
       ],
       "flags": {},
-      "order": 9,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
@@ -418,41 +338,6 @@
       "widgets_values": []
     },
     {
-      "id": 46,
-      "type": "DualCLIPLoader",
-      "pos": [
-        -314.88250732421875,
-        351.5559387207031
-      ],
-      "size": [
-        270,
-        130
-      ],
-      "flags": {},
-      "order": 2,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "CLIP",
-          "type": "CLIP",
-          "links": [
-            71,
-            72
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "DualCLIPLoader"
-      },
-      "widgets_values": [
-        "fluxte.safetensors",
-        "clipl.safetensors",
-        "flux",
-        "default"
-      ]
-    },
-    {
       "id": 6,
       "type": "CLIPTextEncode",
       "pos": [
@@ -464,7 +349,7 @@
         164.30999755859375
       ],
       "flags": {},
-      "order": 5,
+      "order": 10,
       "mode": 0,
       "inputs": [
         {
@@ -505,7 +390,7 @@
         58
       ],
       "flags": {},
-      "order": 3,
+      "order": 1,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -523,6 +408,238 @@
       "widgets_values": [
         "ae.safetensors"
       ]
+    },
+    {
+      "id": 51,
+      "type": "Note",
+      "pos": [
+        -313.27435302734375,
+        -89.84257507324219
+      ],
+      "size": [
+        214.7521209716797,
+        126.13883209228516
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Rule of thumb",
+      "properties": {},
+      "widgets_values": [
+        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 53,
+      "type": "Note",
+      "pos": [
+        -84.80021667480469,
+        -88.40096282958984
+      ],
+      "size": [
+        462.6545715332031,
+        127.88713836669922
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Ulyssess vs Ring",
+      "properties": {},
+      "widgets_values": [
+        "Why use Ulysses instead of Ring? Ulysses requires less VRAM, but the attention heads must be divisible among the GPUs. For example, Wan has 40 blocks, so the number of GPUs per Ulysses can be 2, 4, 5, 8, 10, or 20.\n\nRing, on the other hand, doesn’t have that restriction since it’s basically like a game of musical chairs—just without removing the chairs. However, the biggest problem with Ring is communication inefficiency and computation overhead"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 55,
+      "type": "RayUNETLoader",
+      "pos": [
+        24.468101501464844,
+        90.83113098144531
+      ],
+      "size": [
+        270,
+        102
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "link": 74
+        },
+        {
+          "name": "lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayUNETLoader"
+      },
+      "widgets_values": [
+        "Wan2_1-T2V-14B_fp8_e5m2_scale.safetensors",
+        "default"
+      ]
+    },
+    {
+      "id": 52,
+      "type": "MarkdownNote",
+      "pos": [
+        -89.25515747070312,
+        -257.5798645019531
+      ],
+      "size": [
+        470.2823486328125,
+        127.1243667602539
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "\nRaylight uses **FSDP2** to shard the model across GPUs.\n\nIn rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP. However, in most tests this issue does not appear, even with the same Docker setup....\n\nIf memory leak cases continue to grow, I will force a reinitialization of the Ray worker.\n\nIn the meantime, if you encounter this issue, please restart Comfy.\nOpen Issue on [Raylight Issue](https://github.com/komikndr/raylight/issues)\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 54,
+      "type": "RayInitializer",
+      "pos": [
+        -311.276123046875,
+        92.89726257324219
+      ],
+      "size": [
+        291.400390625,
+        178
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "links": [
+            74
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayInitializer"
+      },
+      "widgets_values": [
+        "local",
+        "default",
+        2,
+        2,
+        1,
+        false
+      ]
+    },
+    {
+      "id": 46,
+      "type": "DualCLIPLoader",
+      "pos": [
+        -305.5850524902344,
+        331.927978515625
+      ],
+      "size": [
+        270,
+        130
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            71,
+            72
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "DualCLIPLoader"
+      },
+      "widgets_values": [
+        "fluxte.safetensors",
+        "clipl.safetensors",
+        "flux",
+        "default"
+      ]
+    },
+    {
+      "id": 50,
+      "type": "Note",
+      "pos": [
+        -316.2813720703125,
+        -257.21722412109375
+      ],
+      "size": [
+        215.3394317626953,
+        117.74829864501953
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Glosarry",
+      "properties": {},
+      "widgets_values": [
+        "rank = id assigned to the GPU\nworld_size = number of GPUs\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 49,
+      "type": "MarkdownNote",
+      "pos": [
+        -691.6290283203125,
+        -261.6722106933594
+      ],
+      "size": [
+        363.9535217285156,
+        819.131103515625
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Introduction",
+      "properties": {},
+      "widgets_values": [
+        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\nMore info: [Raylight on GitHub](https://github.com/komikndr/raylight)\n\n\n## Supported Models\n\n| Model             | USP | FSDP |\n|-------------------|-----|------|\n| Wan2.1 1.3B T2V      | ✅  | ✅   |\n| Wan2.1 14B T2V       | ✅  | ✅   |\n| Wan2.1 14B I2V       | ✅  | ✅   |\n| Wan2.1 Vace             | ✅  | ❌   |\n| Wan2.2 5B TI2V       | ✅  | ✅   |\n| Wan2.2 14B I2V       | ✅  | ✅   |\n| Flux Dev          | ❌  | ✅   |\n| Flux Konteks      | ❌  | ❓   |\n| Flux ControlNet   | ❌  | ❌   |\n| Qwen Image        | ❌  | ❓   |\n| Hunyuan Video     | ❌  | ❓   |\n\n**Legend:**\n- ✅ = Supported\n- ❌ = Not currently supported\n- ❓ = Maybe work?\n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
     }
   ],
   "links": [
@@ -557,22 +674,6 @@
       40,
       0,
       "*"
-    ],
-    [
-      65,
-      42,
-      0,
-      43,
-      0,
-      "RAY_ACTORS_INIT"
-    ],
-    [
-      66,
-      43,
-      0,
-      44,
-      0,
-      "RAY_ACTORS"
     ],
     [
       67,
@@ -629,19 +730,27 @@
       8,
       1,
       "VAE"
+    ],
+    [
+      74,
+      54,
+      0,
+      55,
+      0,
+      "RAY_ACTORS_INIT"
     ]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.9680000000000002,
+      "scale": 1.0648000000000002,
       "offset": [
-        704.8706797092769,
-        -35.046001577576334
+        942.0367016526388,
+        394.7809631727207
       ]
     },
-    "frontendVersion": "1.25.9"
+    "frontendVersion": "1.25.11"
   },
   "version": 0.4
 }

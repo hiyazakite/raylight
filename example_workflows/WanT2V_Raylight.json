@@ -1,8 +1,8 @@
 {
   "id": "b590dcc4-90de-4786-b0a4-6b9020fb3eb3",
   "revision": 0,
-  "last_node_id": 34,
-  "last_link_id": 34,
+  "last_node_id": 44,
+  "last_link_id": 40,
   "nodes": [
     {
       "id": 20,
@@ -16,7 +16,7 @@
         88
       ],
       "flags": {},
-      "order": 11,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -37,7 +37,9 @@
       ],
       "title": "CLIP Text Encode (Positive Prompt)",
       "properties": {
-        "Node name for S&R": "CLIPTextEncode"
+        "Node name for S&R": "CLIPTextEncode",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
       },
       "widgets_values": [
         "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
@@ -57,7 +59,7 @@
         46
       ],
       "flags": {},
-      "order": 16,
+      "order": 18,
       "mode": 0,
       "inputs": [
         {
@@ -82,7 +84,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "VAEDecode"
+        "Node name for S&R": "VAEDecode",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
       },
       "widgets_values": []
     },
@@ -98,7 +102,7 @@
         78
       ],
       "flags": {},
-      "order": 17,
+      "order": 19,
       "mode": 0,
       "inputs": [
         {
@@ -123,41 +127,12 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "CreateVideo"
+        "Node name for S&R": "CreateVideo",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
       },
       "widgets_values": [
         16
-      ]
-    },
-    {
-      "id": 23,
-      "type": "SaveVideo",
-      "pos": [
-        2010,
-        480
-      ],
-      "size": [
-        432.9290466308594,
-        453.8443908691406
-      ],
-      "flags": {},
-      "order": 18,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "video",
-          "type": "VIDEO",
-          "link": 22
-        }
-      ],
-      "outputs": [],
-      "properties": {
-        "Node name for S&R": "SaveVideo"
-      },
-      "widgets_values": [
-        "video/ComfyUI",
-        "auto",
-        "auto"
       ]
     },
     {
@@ -172,7 +147,7 @@
         88
       ],
       "flags": {},
-      "order": 10,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
@@ -193,305 +168,15 @@
       ],
       "title": "CLIP Text Encode (Positive Prompt)",
       "properties": {
-        "Node name for S&R": "CLIPTextEncode"
+        "Node name for S&R": "CLIPTextEncode",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
       },
       "widgets_values": [
         "a fox moving quickly in a beautiful winter scenery nature trees mountains daytime tracking camera"
       ],
       "color": "#232",
       "bgcolor": "#353"
-    },
-    {
-      "id": 19,
-      "type": "EmptyHunyuanLatentVideo",
-      "pos": [
-        1392.9451904296875,
-        844.8319091796875
-      ],
-      "size": [
-        210.09432983398438,
-        130
-      ],
-      "flags": {},
-      "order": 0,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "LATENT",
-          "type": "LATENT",
-          "slot_index": 0,
-          "links": [
-            18
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "EmptyHunyuanLatentVideo"
-      },
-      "widgets_values": [
-        832,
-        480,
-        33,
-        1
-      ]
-    },
-    {
-      "id": 24,
-      "type": "Note",
-      "pos": [
-        858.4744873046875,
-        139.15330505371094
-      ],
-      "size": [
-        448.1618347167969,
-        159.92376708984375
-      ],
-      "flags": {},
-      "order": 1,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Ulyssess vs Ring",
-      "properties": {},
-      "widgets_values": [
-        "Why use Ulysses instead of Ring? Ulysses requires less VRAM, but the attention heads must be divisible among the GPUs. For example, Wan has 40 blocks, so the number of GPUs per Ulysses can be 2, 4, 5, 8, 10, or 20.\n\nRing, on the other hand, doesn’t have that restriction since it’s basically like a game of musical chairs—just without removing the chairs. However, the biggest problem with Ring is communication inefficiency and computation overhead"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 25,
-      "type": "Note",
-      "pos": [
-        630,
-        140
-      ],
-      "size": [
-        216.27767944335938,
-        157.41268920898438
-      ],
-      "flags": {},
-      "order": 2,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Rule of thumb",
-      "properties": {},
-      "widgets_values": [
-        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n\nSet FSDP if you like it, but it will hit ram hard and kinda unstable for now"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 27,
-      "type": "Note",
-      "pos": [
-        861.1655883789062,
-        -2.2029457092285156
-      ],
-      "size": [
-        439.5958251953125,
-        104.018310546875
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "FSDP2",
-      "properties": {},
-      "widgets_values": [
-        "Raylight is using FSDP2 to shard the model across GPUs. Currently, this is the main cause of high RAM usage. I’m still working on implementing Meta Tensors (tensors without data) to reduce RAM usage, but at the moment they are stored in CPU RAM. This is also the slowest part of model loading and the most unstable, since most FSDP2 examples are very sterile and clean, while Comfy’s usage is anything but that."
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 28,
-      "type": "Note",
-      "pos": [
-        400.4482727050781,
-        0.8481568694114685
-      ],
-      "size": [
-        219.1533203125,
-        292.4241943359375
-      ],
-      "flags": {},
-      "order": 4,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Introduction",
-      "properties": {},
-      "widgets_values": [
-        "As the name implies, Raylight uses Ray workers, called Actors. Each worker is its own Python process. While this allows splitting across multiple VRAMs, it definitely increases RAM usage. Then again, RAM is much cheaper than VRAM."
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 16,
-      "type": "VAELoader",
-      "pos": [
-        1645.53271484375,
-        721.1167602539062
-      ],
-      "size": [
-        295.85809326171875,
-        61.84592056274414
-      ],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "VAE",
-          "type": "VAE",
-          "slot_index": 0,
-          "links": [
-            24
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "VAELoader",
-        "models": [
-          {
-            "name": "wan_2.1_vae.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors?download=true",
-            "directory": "vae"
-          }
-        ]
-      },
-      "widgets_values": [
-        "Wan2_1_VAE_bf16.safetensors"
-      ]
-    },
-    {
-      "id": 15,
-      "type": "CLIPLoader",
-      "pos": [
-        940,
-        880
-      ],
-      "size": [
-        429.68731689453125,
-        106
-      ],
-      "flags": {},
-      "order": 6,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "CLIP",
-          "type": "CLIP",
-          "slot_index": 0,
-          "links": [
-            15,
-            17
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "CLIPLoader",
-        "models": [
-          {
-            "name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors?download=true",
-            "directory": "text_encoders"
-          }
-        ]
-      },
-      "widgets_values": [
-        "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-        "wan",
-        "default"
-      ]
-    },
-    {
-      "id": 8,
-      "type": "RayUNETLoader",
-      "pos": [
-        954.1246948242188,
-        339.85400390625
-      ],
-      "size": [
-        270,
-        102
-      ],
-      "flags": {},
-      "order": 12,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "ray_actors_init",
-          "type": "RAY_ACTORS_INIT",
-          "link": 6
-        },
-        {
-          "name": "lora",
-          "shape": 7,
-          "type": "RAY_LORA",
-          "link": 30
-        }
-      ],
-      "outputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "links": [
-            14
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayUNETLoader"
-      },
-      "widgets_values": [
-        "wan14.safetensors",
-        "default"
-      ]
-    },
-    {
-      "id": 1,
-      "type": "RayInitializer",
-      "pos": [
-        621.1966552734375,
-        340.9051208496094
-      ],
-      "size": [
-        291.400390625,
-        202
-      ],
-      "flags": {},
-      "order": 7,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "ray_actors_init",
-          "type": "RAY_ACTORS_INIT",
-          "links": [
-            6
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayInitializer"
-      },
-      "widgets_values": [
-        "local",
-        "default",
-        2,
-        1,
-        true,
-        false
-      ]
     },
     {
       "id": 33,
@@ -505,7 +190,7 @@
         26
       ],
       "flags": {},
-      "order": 13,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
@@ -524,7 +209,9 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "easy cleanGpuUsed"
+        "Node name for S&R": "easy cleanGpuUsed",
+        "cnr_id": "comfyui-easy-use",
+        "ver": "3f37ba9491fa7f6c8520dda6cf92a8e2dcbee8fa"
       },
       "widgets_values": []
     },
@@ -540,7 +227,7 @@
         26
       ],
       "flags": {},
-      "order": 14,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
@@ -559,9 +246,93 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "easy cleanGpuUsed"
+        "Node name for S&R": "easy cleanGpuUsed",
+        "cnr_id": "comfyui-easy-use",
+        "ver": "3f37ba9491fa7f6c8520dda6cf92a8e2dcbee8fa"
       },
       "widgets_values": []
+    },
+    {
+      "id": 31,
+      "type": "RayLoraLoader",
+      "pos": [
+        622.13916015625,
+        600.903564453125
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prev_ray_lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": 35
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_lora",
+          "type": "RAY_LORA",
+          "links": [
+            30
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayLoraLoader",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
+      },
+      "widgets_values": [
+        "Wan2_1_self_forcing_dmd_1_3B_lora_rank_32_fp16.safetensors",
+        1
+      ]
+    },
+    {
+      "id": 35,
+      "type": "RayLoraLoader",
+      "pos": [
+        624.6658935546875,
+        731.8026733398438
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "prev_ray_lora",
+          "shape": 7,
+          "type": "RAY_LORA",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_lora",
+          "type": "RAY_LORA",
+          "links": [
+            35
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayLoraLoader",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
+      },
+      "widgets_values": [
+        "Studio_Ghibli_LORA_1_3B.safetensors",
+        1
+      ]
     },
     {
       "id": 14,
@@ -575,13 +346,13 @@
         334
       ],
       "flags": {},
-      "order": 15,
+      "order": 17,
       "mode": 0,
       "inputs": [
         {
           "name": "ray_actors",
           "type": "RAY_ACTORS",
-          "link": 14
+          "link": 38
         },
         {
           "name": "positive",
@@ -624,11 +395,13 @@
         }
       ],
       "properties": {
-        "Node name for S&R": "XFuserKSamplerAdvanced"
+        "Node name for S&R": "XFuserKSamplerAdvanced",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
       },
       "widgets_values": [
         "enable",
-        823953663379817,
+        546815791065292,
         "randomize",
         4,
         1,
@@ -640,57 +413,201 @@
       ]
     },
     {
-      "id": 31,
-      "type": "RayLoraLoader",
+      "id": 8,
+      "type": "RayUNETLoader",
       "pos": [
-        622.13916015625,
-        600.903564453125
+        954.1246948242188,
+        339.85400390625
       ],
       "size": [
         270,
-        82
+        102
       ],
       "flags": {},
-      "order": 8,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
-          "name": "prev_ray_lora",
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "link": 40
+        },
+        {
+          "name": "lora",
           "shape": 7,
           "type": "RAY_LORA",
-          "link": null
+          "link": 30
         }
       ],
       "outputs": [
         {
-          "name": "ray_lora",
-          "type": "RAY_LORA",
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
           "links": [
-            30
+            37
           ]
         }
       ],
       "properties": {
-        "Node name for S&R": "RayLoraLoader"
+        "Node name for S&R": "RayUNETLoader",
+        "cnr_id": "raylight",
+        "ver": "0.2.0"
       },
       "widgets_values": [
-        "lx14.safetensors",
+        "Wan2_1-T2V-1_3B_bf16.safetensors",
+        "default"
+      ]
+    },
+    {
+      "id": 15,
+      "type": "CLIPLoader",
+      "pos": [
+        940,
+        880
+      ],
+      "size": [
+        429.68731689453125,
+        106
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            15,
+            17
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55",
+        "models": [
+          {
+            "name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors?download=true",
+            "directory": "text_encoders"
+          }
+        ]
+      },
+      "widgets_values": [
+        "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        "wan",
+        "default"
+      ]
+    },
+    {
+      "id": 19,
+      "type": "EmptyHunyuanLatentVideo",
+      "pos": [
+        1391.0992431640625,
+        855.9075927734375
+      ],
+      "size": [
+        210.09432983398438,
+        130
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "slot_index": 0,
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptyHunyuanLatentVideo",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
+      },
+      "widgets_values": [
+        832,
+        480,
+        33,
         1
       ]
+    },
+    {
+      "id": 23,
+      "type": "SaveVideo",
+      "pos": [
+        2010,
+        480
+      ],
+      "size": [
+        432.9290466308594,
+        453.8443908691406
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 22
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
+      },
+      "widgets_values": [
+        "raylight/gen_",
+        "auto",
+        "auto"
+      ]
+    },
+    {
+      "id": 43,
+      "type": "MarkdownNote",
+      "pos": [
+        861.647216796875,
+        -17.82110023498535
+      ],
+      "size": [
+        470.2823486328125,
+        127.1243667602539
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "\nRaylight uses **FSDP2** to shard the model across GPUs.\n\nIn rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP. However, in most tests this issue does not appear, even with the same Docker setup....\n\nIf memory leak cases continue to grow, I will force a reinitialization of the Ray worker.\n\nIn the meantime, if you encounter this issue, please restart Comfy.\nOpen Issue on [Raylight Issue](https://github.com/komikndr/raylight/issues)\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
     },
     {
       "id": 26,
       "type": "Note",
       "pos": [
-        632.332275390625,
-        -2.2029402256011963
+        634.6205444335938,
+        -17.458473205566406
       ],
       "size": [
-        213.0511016845703,
-        102.49275970458984
+        215.3394317626953,
+        117.74829864501953
       ],
       "flags": {},
-      "order": 9,
+      "order": 4,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -701,25 +618,195 @@
       ],
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 25,
+      "type": "Note",
+      "pos": [
+        637.6275634765625,
+        149.91604614257812
+      ],
+      "size": [
+        214.7521209716797,
+        126.13883209228516
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Rule of thumb",
+      "properties": {},
+      "widgets_values": [
+        "Just jack up more ulysses per number of GPUs, and set ring only 1.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 24,
+      "type": "Note",
+      "pos": [
+        866.1021728515625,
+        151.35765075683594
+      ],
+      "size": [
+        462.6545715332031,
+        127.88713836669922
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Ulyssess vs Ring",
+      "properties": {},
+      "widgets_values": [
+        "Why use Ulysses instead of Ring? Ulysses requires less VRAM, but the attention heads must be divisible among the GPUs. For example, Wan has 40 blocks, so the number of GPUs per Ulysses can be 2, 4, 5, 8, 10, or 20.\n\nRing, on the other hand, doesn’t have that restriction since it’s basically like a game of musical chairs—just without removing the chairs. However, the biggest problem with Ring is communication inefficiency and computation overhead"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 16,
+      "type": "VAELoader",
+      "pos": [
+        1645.53271484375,
+        721.1167602539062
+      ],
+      "size": [
+        295.85809326171875,
+        61.84592056274414
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "slot_index": 0,
+          "links": [
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55",
+        "models": [
+          {
+            "name": "wan_2.1_vae.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors?download=true",
+            "directory": "vae"
+          }
+        ]
+      },
+      "widgets_values": [
+        "Wan2_1_VAE_bf16.safetensors"
+      ]
+    },
+    {
+      "id": 38,
+      "type": "RayInitializer",
+      "pos": [
+        623.9815063476562,
+        358.7467346191406
+      ],
+      "size": [
+        270.17230224609375,
+        179.84591674804688
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "links": [
+            40
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayInitializer"
+      },
+      "widgets_values": [
+        "local",
+        "default",
+        2,
+        2,
+        1,
+        false
+      ]
+    },
+    {
+      "id": 44,
+      "type": "MarkdownNote",
+      "pos": [
+        240.78379821777344,
+        -17.8378849029541
+      ],
+      "size": [
+        363.9535217285156,
+        819.131103515625
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Introduction",
+      "properties": {},
+      "widgets_values": [
+        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\nMore info: [Raylight on GitHub](https://github.com/komikndr/raylight)\n\n\n## Supported Models\n\n| Model             | USP | FSDP |\n|-------------------|-----|------|\n| Wan2.1 1.3B T2V      | ✅  | ✅   |\n| Wan2.1 14B T2V       | ✅  | ✅   |\n| Wan2.1 14B I2V       | ✅  | ✅   |\n| Wan2.1 Vace             | ✅  | ❌   |\n| Wan2.2 5B TI2V       | ✅  | ✅   |\n| Wan2.2 14B I2V       | ✅  | ✅   |\n| Flux Dev          | ❌  | ✅   |\n| Flux Konteks      | ❌  | ❓   |\n| Flux ControlNet   | ❌  | ❌   |\n| Qwen Image        | ❌  | ❓   |\n| Hunyuan Video     | ❌  | ❓   |\n\n**Legend:**\n- ✅ = Supported\n- ❌ = Not currently supported\n- ❓ = Maybe work?\n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 39,
+      "type": "RayTorchCompileModel",
+      "pos": [
+        1286.665771484375,
+        343.05596923828125
+      ],
+      "size": [
+        270,
+        58
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 37
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            38
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayTorchCompileModel"
+      },
+      "widgets_values": [
+        "inductor"
+      ]
     }
   ],
   "links": [
-    [
-      6,
-      1,
-      0,
-      8,
-      0,
-      "RAY_ACTORS_INIT"
-    ],
-    [
-      14,
-      8,
-      0,
-      14,
-      0,
-      "RAY_ACTORS"
-    ],
     [
       15,
       15,
@@ -815,19 +902,51 @@
       14,
       2,
       "CONDITIONING"
+    ],
+    [
+      35,
+      35,
+      0,
+      31,
+      0,
+      "RAY_LORA"
+    ],
+    [
+      37,
+      8,
+      0,
+      39,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      38,
+      39,
+      0,
+      14,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      40,
+      38,
+      0,
+      8,
+      0,
+      "RAY_ACTORS_INIT"
     ]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.8954302432552405,
+      "scale": 1.1918176537727252,
       "offset": [
-        -703.8326839919522,
-        -226.500541955868
+        -166.49442913846104,
+        114.29264488602716
       ]
     },
-    "frontendVersion": "1.25.9"
+    "frontendVersion": "1.25.11"
   },
   "version": 0.4
 }

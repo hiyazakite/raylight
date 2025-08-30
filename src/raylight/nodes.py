@@ -22,7 +22,6 @@ class RayInitializer:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
-                "DEBUG_USP": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -39,7 +38,6 @@ class RayInitializer:
         ulysses_degree,
         ring_degree,
         FSDP,
-        DEBUG_USP,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
@@ -59,28 +57,32 @@ class RayInitializer:
             raise ValueError(
                 f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}"
             )
-
         if FSDP is True and (world_size == 1):
             raise ValueError(
                 "ERROR, FSDP cannot be use in single cuda/cudalike device"
             )
+
+        try:
+            import flash_attn
+            is_flash_attn_exist = True
+        except ImportError:
+            is_flash_attn_exist = False
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["is_dumb_parallel"] = True
 
         if ulysses_degree > 1 or ring_degree > 1:
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = ulysses_degree
-            self.parallel_dict["ring_degree"] = ring_degree
+            if is_flash_attn_exist is False:
+                raise ValueError("ERROR, Flash Attention is not installed, cannot use USP")
+            else:
+                self.parallel_dict["is_xdit"] = True
+                self.parallel_dict["ulysses_degree"] = ulysses_degree
+                self.parallel_dict["ring_degree"] = ring_degree
 
         if FSDP:
             self.parallel_dict["is_fsdp"] = True
             self.parallel_dict["is_fsdp_wrapped"] = False
-
-        if DEBUG_USP:
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = 1
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error
