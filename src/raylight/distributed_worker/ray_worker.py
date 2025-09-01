@@ -202,7 +202,7 @@ class RayWorker:
     def set_meta_model(self, model):
         first_param_device = next(model.model.parameters()).device
         if first_param_device == torch.device("meta"):
-            self.model = model.enable_fsdp(self.local_rank, self.device_mesh)
+            self.model = model.config_fsdp(self.local_rank, self.device_mesh)
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
 
@@ -221,7 +221,8 @@ class RayWorker:
             self.load_lora()
 
         if self.parallel_dict["is_fsdp"] is True:
-            self.model = FSDPModelPatcher.clone(self.model).enable_fsdp(self.local_rank, self.device_mesh)
+            self.model = FSDPModelPatcher.clone(self.model)
+            self.model.config_fsdp(self.local_rank, self.device_mesh)
 
     def set_lora_list(self, lora):
         self.lora_list = lora
@@ -284,6 +285,9 @@ class RayWorker:
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        if self.parallel_dict["is_fsdp"] is True:
+            self.model.patch_fsdp()
 
         with torch.no_grad():
             samples = comfy.sample.sample(

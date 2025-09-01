@@ -19,7 +19,11 @@ from raylight import comfy_dist
 
 class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
-    def patch_fsdp(self, model_state_dict, device_to=None):
+    def patch_fsdp(self, model_state_dict=None, device_to=None):
+        if model_state_dict is None:
+            model_state_dict = self.model_sd
+        if device_to is None:
+            self.device_to = "cpu"
         from torch.distributed.fsdp import FSDPModule
         print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
 
@@ -79,55 +83,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         else:
             set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
 
-    def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
-        with self.use_ejected():
-            cuda_device = device_to
-            if self.rank == 0:
-                self.unpatch_hooks()
-                device_to = "cpu"
-                mem_counter = 0
-                loading = self._load_list()
-
-                load_modules = []
-                loading.sort(reverse=True)
-
-                for module_mem, name, module, params in loading:
-                    weight_key = f"{name}.weight"
-                    bias_key = f"{name}.bias"
-
-                    if hasattr(module, "comfy_cast_weights"):
-                        module.prev_comfy_cast_weights = module.comfy_cast_weights
-                        module.comfy_cast_weights = True
-
-                    if weight_key in self.weight_wrapper_patches:
-                        module.weight_function.extend(self.weight_wrapper_patches[weight_key])
-                    if bias_key in self.weight_wrapper_patches:
-                        module.bias_function.extend(self.weight_wrapper_patches[bias_key])
-
-                    mem_counter += move_weight_functions(module, device_to)
-                    load_modules.append((module_mem, name, module, params))
-
-                for _, name, module, params in load_modules:
-                    for param in params:
-                        self.patch_weight_to_device(f"{name}.{param}", device_to)
-                    module.comfy_patched_weights = True
-
-                for _, _, module, _ in load_modules:
-                    module.to('cpu')
-
-                logging.info(f"Loaded completely on CPU: mem={mem_counter / (1024*1024):.2f} MB")
-
-            self.patch_fsdp(device_to, self.model_state_dict)
-            self.model.device = cuda_device
-            self.model.model_loaded_weight_memory = mem_counter
-            self.model.current_weight_patches_uuid = self.patches_uuid
-
-            for callback in self.get_all_callbacks(CallbacksMP.ON_LOAD):
-                callback(self, cuda_device, lowvram_model_memory, force_patch_weights, full_load)
-
-            self.apply_hooks(self.forced_hooks, force_apply=True)
-
-    def enable_fsdp(self, rank, device_mesh):
+    def config_fsdp(self, rank, device_mesh):
         self.rank = rank
         self.device_mesh = device_mesh
         if rank == 0:
