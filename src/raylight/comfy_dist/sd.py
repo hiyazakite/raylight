@@ -1,5 +1,4 @@
 import logging
-
 from raylight import comfy_dist
 import comfy
 
@@ -22,7 +21,7 @@ def load_lora_for_models(model, lora, strength_model):
 
     k = set(k)
     for x in loaded:
-        if (x not in k):
+        if x not in k:
             logging.warning("NOT LOADED {}".format(x))
 
     return new_modelpatcher

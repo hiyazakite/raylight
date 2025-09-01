@@ -18,7 +18,7 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
-from raylight.comfy_dist.model_patcher import make_ray_patch_weight_to_device
+from raylight.comfy_dist.model_patcher import FSDPModelPatcher
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 
 # see comment on init_process_group
@@ -202,7 +202,7 @@ class RayWorker:
     def set_meta_model(self, model):
         first_param_device = next(model.model.parameters()).device
         if first_param_device == torch.device("meta"):
-            self.model = model
+            self.model = model.enable_fsdp(self.local_rank, self.device_mesh)
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
 
@@ -215,16 +215,13 @@ class RayWorker:
 
     def load_unet(self, unet_path, model_options):
         self.model = comfy.sd.load_diffusion_model(
-            unet_path, model_options=model_options
+            unet_path, model_options=model_options,
         )
         if self.lora_list is not None:
             self.load_lora()
+
         if self.parallel_dict["is_fsdp"] is True:
-            if self.local_rank == 0:
-                self.state_dict = self.model.model_state_dict()
-            self.model.model = self.model.model.to("meta")
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
+            self.model = FSDPModelPatcher.clone(self.model).enable_fsdp(self.local_rank, self.device_mesh)
 
     def set_lora_list(self, lora):
         self.lora_list = lora
@@ -247,38 +244,6 @@ class RayWorker:
                     self.model, None, lora_model, strength_model, 0
                 )[0]
             del lora_model
-
-    def patch_fsdp(self,):
-        from torch.distributed.fsdp import FSDPModule
-        print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
-
-        if not isinstance(self.model.model.diffusion_model, FSDPModule):
-            if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
-                from ..wan.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
-
-            elif isinstance(self.model.model, model_base.Flux):
-                from ..flux.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
-
-            elif isinstance(self.model.model, model_base.QwenImage):
-                from ..qwen_image.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
-
-            elif isinstance(self.model.model, model_base.HunyuanVideo):
-                from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
-
-            else:
-                raise ValueError(f"{type(self.model.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
-
-            self.state_dict = None
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
-            dist.barrier()
-            print("FSDP registered")
-        else:
-            print("FSDP already registered, skip wrapping...")
 
     def common_ksampler(
         self,
@@ -319,13 +284,6 @@ class RayWorker:
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-
-        if self.parallel_dict["is_fsdp"] is True:
-            self.model.patch_weight_to_device = types.MethodType(
-                make_ray_patch_weight_to_device(convert_dtensor=True, device_mesh=self.device_mesh),
-                self.model
-            )
-            self.patch_fsdp()
 
         with torch.no_grad():
             samples = comfy.sample.sample(
