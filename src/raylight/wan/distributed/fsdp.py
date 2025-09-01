@@ -3,7 +3,7 @@ from raylight.distributed_worker.utils import detect_dtype_mismatch
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 
 
-def shard_model_fsdp2(model, device_to, model_state_dict):
+def shard_model_fsdp2(model, model_state_dict):
     diffusion_model = model.diffusion_model
 
     # Shard only the blocks, since other modules have different dtype

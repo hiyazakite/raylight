@@ -19,11 +19,9 @@ from raylight import comfy_dist
 
 class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
-    def patch_fsdp(self, model_state_dict=None, device_to=None):
-        if model_state_dict is None:
-            model_state_dict = self.model_sd
-        if device_to is None:
-            self.device_to = "cpu"
+    def patch_fsdp(self):
+        model_state_dict = self.model_sd
+        device_to = self.load_device
         from torch.distributed.fsdp import FSDPModule
         print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
 
@@ -84,6 +82,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
 
     def config_fsdp(self, rank, device_mesh):
+        self.__class__ = FSDPModelPatcher
         self.rank = rank
         self.device_mesh = device_mesh
         if rank == 0:
@@ -91,13 +90,3 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         else:
             self.model_sd = None
         self.model.to("meta")
-
-    def clone(self, *args, **kwargs):
-        src_cls = self.__class__
-        self.__class__ = FSDPModelPatcher
-        n = super().clone(*args, **kwargs)
-        n.__class__ = FSDPModelPatcher
-        self.__class__ = src_cls
-        if src_cls != FSDPModelPatcher:
-            n.size = 0
-        return n
