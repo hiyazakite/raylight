@@ -33,6 +33,7 @@ def shard_model_fsdp2(model, model_state_dict):
         options=StateDictOptions(
             full_state_dict=True,
             broadcast_from_rank0=True,
+            cpu_offload=True
         ),
     )
 

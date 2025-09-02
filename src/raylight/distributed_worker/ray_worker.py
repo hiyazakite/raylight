@@ -247,15 +247,15 @@ class RayWorker:
 
             elif isinstance(self.model.model, model_base.Flux):
                 from ..flux.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict)
 
             elif isinstance(self.model.model, model_base.QwenImage):
                 from ..qwen_image.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict)
 
             elif isinstance(self.model.model, model_base.HunyuanVideo):
                 from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.device, self.state_dict)
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict)
 
             else:
                 raise ValueError(f"{type(self.model.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
