@@ -2,7 +2,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 
-def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None):
+def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None, device_mesh=None):
     mantissa_scaled = torch.where(
         normal_mask,
         (abs_x / (2.0 ** (exponent - EXPONENT_BIAS)) - 1.0) * (2**MANTISSA_BITS),
@@ -10,14 +10,14 @@ def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, ge
     )
 
     if isinstance(mantissa_scaled, DTensor):
-        mantissa_scaled += DTensor.from_local(torch.rand(mantissa_scaled.size(), dtype=mantissa_scaled.dtype, layout=mantissa_scaled.layout, device=mantissa_scaled.device, generator=generator))
+        mantissa_scaled += DTensor.from_local(torch.rand(mantissa_scaled.size(), dtype=mantissa_scaled.dtype, layout=mantissa_scaled.layout, device=mantissa_scaled.device, generator=generator), device_mesh)
     else:
         mantissa_scaled += torch.rand(mantissa_scaled.size(), dtype=mantissa_scaled.dtype, layout=mantissa_scaled.layout, device=mantissa_scaled.device, generator=generator)
     return mantissa_scaled.floor() / (2**MANTISSA_BITS)
 
 
 # Not 100% sure about this
-def manual_stochastic_round_to_float8(x, dtype, generator=None):
+def manual_stochastic_round_to_float8(x, dtype, generator=None, device_mesh=None):
     if dtype == torch.float8_e4m3fn:
         EXPONENT_BITS, MANTISSA_BITS, EXPONENT_BIAS = 4, 3, 7
     elif dtype == torch.float8_e5m2:
@@ -39,7 +39,7 @@ def manual_stochastic_round_to_float8(x, dtype, generator=None):
     # Combine mantissa calculation and rounding
     normal_mask = ~(exponent == 0)
 
-    abs_x[:] = calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=generator)
+    abs_x[:] = calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=generator, device_mesh=device_mesh)
 
     sign *= torch.where(
         normal_mask,
@@ -52,7 +52,7 @@ def manual_stochastic_round_to_float8(x, dtype, generator=None):
     return sign
 
 
-def stochastic_rounding(value, dtype, seed=0):
+def stochastic_rounding(value, dtype, seed=0, device_mesh=None):
     if dtype == torch.float32:
         return value.to(dtype=torch.float32)
     if dtype == torch.float16:
@@ -66,7 +66,7 @@ def stochastic_rounding(value, dtype, seed=0):
         num_slices = max(1, (value.numel() / (4096 * 4096)))
         slice_size = max(1, round(value.shape[0] / num_slices))
         for i in range(0, value.shape[0], slice_size):
-            output[i:i+slice_size].copy_(manual_stochastic_round_to_float8(value[i:i+slice_size], dtype, generator=generator))
+            output[i:i+slice_size].copy_(manual_stochastic_round_to_float8(value[i:i+slice_size], dtype, generator=generator, device_mesh=device_mesh))
         return output
 
     return value.to(dtype=dtype)
