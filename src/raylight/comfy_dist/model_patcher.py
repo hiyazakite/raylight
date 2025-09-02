@@ -19,40 +19,6 @@ from raylight import comfy_dist
 
 class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
-    def patch_fsdp(self):
-        model_state_dict = self.model_sd
-        device_to = self.load_device
-        from torch.distributed.fsdp import FSDPModule
-        print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
-
-        if not isinstance(self.model.diffusion_model, FSDPModule):
-            if isinstance(self.model, model_base.WAN21) or isinstance(self.model, model_base.WAN22):
-                from ..wan.distributed.fsdp import shard_model_fsdp2
-                self.model = shard_model_fsdp2(self.model, device_to, model_state_dict)
-
-            elif isinstance(self.model, model_base.Flux):
-                from ..flux.distributed.fsdp import shard_model_fsdp2
-                self.model = shard_model_fsdp2(self.model, device_to, model_state_dict)
-
-            elif isinstance(self.model, model_base.QwenImage):
-                from ..qwen_image.distributed.fsdp import shard_model_fsdp2
-                self.model = shard_model_fsdp2(self.model, device_to, model_state_dict)
-
-            elif isinstance(self.model, model_base.HunyuanVideo):
-                from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
-                self.model = shard_model_fsdp2(self.model, device_to, model_state_dict)
-
-            else:
-                raise ValueError(f"{type(self.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
-
-            self.state_dict = None
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
-            dist.barrier()
-            print("FSDP registered")
-        else:
-            print("FSDP already registered, skip wrapping...")
-
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False, convert_dtensor=False):
         if key not in self.patches:
             return
@@ -82,11 +48,16 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
 
     def config_fsdp(self, rank, device_mesh):
-        self.__class__ = FSDPModelPatcher
         self.rank = rank
         self.device_mesh = device_mesh
-        if rank == 0:
-            self.model_sd = self.model_state_dict()
-        else:
-            self.model_sd = None
         self.model.to("meta")
+
+    def clone(self, *args, **kwargs):
+        src_cls = self.__class__
+        self.__class__ = FSDPModelPatcher
+        n = super().clone(*args, **kwargs)
+        n.__class__ = FSDPModelPatcher
+        self.__class__ = src_cls
+        if src_cls != FSDPModelPatcher:
+            n.size = 0
+        return n
