@@ -202,7 +202,8 @@ class RayWorker:
     def set_meta_model(self, model):
         first_param_device = next(model.model.parameters()).device
         if first_param_device == torch.device("meta"):
-            self.model = model.config_fsdp(self.local_rank, self.device_mesh)
+            self.model = model
+            self.model.config_fsdp(self.local_rank, self.device_mesh)
         else:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
 
