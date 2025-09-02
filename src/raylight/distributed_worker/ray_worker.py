@@ -222,6 +222,10 @@ class RayWorker:
             self.load_lora()
 
         if self.parallel_dict["is_fsdp"] is True:
+            import comfy.model_patcher as model_patcher
+            from raylight.comfy_dist.model_patcher import LowVramPatch
+            model_patcher.LowVramPatch = LowVramPatch
+
             self.model = FSDPModelPatcher.clone(self.model)
             self.state_dict = self.model.model_state_dict()
             self.model.config_fsdp(self.local_rank, self.device_mesh)
