@@ -37,7 +37,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
         out_weight = comfy_dist.lora.calculate_weight(self.patches[key], temp_weight, key, device_mesh=self.device_mesh)
         if set_func is None:
-            out_weight = comfy_dist.float.stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key))
+            out_weight = comfy_dist.float.stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key), device_mesh=self.device_mesh)
 
             if inplace_update:
                 comfy.utils.copy_to_param(self.model, key, out_weight)
