@@ -84,16 +84,16 @@ class RayWorker:
     def __init__(self, local_rank, world_size, device_id, parallel_dict):
         self.model = None
         self.model_type = None
-        self.local_rank = local_rank
-        self.world_size = world_size
-        self.device_id = device_id
         self.noise_add = 0
         self.state_dict = None
 
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.device_id = device_id
         self.parallel_dict = parallel_dict
-        self.parallel_dict["is_fsdp_wrapped"] = False
         self.device = torch.device(f"cuda:{self.device_id}")
         self.device_mesh = None
+        self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
 
         if self.model is not None:
             self.is_model_load = True
@@ -172,8 +172,14 @@ class RayWorker:
                     ulysses_degree=ulysses_degree,
                 )
 
+    def get_compute_capability(self):
+        return self.compute_capability
+
     def get_parallel_dict(self):
         return self.parallel_dict
+
+    def set_parallel_dict(self, parallel_dict):
+        self.parallel_dict = parallel_dict
 
     def clear_model(self):
         self.model = None
@@ -182,9 +188,6 @@ class RayWorker:
 
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)
-
-    def set_parallel_dict(self, parallel_dict):
-        self.parallel_dict = parallel_dict
 
     def get_local_rank(self):
         return self.local_rank

@@ -124,7 +124,7 @@ class RayUNETLoader:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "weight_dtype": (
-                    ["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],
+                    ["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2", "bf16", "fp16"],
                 ),
                 "ray_actors_init": (
                     "RAY_ACTORS_INIT",
@@ -152,12 +152,47 @@ class RayUNETLoader:
             model_options["fp8_optimizations"] = True
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
+        elif weight_dtype == "bf16":
+            model_options["dtype"] = torch.bfloat16
+        elif weight_dtype == "fp16":
+            model_options["dtype"] = torch.float16
 
-        if parallel_dict["is_fsdp"] is True and ("scale" in unet_name.lower()):
+        #  Collect compute capabilities from Ray workers
+        cc_futures = []
+        for actor in gpu_actors:
+            cc_futures.append(
+                actor.get_compute_capability.remote()
+            )
+
+        compute_capabilities = [ray.get(cc) for cc in cc_futures]
+        unique_cc = set(compute_capabilities)
+
+        if len(unique_cc) > 1:
+            print(f"Multiple device architectures detected: {unique_cc}, choosing the oldest")
+            oldest = min(unique_cc)
+        else:
+            oldest = next(iter(unique_cc))
+
+        device_arch = oldest
+        print(f"Oldest device arch: sm{device_arch}")
+
+        if parallel_dict["is_fsdp"] is True and (device_arch >= 89):
+            print(f"Ada and above detected (sm{device_arch}), FP8 supported")
+        if parallel_dict["is_fsdp"] is True and (80 <= device_arch <= 86) and weight_dtype not in ("bf16", "fp16"):
             raise ValueError(
-                """Pre-FSDP filename check: Non uniform dtype FP8 transformer block is currently
-                not supported for Raylight FSDP implementation, especially Ampere architecture and below,
-                try non scaled model"""
+                f"Ampere detected (sm{device_arch}), model weight_dtype must be bfloat16 or fp16 to enable FSDP. "
+                f"Please select that option."
+            )
+        if parallel_dict["is_fsdp"] is True and (70 <= device_arch <= 76) and weight_dtype != "fp16":
+            raise ValueError(
+                f"Turing detected (sm{device_arch}), model weight_dtype must be fp16 to enable FSDP. "
+                f"Please select that option."
+            )
+
+        # Check for flash_attn compatibility
+        if parallel_dict["is_xdit"] is True and device_arch <= 61:
+            raise ValueError(
+                f"Pascal detected (sm{device_arch}), cannot use USP"
             )
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
