@@ -152,10 +152,6 @@ class RayUNETLoader:
             model_options["fp8_optimizations"] = True
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
-        elif weight_dtype == "bf16":
-            model_options["dtype"] = torch.bfloat16
-        elif weight_dtype == "fp16":
-            model_options["dtype"] = torch.float16
 
         #  Collect compute capabilities from Ray workers
         cc_futures = []
@@ -174,21 +170,6 @@ class RayUNETLoader:
             oldest = next(iter(unique_cc))
 
         device_arch = oldest
-        print(f"Oldest device arch: sm{device_arch}")
-
-        if parallel_dict["is_fsdp"] is True and (device_arch >= 89):
-            print(f"Ada and above detected (sm{device_arch}), FP8 supported")
-        if parallel_dict["is_fsdp"] is True and (80 <= device_arch <= 86) and weight_dtype not in ("bf16", "fp16"):
-            raise ValueError(
-                f"Ampere detected (sm{device_arch}), model weight_dtype must be bfloat16 or fp16 to enable FSDP. "
-                f"Please select that option."
-            )
-        if parallel_dict["is_fsdp"] is True and (70 <= device_arch <= 76) and weight_dtype != "fp16":
-            raise ValueError(
-                f"Turing detected (sm{device_arch}), model weight_dtype must be fp16 to enable FSDP. "
-                f"Please select that option."
-            )
-
         # Check for flash_attn compatibility
         if parallel_dict["is_xdit"] is True and device_arch <= 61:
             raise ValueError(

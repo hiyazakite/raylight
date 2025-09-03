@@ -182,9 +182,9 @@ class RayWorker:
         self.parallel_dict = parallel_dict
 
     def clear_model(self):
-        self.model = None
-        gc.collect()
-        comfy.model_management.soft_empty_cache()
+        if self.model is not None:
+            comfy.model_management.cleanup_models()
+            self.model = None
 
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)

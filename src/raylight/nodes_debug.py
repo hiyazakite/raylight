@@ -64,6 +64,7 @@ class RayInitializerDebug:
 
         if DEBUG_USP:
             self.parallel_dict["is_xdit"] = True
+            self.parallel_dict["ring_degree"] = 1
             self.parallel_dict["ulysses_degree"] = 1
 
         try:

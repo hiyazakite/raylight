@@ -67,6 +67,13 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         n = super().clone(*args, **kwargs)
         n.__class__ = FSDPModelPatcher
         self.__class__ = src_cls
+
+        # inject fsdp-specific defaults if missing
+        if not hasattr(n, "device_mesh"):
+            n.device_mesh = None
+        if not hasattr(n, "rank"):
+            n.rank = None
+
         if src_cls != FSDPModelPatcher:
             n.size = 0
         return n
