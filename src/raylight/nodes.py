@@ -8,38 +8,11 @@ import folder_paths
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
-from .distributed_worker.ray_worker import RayWorker
-
-
-# Test to just kill the damn actor when lora change, so no dangling memory leak when FSDP.
-def make_ray_actor_fn(
-    world_size,
-    parallel_dict
-):
-    def _init_ray_actor(
-        world_size=world_size,
-        parallel_dict=parallel_dict
-    ):
-        ray_actors = dict()
-        gpu_actor = ray.remote(RayWorker)
-        gpu_actors = []
-
-        for local_rank in range(world_size):
-            gpu_actors.append(
-                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                    local_rank=local_rank,
-                    world_size=world_size,
-                    device_id=0,
-                    parallel_dict=parallel_dict,
-                )
-            )
-        ray_actors["workers"] = gpu_actors
-
-        for actor in ray_actors["workers"]:
-            ray.get(actor.__ray_ready__.remote())
-        return ray_actors
-
-    return _init_ray_actor
+from .distributed_worker.ray_worker import (
+    make_ray_actor_fn,
+    ensure_fresh_actors,
+    ray_nccl_tester
+)
 
 
 class RayInitializer:
@@ -58,6 +31,7 @@ class RayInitializer:
 
     RETURN_TYPES = ("RAY_ACTORS_INIT",)
     RETURN_NAMES = ("ray_actors_init",)
+
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
@@ -71,7 +45,7 @@ class RayInitializer:
         FSDP,
     ):
         # THIS IS PYTORCH DIST ADDRESS
-        # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
+        # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
@@ -128,6 +102,7 @@ class RayInitializer:
             ray.init(runtime_env={"py_modules": [raylight]})
             raise RuntimeError(f"Ray connection failed: {e}")
 
+        ray_nccl_tester(world_size)
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
@@ -157,11 +132,7 @@ class RayUNETLoader:
     CATEGORY = "Raylight"
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
-        ray_actors = ray_actors_init[0]
-        ray_actor_fn = ray_actors_init[1]
-
-        gpu_actors = ray_actors["workers"]
-        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
@@ -198,10 +169,6 @@ class RayUNETLoader:
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
         # Kill actor if model exist
-        if ray.get(gpu_actors[0].get_is_model_loaded.remote()) is True:
-            for actor in gpu_actors:
-                ray.kill(actor)
-            ray_actor_fn()
 
         loaded_futures = []
         patched_futures = []

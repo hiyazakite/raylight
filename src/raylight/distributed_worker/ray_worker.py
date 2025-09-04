@@ -2,7 +2,6 @@ import types
 import os
 import gc
 from datetime import timedelta
-import warnings
 
 import torch
 import torch.distributed as dist
@@ -20,12 +19,7 @@ from comfy import model_base
 import raylight.distributed_worker.context_parallel as cp
 from raylight.comfy_dist.model_patcher import FSDPModelPatcher
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
-
-# see comment on init_process_group
-warnings.filterwarnings(
-    "ignore",
-    message="No device id is provided via `init_process_group` or `barrier`.*"
-)
+from ray.exceptions import RayActorError
 
 
 def usp_inject_callback(
@@ -79,7 +73,6 @@ def usp_inject_callback(
 
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
-
 class RayWorker:
     def __init__(self, local_rank, world_size, device_id, parallel_dict):
         self.model = None
@@ -99,36 +92,16 @@ class RayWorker:
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
-            # NCCL USP error if we put device into dist.init_process_group
             dist.init_process_group(
                 "nccl",
                 rank=local_rank,
                 world_size=self.world_size,
                 timeout=timedelta(minutes=1),
+                device_id=self.device
             )
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
             pg = dist.group.WORLD
             cp.set_cp_group(pg, list(range(self.world_size)), local_rank)
-
-            print("Running NCCL COMM pre-run")
-
-            # Each rank contributes rank+1
-            x = torch.ones(1, device=self.device) * (self.local_rank + 1)
-            dist.all_reduce(x, op=dist.ReduceOp.SUM)
-            result = x.item()
-
-            # Expected sum = N(N+1)/2
-            expected = self.world_size * (self.world_size + 1) // 2
-
-            if abs(result - expected) > 1e-3:
-                raise RuntimeError(
-                    f"[Rank {self.local_rank}] COMM test failed: "
-                    f"got {result}, expected {expected}. "
-                    f"world_size may be mismatched!"
-                )
-            else:
-                print(f"[Rank {self.local_rank}] COMM test passed ✅ (result={result})")
-
         else:
             print(
                 f"Running Ray in normal seperate sampler with: {self.world_size} number of workers"
@@ -136,7 +109,6 @@ class RayWorker:
             self.noise_add = self.local_rank
 
         # From mochi-xdit, xdit, pipelines.py
-        # I dont use globals since it does not work as module
         if self.parallel_dict["is_xdit"]:
             from xfuser.core.distributed import (
                 init_distributed_environment,
@@ -185,7 +157,7 @@ class RayWorker:
         return self.local_rank
 
     def get_is_model_loaded(self):
-        return self.is_model_load
+        return self.is_model_loaded
 
     def patch_usp(self):
         self.model.add_callback(
@@ -281,6 +253,11 @@ class RayWorker:
                 )[0]
             del lora_model
 
+    def kill(self):
+        self.model = None
+        dist.destroy_process_group()
+        ray.actor.exit_actor()
+
     def common_ksampler(
         self,
         seed,
@@ -352,3 +329,123 @@ class RayWorker:
         comfy.model_management.soft_empty_cache()
         gc.collect()
         return (out,)
+
+
+class RayNCCLTester:
+    def __init__(self, local_rank, world_size, device_id):
+        local_rank = local_rank
+        world_size = world_size
+        device_id = device_id
+        device = torch.device(f"cuda:{device_id}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
+
+        dist.init_process_group(
+            "nccl",
+            rank=local_rank,
+            world_size=world_size,
+            timeout=timedelta(minutes=1),
+            device_id=device
+        )
+        pg = dist.group.WORLD
+        cp.set_cp_group(pg, list(range(world_size)), local_rank)
+
+        print("Running NCCL COMM pre-run")
+
+        # Each rank contributes rank+1
+        x = torch.ones(1, device=device) * (local_rank + 1)
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        result = x.item()
+
+        # Expected sum = N(N+1)/2
+        expected = world_size * (world_size + 1) // 2
+
+        if abs(result - expected) > 1e-3:
+            raise RuntimeError(
+                f"[Rank {local_rank}] COMM test failed: "
+                f"got {result}, expected {expected}. "
+                f"world_size may be mismatched!"
+            )
+        else:
+            print(f"[Rank {local_rank}] COMM test passed ✅ (result={result})")
+        dist.barrier()
+
+    def kill(self):
+        dist.destroy_process_group()
+        ray.actor.exit_actor()
+
+
+def ray_nccl_tester(world_size):
+    gpu_actor = ray.remote(RayNCCLTester)
+    gpu_actors = []
+
+    for local_rank in range(world_size):
+        gpu_actors.append(
+            gpu_actor.options(num_gpus=1, name=f"RayTest:{local_rank}").remote(
+                local_rank=local_rank,
+                world_size=world_size,
+                device_id=0,
+            )
+        )
+    for actor in gpu_actors:
+        ray.get(actor.__ray_ready__.remote())
+
+    for actor in gpu_actors:
+        actor.kill.remote()
+
+
+# Just kill the damn actor when lora change, so no dangling memory leak BS when FSDP.
+def make_ray_actor_fn(
+    world_size,
+    parallel_dict
+):
+    def _init_ray_actor(
+        world_size=world_size,
+        parallel_dict=parallel_dict
+    ):
+        ray_actors = dict()
+        gpu_actor = ray.remote(RayWorker)
+        gpu_actors = []
+
+        for local_rank in range(world_size):
+            gpu_actors.append(
+                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+                    local_rank=local_rank,
+                    world_size=world_size,
+                    device_id=0,
+                    parallel_dict=parallel_dict,
+                )
+            )
+        ray_actors["workers"] = gpu_actors
+
+        for actor in ray_actors["workers"]:
+            ray.get(actor.__ray_ready__.remote())
+        return ray_actors
+
+    return _init_ray_actor
+
+
+def ensure_fresh_actors(ray_actors_init):
+    ray_actors, ray_actor_fn = ray_actors_init
+    gpu_actors = ray_actors["workers"]
+
+    needs_restart = False
+    try:
+        is_loaded = ray.get(gpu_actors[0].get_is_model_loaded.remote())
+        if is_loaded:
+            needs_restart = True
+    except RayActorError:
+        # Actor already dead or crashed
+        needs_restart = True
+
+    if needs_restart:
+        for actor in gpu_actors:
+            try:
+                ray.get(actor.kill.remote())
+            except Exception:
+                pass  # ignore already dead
+        ray_actors = ray_actor_fn()
+        gpu_actors = ray_actors["workers"]
+
+    parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+
+    return ray_actors, gpu_actors, parallel_dict

@@ -6,7 +6,10 @@ import torch
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
-from .distributed_worker.ray_worker import RayWorker
+from .distributed_worker.ray_worker import (
+    make_ray_actor_fn,
+    ray_nccl_tester
+)
 
 
 class RayInitializerDebug:
@@ -20,12 +23,12 @@ class RayInitializerDebug:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
-                "DEBUG_USP": ("BOOLEAN", {"default": False}),
             }
         }
 
     RETURN_TYPES = ("RAY_ACTORS_INIT",)
     RETURN_NAMES = ("ray_actors_init",)
+
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
 
@@ -37,7 +40,6 @@ class RayInitializerDebug:
         ulysses_degree,
         ring_degree,
         FSDP,
-        DEBUG_USP,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
@@ -49,6 +51,9 @@ class RayInitializerDebug:
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = GPU
         max_world_size = torch.cuda.device_count()
+        if world_size > max_world_size:
+            raise ValueError("To many gpus")
+
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["is_dumb_parallel"] = True
@@ -61,11 +66,6 @@ class RayInitializerDebug:
         if FSDP:
             self.parallel_dict["is_fsdp"] = True
             self.parallel_dict["is_fsdp_wrapped"] = False
-
-        if DEBUG_USP:
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ring_degree"] = 1
-            self.parallel_dict["ulysses_degree"] = 1
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error
@@ -80,24 +80,10 @@ class RayInitializerDebug:
             ray.init(runtime_env={"py_modules": [raylight]})
             raise RuntimeError(f"Ray connection failed: {e}")
 
-        ray_actors = dict()
-        gpu_actor = ray.remote(RayWorker)
-        gpu_actors = []
-        for local_rank in range(world_size):
-            gpu_actors.append(
-                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                    local_rank=local_rank,
-                    world_size=world_size,
-                    device_id=0,
-                    parallel_dict=self.parallel_dict,
-                )
-            )
-        ray_actors["workers"] = gpu_actors
-
-        for actor in ray_actors["workers"]:
-            ray.get(actor.__ray_ready__.remote())
-
-        return (ray_actors,)
+        ray_nccl_tester(world_size)
+        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
+        ray_actors = ray_actor_fn()
+        return ([ray_actors, ray_actor_fn],)
 
 
 NODE_CLASS_MAPPINGS = {
