@@ -95,10 +95,7 @@ class RayWorker:
         self.device_mesh = None
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
 
-        if self.model is not None:
-            self.is_model_load = True
-        else:
-            self.is_model_load = False
+        self.is_model_loaded = False
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
@@ -181,18 +178,13 @@ class RayWorker:
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
 
-    def clear_model(self):
-        if self.model is not None:
-            comfy.model_management.cleanup_models()
-            self.model = None
-
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)
 
     def get_local_rank(self):
         return self.local_rank
 
-    def is_model_loaded(self):
+    def get_is_model_loaded(self):
         return self.is_model_load
 
     def patch_usp(self):
@@ -232,6 +224,8 @@ class RayWorker:
             self.model = FSDPModelPatcher.clone(self.model)
             self.state_dict = self.model.model_state_dict()
             self.model.config_fsdp(self.local_rank, self.device_mesh)
+
+        self.is_model_loaded = True
 
     def set_lora_list(self, lora):
         self.lora_list = lora

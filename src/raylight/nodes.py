@@ -11,6 +11,37 @@ from comfy import sd, sample, utils
 from .distributed_worker.ray_worker import RayWorker
 
 
+# Test to just kill the damn actor when lora change, so no dangling memory leak when FSDP.
+def make_ray_actor_fn(
+    world_size,
+    parallel_dict
+):
+    def _init_ray_actor(
+        world_size=world_size,
+        parallel_dict=parallel_dict
+    ):
+        ray_actors = dict()
+        gpu_actor = ray.remote(RayWorker)
+        gpu_actors = []
+
+        for local_rank in range(world_size):
+            gpu_actors.append(
+                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+                    local_rank=local_rank,
+                    world_size=world_size,
+                    device_id=0,
+                    parallel_dict=parallel_dict,
+                )
+            )
+        ray_actors["workers"] = gpu_actors
+
+        for actor in ray_actors["workers"]:
+            ray.get(actor.__ray_ready__.remote())
+        return ray_actors
+
+    return _init_ray_actor
+
+
 class RayInitializer:
     @classmethod
     def INPUT_TYPES(s):
@@ -97,24 +128,9 @@ class RayInitializer:
             ray.init(runtime_env={"py_modules": [raylight]})
             raise RuntimeError(f"Ray connection failed: {e}")
 
-        ray_actors = dict()
-        gpu_actor = ray.remote(RayWorker)
-        gpu_actors = []
-        for local_rank in range(world_size):
-            gpu_actors.append(
-                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
-                    local_rank=local_rank,
-                    world_size=world_size,
-                    device_id=0,
-                    parallel_dict=self.parallel_dict,
-                )
-            )
-        ray_actors["workers"] = gpu_actors
-
-        for actor in ray_actors["workers"]:
-            ray.get(actor.__ray_ready__.remote())
-
-        return (ray_actors,)
+        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
+        ray_actors = ray_actor_fn()
+        return ([ray_actors, ray_actor_fn],)
 
 
 class RayUNETLoader:
@@ -141,7 +157,10 @@ class RayUNETLoader:
     CATEGORY = "Raylight"
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, lora=None):
-        gpu_actors = ray_actors_init["workers"]
+        ray_actors = ray_actors_init[0]
+        ray_actor_fn = ray_actors_init[1]
+
+        gpu_actors = ray_actors["workers"]
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
 
         model_options = {}
@@ -178,15 +197,14 @@ class RayUNETLoader:
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
+        # Kill actor if model exist
+        if ray.get(gpu_actors[0].get_is_model_loaded.remote()) is True:
+            for actor in gpu_actors:
+                ray.kill(actor)
+            ray_actor_fn()
+
         loaded_futures = []
         patched_futures = []
-
-        for actor in gpu_actors:
-            loaded_futures.append(
-                actor.clear_model.remote()
-            )
-        ray.get(loaded_futures)
-        loaded_futures = []
 
         for actor in gpu_actors:
             loaded_futures.append(
@@ -220,7 +238,7 @@ class RayUNETLoader:
 
         ray.get(patched_futures)
 
-        return (ray_actors_init,)
+        return (ray_actors,)
 
 
 class RayLoraLoader:
