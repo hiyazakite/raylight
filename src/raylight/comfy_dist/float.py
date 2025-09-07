@@ -2,18 +2,38 @@ import torch
 from torch.distributed.tensor import DTensor
 
 
-def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=None, device_mesh=None):
+#  Honestly i just throw DTensor.from_local untill i dont get error
+def calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS,
+                  generator=None, device_mesh=None):
     mantissa_scaled = torch.where(
         normal_mask,
         (abs_x / (2.0 ** (exponent - EXPONENT_BIAS)) - 1.0) * (2**MANTISSA_BITS),
         (abs_x / (2.0 ** (-EXPONENT_BIAS + 1 - MANTISSA_BITS)))
     )
 
-    if isinstance(mantissa_scaled, DTensor):
-        mantissa_scaled += DTensor.from_local(torch.rand(mantissa_scaled.size(), dtype=mantissa_scaled.dtype, layout=mantissa_scaled.layout, device=mantissa_scaled.device, generator=generator), device_mesh)
+    rand_local = torch.rand(
+        mantissa_scaled.size(),
+        dtype=mantissa_scaled.dtype,
+        layout=mantissa_scaled.layout,
+        device=mantissa_scaled.device,
+        generator=generator,
+    )
+
+    if isinstance(abs_x, DTensor):
+        rand_local = DTensor.from_local(rand_local, abs_x.device_mesh, abs_x.placements)
+        mantissa_scaled = mantissa_scaled + rand_local
     else:
-        mantissa_scaled += torch.rand(mantissa_scaled.size(), dtype=mantissa_scaled.dtype, layout=mantissa_scaled.layout, device=mantissa_scaled.device, generator=generator)
-    return mantissa_scaled.floor() / (2**MANTISSA_BITS)
+        mantissa_scaled = mantissa_scaled + rand_local
+
+    mantissa_scaled = mantissa_scaled.floor() / (2**MANTISSA_BITS)
+
+    # Ensure return type mirrors abs_x
+    if isinstance(abs_x, DTensor) and not isinstance(mantissa_scaled, DTensor):
+        mantissa_scaled = DTensor.from_local(mantissa_scaled, abs_x.device_mesh, abs_x.placements)
+    elif not isinstance(abs_x, DTensor) and isinstance(mantissa_scaled, DTensor):
+        mantissa_scaled = mantissa_scaled.to_local()
+
+    return mantissa_scaled
 
 
 # Not 100% sure about this
@@ -25,30 +45,41 @@ def manual_stochastic_round_to_float8(x, dtype, generator=None, device_mesh=None
     else:
         raise ValueError("Unsupported dtype")
 
+    # Convert input precision
     x = x.half()
+
+    # Sign + abs
     sign = torch.sign(x)
     abs_x = x.abs()
-    sign = torch.where(abs_x == 0, 0, sign)
+    sign = torch.where(abs_x == 0, torch.zeros_like(sign), sign)
 
-    # Combine exponent calculation and clamping
+    # Exponent
     exponent = torch.clamp(
         torch.floor(torch.log2(abs_x)) + EXPONENT_BIAS,
         0, 2**EXPONENT_BITS - 1
     )
-
-    # Combine mantissa calculation and rounding
     normal_mask = ~(exponent == 0)
 
-    abs_x[:] = calc_mantissa(abs_x, exponent, normal_mask, MANTISSA_BITS, EXPONENT_BIAS, generator=generator, device_mesh=device_mesh)
+    abs_x = calc_mantissa(abs_x, exponent, normal_mask,
+                          MANTISSA_BITS, EXPONENT_BIAS,
+                          generator=generator, device_mesh=device_mesh)
 
-    sign *= torch.where(
+    sign = sign * torch.where(
         normal_mask,
         (2.0 ** (exponent - EXPONENT_BIAS)) * (1.0 + abs_x),
         (2.0 ** (-EXPONENT_BIAS + 1)) * abs_x
     )
 
-    inf = torch.finfo(dtype)
-    torch.clamp(sign, min=inf.min, max=inf.max, out=sign)
+    # Clamp to float8 range
+    finfo = torch.finfo(dtype)
+    torch.clamp(sign, min=finfo.min, max=finfo.max, out=sign)
+
+    # Mirror input type
+    if isinstance(x, DTensor) and not isinstance(sign, DTensor):
+        sign = DTensor.from_local(sign, x.device_mesh, x.placements)
+    elif not isinstance(x, DTensor) and isinstance(sign, DTensor):
+        sign = sign.to_local()
+
     return sign
 
 
