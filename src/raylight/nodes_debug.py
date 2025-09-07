@@ -58,10 +58,8 @@ class RayInitializerDebug:
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["is_dumb_parallel"] = True
 
-        if ulysses_degree > 1 or ring_degree > 1:
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = ulysses_degree
-            self.parallel_dict["ring_degree"] = ring_degree
+        self.parallel_dict["ulysses_degree"] = ulysses_degree
+        self.parallel_dict["ring_degree"] = 1
 
         if FSDP:
             self.parallel_dict["is_fsdp"] = True

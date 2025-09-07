@@ -97,7 +97,7 @@ class RayWorker:
                 rank=local_rank,
                 world_size=self.world_size,
                 timeout=timedelta(minutes=1),
-                device_id=self.device
+                # device_id=self.device
             )
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
             pg = dist.group.WORLD

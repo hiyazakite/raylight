@@ -2,14 +2,6 @@
 
 Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser and FSDP to implement parallelism
 
-## NOTICE
-In rare cases, a memory leak may occur when switching from one LoRA to another while using FSDP.
-However, in most tests this issue does not appear, even with the same Docker setup....
-
-If memory leak cases continue to grow, I will force a reinitialization of the Ray worker.
-
-In the meantime, if you encounter this issue, please restart Comfy.
-
 ## RTM, Known Issues
 - Scroll further down for the installation guide.
 - If NCCL communication fails before running (e.g., watchdog timeout), set the following environment variables:
@@ -24,6 +16,22 @@ In the meantime, if you encounter this issue, please restart Comfy.
 - Tested on PyTorch 2.7 - 2.8 CU128
 - FLASH ATTENTION IS A MUST IF USING USP
 - Example WF just open from your comfyui menu and browse templates
+
+## GPU Architectures
+
+1. **Ampere**: There is an issue with NCCL broadcast and reduction in FSDP on PyTorch 2.8.
+   Please use the previous version instead. FSDP works successfully on Torch 2.7.1 CU128 for Ampere.
+   Reference: https://github.com/pytorch/pytorch/issues/162057#issuecomment-3250217122
+
+2. **Turing**: Not tested. Please use FlashAttn1 instead of FlashAttn2.
+
+3. **Ada Lovelace**: There is also an issue with Torch 2.8 which when assigning
+   `device_id` to `torch.dist_init_process_group()` cause OOM.
+   In a mean time, you would see torch distributor complaining about device assigment, but other-
+   than that it should be working fine.
+
+4. **Blackwell**: Expected to work just like Ada Lovelace.
+
 
 ## Supported Models
 
