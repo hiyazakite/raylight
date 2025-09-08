@@ -54,7 +54,7 @@ class RayInitializerDebug:
         if world_size > max_world_size:
             raise ValueError("To many gpus")
 
-        self.parallel_dict["is_xdit"] = False
+        self.parallel_dict["is_xdit"] = True
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["is_dumb_parallel"] = True
 
