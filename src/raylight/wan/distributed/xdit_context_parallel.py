@@ -5,7 +5,7 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+from raylight.comfy_dist.ldm.modules.attention import xfuser_optimized_attention
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -186,16 +186,17 @@ def usp_attn_forward(self, x, freqs, dtype=torch.bfloat16):
     def qkv_fn(x):
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+        v = self.v(x).view(b, s, n * d)
         return q, k, v
 
     q, k, v = qkv_fn(x)
     q, k = apply_rope_sp(q, k, freqs)
 
-    x = xFuserLongContextAttention()(
-        None, query=q, key=k, value=v, window_size=self.window_size
+    x = xfuser_optimized_attention(
+        q.view(b, s, n * d),
+        k.view(b, s, n * d),
+        v,
+        heads=self.num_heads,
     )
-
-    x = x.flatten(2)
     x = self.o(x)
     return x

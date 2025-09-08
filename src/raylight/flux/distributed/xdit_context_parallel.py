@@ -8,7 +8,23 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+from raylight.comfy_dist.ldm.modules.attention import xfuser_optimized_attention
+
+
+def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
+    if modulation_dims is None:
+        if m_add is not None:
+            return torch.addcmul(m_add, tensor, m_mult)
+        else:
+            return tensor * m_mult
+    else:
+        for d in modulation_dims:
+            tensor[:, d[0]:d[1]] *= m_mult[:, d[2]]
+            if m_add is not None:
+                tensor[:, d[0]:d[1]] += m_add[:, d[2]]
+        return tensor
+
+
 
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -87,6 +103,15 @@ def apply_rope_sp(xq, xk, freqs_cis):
     return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
 
 
+def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, mask=None) -> Tensor:
+    if pe is not None:
+        q, k = apply_rope_sp(q, k, pe)
+
+    heads = q.shape[1]
+    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True, mask=mask)
+    return x
+
+
 def usp_dit_forward(
     self,
     img: Tensor,
@@ -115,7 +140,7 @@ def usp_dit_forward(
         if guidance is not None:
             vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
 
-    vec = vec + self.vector_in(y[:,:self.params.vec_in_dim])
+    vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
     txt = self.txt_in(txt)
 
     if img_ids is not None:
@@ -168,7 +193,7 @@ def usp_dit_forward(
                              pe=pe,
                              attn_mask=attn_mask)
 
-        if control is not None: # Controlnet
+        if control is not None:  # Controlnet
             control_i = control.get("input")
             if i < len(control_i):
                 add = control_i[i]
@@ -201,59 +226,31 @@ def usp_dit_forward(
         else:
             img = block(img, vec=vec, pe=pe, attn_mask=attn_mask)
 
-        if control is not None: # Controlnet
+        if control is not None:  # Controlnet
             control_o = control.get("output")
             if i < len(control_o):
                 add = control_o[i]
                 if add is not None:
-                    img[:, txt.shape[1] :, ...] += add
+                    img[:, txt.shape[1]:, ...] += add
 
     # Context parallel
     img = get_sp_group().all_gather(img, dim=1)
 
-    img = img[:, txt.shape[1] :, ...]
+    img = img[:, txt.shape[1]:, ...]
     img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
     return img
 
 
-def usp_single_attn_forward(self, x, freqs, dtype=torch.bfloat16):
-    r"""
-    Args:
-        x(Tensor): Shape [B, L, num_heads, C / num_heads]
-        freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-    """
-    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims=None) -> Tensor:
+    mod, _ = self.modulation(vec)
+    qkv, mlp = torch.split(self.linear1(apply_mod(self.pre_norm(x), (1 + mod.scale), mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
-    # query, key, value function
-    def qkv_fn(x):
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
-        return q, k, v
+    q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    q, k = self.norm(q, k, v)
 
-    q, k, v = qkv_fn(x)
-    q, k = apply_rope_sp(q, k, freqs)
-
-    x = xFuserLongContextAttention()(
-        None, query=q, key=k, value=v, window_size=self.window_size
-    )
-
-    x = x.flatten(2)
-    x = self.o(x)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask)
+    output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+    x += apply_mod(output, mod.gate, None, modulation_dims)
+    if x.dtype == torch.float16:
+        x = torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
     return x
-
-
-def usp_attn_forward(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, mask=None) -> Tensor:
-    q_shape = q.shape
-    k_shape = k.shape
-
-    if pe is not None:
-        q, k = apply_rope_sp(q, k, pe)
-
-    x = optimized_attention(q, k, v, heads, skip_reshape=True, mask=mask)
-    x = xFuserLongContextAttention()(
-        None, query=q, key=k, value=v
-    )
-    x = x.flatten(2)
-    return x
-
