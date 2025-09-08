@@ -75,7 +75,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 | sage_fp8             | 10.75    |
 | sage_fp16_cuda       | 11.00    |
 | sage_fp16_triton     | 11.17    |
-| flash                | 11.34    |
+| flash                | 11.24    |
 | torch                | 11.36    |
 
 **Notes:**
