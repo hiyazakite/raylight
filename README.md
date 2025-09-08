@@ -68,6 +68,19 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.
 - Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.
 
+## Attention
+
+| Attention Variant    | Time (s) |
+|----------------------|----------|
+| sage_fp8             | 10.75    |
+| sage_fp16_cuda       | 11.00    |
+| sage_fp16_triton     | 11.17    |
+| flash                | 11.34    |
+| torch                | 11.36    |
+
+**Notes:**
+- Tested on Wan 2.1 T2V 14B 832x480 33 frame 2 RTX 2000 ADA
+
 
 
 ## Wan T2V 1.3B
