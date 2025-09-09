@@ -6,10 +6,19 @@ from xfuser.core.long_ctx_attention import (
 )
 
 from yunchang.kernels import AttnType
-from comfy import model_management
 
 
 def fa_attention_xfuser(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False):
+    if skip_reshape:
+        b, _, _, dim_head = q.shape
+    else:
+        b, _, dim_head = q.shape
+        dim_head //= heads
+        q, k, v = map(
+            lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2),
+            (q, k, v),
+        )
+
     if mask is not None:
         if mask.ndim == 2:
             mask = mask.unsqueeze(0)
@@ -19,13 +28,17 @@ def fa_attention_xfuser(q, k, v, heads, mask=None, attn_precision=None, skip_res
         assert mask is None
         out = xFuserLongContextAttention(attn_type=AttnType.FA)(
             None,
-            q,
-            k,
-            v,
-        ).flatten(2)
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+        ).transpose(1, 2)
     except Exception as e:
         logging.warning(f"Flash Attention failed, using default SDPA: {e}")
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+    if not skip_output_reshape:
+        out = (
+            out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+        )
     return out
 
 

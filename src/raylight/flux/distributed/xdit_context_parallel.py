@@ -25,8 +25,6 @@ def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
         return tensor
 
 
-
-
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
     """
     Create sinusoidal timestep embeddings.
@@ -51,16 +49,16 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
 
 def pad_freqs(original_tensor, target_len):
     """
-    original_tensor: [B, L_global, 1, D/2, 2, 2] — full freq tensor
+    original_tensor: [B, 1, L_global, D/2, 2, 2] — full freq tensor
     """
-    b, seq_len, z, dim, a, c = original_tensor.shape
+    b, z, seq_len, dim, a, c = original_tensor.shape
     pad_size = target_len - seq_len
     if pad_size <= 0:
         return original_tensor
     padding_tensor = torch.ones(
         b,
-        pad_size,
         z,
+        pad_size,
         dim,
         a,
         c,
@@ -73,15 +71,15 @@ def pad_freqs(original_tensor, target_len):
 
 def apply_rope_sp(xq, xk, freqs_cis):
     """
-    xq, xk:       [B, L_local, 1, D]
-    freqs_cis:    [B, L_global, 1, D/2, 2, 2] — full freq tensor
+    xq, xk:       [B, 1, L_local, D]
+    freqs_cis:    [B, 1, L_global, D/2, 2, 2] — full freq tensor
     Returns:      RoPE-applied local xq, xk
     """
 
     sp_rank = get_sequence_parallel_rank()
     sp_size = get_sequence_parallel_world_size()
 
-    B, L_local, _, D = xq.shape
+    B, _, L_local, D = xq.shape
     L_global = L_local * sp_size
 
     # Ensure freqs_cis has length L_global
@@ -90,7 +88,7 @@ def apply_rope_sp(xq, xk, freqs_cis):
     # Slice the correct frequency chunk for this rank
     start = sp_rank * L_local
     end = start + L_local
-    freqs_local = freqs_cis[:, start:end]  # [B, L_local, 1, D/2, 2, 2]
+    freqs_local = freqs_cis[:, :, start:end]  # [B, 1, L_local, D]
 
     # Prepare xq/xk for RoPE (split real/imag)
     xq_ = xq.to(dtype=freqs_local.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
@@ -106,11 +104,9 @@ def apply_rope_sp(xq, xk, freqs_cis):
 def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, mask=None) -> Tensor:
     if pe is not None:
         q, k = apply_rope_sp(q, k, pe)
-
     heads = q.shape[1]
-    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True, mask=mask)
+    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True)
     return x
-
 
 def usp_dit_forward(
     self,
@@ -149,22 +145,12 @@ def usp_dit_forward(
     else:
         pe = None
 
-    # Context Parallel
-    print("BEFORE PARALLEL")
-    print(f"{img.size()=}")
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[
         get_sequence_parallel_rank()
     ]
-    print("AFTER PARALLEL")
-    print(f"{img.size()=}")
-
-    print("BEFORE PARALLEL")
-    print(f"{txt.size()=}")
     txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[
         get_sequence_parallel_rank()
     ]
-    print("AFTER PARALLEL")
-    print(f"{txt.size()=}")
 
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.double_blocks):
@@ -200,12 +186,16 @@ def usp_dit_forward(
                 if add is not None:
                     img += add
 
-    if img.dtype == torch.float16:
-        img = torch.nan_to_num(img, nan=0.0, posinf=65504, neginf=-65504)
-
     img = get_sp_group().all_gather(img, dim=1)
     txt = get_sp_group().all_gather(txt, dim=1)
     img = torch.cat((txt, img), 1)
+
+    if img.dtype == torch.float16:
+        img = torch.nan_to_num(img, nan=0.0, posinf=65504, neginf=-65504)
+
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[
+        get_sequence_parallel_rank()
+    ]
 
     for i, block in enumerate(self.single_blocks):
         if ("single_block", i) in blocks_replace:
@@ -280,7 +270,6 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: T
                          torch.cat((img_k, txt_k), dim=2),
                          torch.cat((img_v, txt_v), dim=2),
                          pe=pe, mask=attn_mask)
-
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1]:]
     else:
         # run actual attention
@@ -288,7 +277,6 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: T
                          torch.cat((txt_k, img_k), dim=2),
                          torch.cat((txt_v, img_v), dim=2),
                          pe=pe, mask=attn_mask)
-
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
     # calculate the img bloks
