@@ -1,5 +1,4 @@
-import logging
-import torch
+from comfy.cli_args import args
 
 from xfuser.core.long_ctx_attention import (
     xFuserLongContextAttention,
@@ -33,14 +32,26 @@ def fa_attention_xfuser(q, k, v, heads, mask=None, attn_precision=None, skip_res
             v.transpose(1, 2),
         ).transpose(1, 2)
     except Exception as e:
-        logging.warning(f"Flash Attention failed, using default SDPA: {e}")
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        print(f"XFuser Flash Attention failed, using XFuser Torch: {e}")
+        out = xFuserLongContextAttention(attn_type=AttnType.TORCH)(
+            None,
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_mask=mask,
+        ).transpose(1, 2)
     if not skip_output_reshape:
         out = (
             out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         )
     return out
 
+
+def sage_attention_enabled():
+    return args.use_sage_attention
+
+def flash_attention_enabled():
+    return args.use_flash_attention
 
 xfuser_optimized_attention = fa_attention_xfuser
 xfuser_optimized_attention_masked = xfuser_optimized_attention
