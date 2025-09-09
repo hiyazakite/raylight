@@ -27,6 +27,16 @@ class RayInitializer:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
+                "XFuser_attention": ([
+                    "TORCH",
+                    "FLASH_ATTN",
+                    "FLASH_ATTN_3",
+                    "SAGE_AUTO_DETECT",
+                    "SAGE_FP16_TRITON",
+                    "SAGE_FP16_CUDA",
+                    "SAGE_FP8_CUDA",
+                    "SAGE_FP8_SM90"
+                ], {"default": "TORCH"})
             }
         }
 
@@ -44,6 +54,7 @@ class RayInitializer:
         ulysses_degree,
         ring_degree,
         FSDP,
+        XFuser_attention
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -75,6 +86,7 @@ class RayInitializer:
         self.parallel_dict["is_dumb_parallel"] = True
 
         if ulysses_degree > 1 or ring_degree > 1:
+            self.parallel_dict["attention"] = XFuser_attention
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
             self.parallel_dict["ring_degree"] = ring_degree

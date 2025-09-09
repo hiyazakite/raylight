@@ -17,6 +17,7 @@ import comfy.patcher_extension as pe
 from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
+import raylight.distributed_modules.attention as xfuser_attn
 from raylight.comfy_dist.model_patcher import FSDPModelPatcher
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from ray.exceptions import RayActorError
@@ -128,7 +129,7 @@ class RayWorker:
                 init_distributed_environment,
                 initialize_model_parallel,
             )
-
+            xfuser_attn.set_attn_type(self.parallel_dict["attention"])
             cp_rank, cp_size = cp.get_cp_rank_size()
             ulysses_degree = self.parallel_dict["ulysses_degree"]
             ring_degree = self.parallel_dict["ring_degree"]

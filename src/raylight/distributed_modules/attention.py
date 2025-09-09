@@ -1,27 +1,44 @@
-from comfy.cli_args import args
-
 from xfuser.core.long_ctx_attention import (
     xFuserLongContextAttention,
 )
 
 from yunchang.kernels import AttnType
+_ATTN_TYPE = None
 
 
-def make_xfuser_attention():
-    args.use_flash_attention = True
-    if args.use_sage_attention:
-        attn_type = AttnType.SAGE_AUTO
-        print(f"Using XFuser {attn_type} attention")
-    elif args.use_flash_attention:
-        attn_type = AttnType.FA
-        print(f"Using XFuser {attn_type} attention")
+def set_attn_type(attn):
+    global _ATTN_TYPE
+    _ATTN_TYPE = attn
+
+
+def get_attn_type():
+    if _ATTN_TYPE is None:
+        raise RuntimeError("_ATTN_TYPE is not initialized")
     else:
-        attn_type = AttnType.TORCH
-        print(f"Using XFuser {attn_type} attention")
-        print(args)
+        return _ATTN_TYPE
 
-    xfuser_attn = xFuserLongContextAttention(attn_type)
-    xfuser_attn_fallback = xFuserLongContextAttention(AttnType.TORCH)
+
+def make_xfuser_attention(attn_type):
+    print(f"Using XFuser {attn_type} attention")
+    if attn_type.upper() == "FLASH_ATTN":
+        attn = AttnType.FA
+    elif attn_type.upper() == "FLASH_ATTN_3":
+        attn = AttnType.FA3
+    elif attn_type.upper() == "SAGE_AUTO_DETECT":
+        attn = AttnType.SAGE_AUTO
+    elif attn_type.upper() == "SAGE_FP16_TRITON":
+        attn = AttnType.SAGE_FP16_TRITON
+    elif attn_type.upper() == "SAGE_FP16_CUDA":
+        attn = AttnType.SAGE_FP16
+    elif attn_type.upper() == "SAGE_FP8_CUDA":
+        attn = AttnType.SAGE_FP8
+    elif attn_type.upper() == "SAGE_FP8_SM90":
+        attn = AttnType.SAGE_FP8_SM90
+    else:
+        attn = AttnType.TORCH
+
+    xfuser_attn = xFuserLongContextAttention(attn_type=attn)
+    xfuser_attn_fallback = xFuserLongContextAttention(attn_type=AttnType.TORCH)
 
     def _attention_xfuser(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False):
         if skip_reshape:
@@ -60,7 +77,3 @@ def make_xfuser_attention():
             )
         return out
     return _attention_xfuser
-
-
-xfuser_optimized_attention = make_xfuser_attention()
-xfuser_optimized_attention_masked = xfuser_optimized_attention

@@ -23,6 +23,16 @@ class RayInitializerDebug:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
+                "XFuser_attention": ([
+                    "TORCH",
+                    "FLASH_ATTN",
+                    "FLASH_ATTN_3",
+                    "SAGE_AUTO_DETECT",
+                    "SAGE_FP16_TRITON",
+                    "SAGE_FP16_CUDA",
+                    "SAGE_FP8_CUDA",
+                    "SAGE_FP8_SM90"
+                ], {"default": "TORCH"})
             }
         }
 
@@ -40,14 +50,16 @@ class RayInitializerDebug:
         ulysses_degree,
         ring_degree,
         FSDP,
+        XFuser_attention
     ):
         # THIS IS PYTORCH DIST ADDRESS
-        # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
+        # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
         self.parallel_dict = dict()
+
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = GPU
@@ -63,6 +75,7 @@ class RayInitializerDebug:
         self.parallel_dict["ring_degree"] = 1
 
         if ulysses_degree > 0 or ring_degree > 0:
+            self.parallel_dict["attention"] = XFuser_attention
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
             self.parallel_dict["ring_degree"] = ring_degree

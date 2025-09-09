@@ -5,7 +5,9 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from raylight.distributed_modules.attention import xfuser_optimized_attention
+import raylight.distributed_modules.attention as xfuser_attn
+attn_type = xfuser_attn.get_attn_type()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
 
 
 def sinusoidal_embedding_1d(dim, position):
