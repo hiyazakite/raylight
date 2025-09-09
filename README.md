@@ -12,12 +12,11 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - Windows is not tested; I only have access to Linux cloud multi-GPU environments.
 - The tested model is the WanModel variant. The next model to be supported will be determined by usage popularity (Flux, Qwen, Hunyuan).
 - Non-DiT models are not supported.
-- Target hardware is 16GB vram and above. I will try to lower down to 12GB.
-- Tested on PyTorch 2.7 - 2.8 CU128
-- FLASH ATTENTION IS A MUST IF USING USP
 - Example WF just open from your comfyui menu and browse templates
 
 ## GPU Architectures
+
+### NVidia
 
 1. **Ampere**: There is an issue with NCCL broadcast and reduction in FSDP on PyTorch 2.8.
    Please use the previous version instead. FSDP works successfully on Torch 2.7.1 CU128 for Ampere.
@@ -32,21 +31,44 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 4. **Blackwell**: Expected to work just like Ada Lovelace.
 
+### AMD
+
+1. **MI3XX** : User confirmed working on 8xMI300X using ROCm compiled PyTorch and Flash Attention
+
 
 ## Supported Models
 
+**Wan**
 | Model             | USP | FSDP |
 |-------------------|-----|------|
-| Wan2.1 1.3B T2V   | ✅  | ✅   |
 | Wan2.1 14B T2V    | ✅  | ✅   |
 | Wan2.1 14B I2V    | ✅  | ✅   |
-| Wan2.1 Vace       | ✅  | ❌   |
-| Wan2.2 5B TI2V    | ✅  | ✅   |
 | Wan2.2 14B I2V    | ✅  | ✅   |
-| Flux Dev          | ❌  | ✅   |
-| Flux Konteks      | ❌  | ❓   |
+| Wan2.2 14B I2V    | ✅  | ✅   |
+| Wan2.1 1.3B T2V   | ✅  | ✅   |
+| Wan2.2 5B TI2V    | ✅  | ✅   |
+| Wan2.1 Vace       | ✅  | ❌   |
+
+
+**Flux**
+| Model             | USP | FSDP |
+|-------------------|-----|------|
+| Flux Dev          | ✅  | ✅   |
+| Flux Konteks      | ✅  | ✅   |
+| Flux Krea         | ✅  | ✅   |
 | Flux ControlNet   | ❌  | ❌   |
+
+
+**Qwen**
+| Model             | USP | FSDP |
+|-------------------|-----|------|
 | Qwen Image        | ❌  | ❓   |
+| Qwen Edit         | ❌  | ❓   |
+
+
+**Hunyuan Video**
+| Model             | USP | FSDP |
+|-------------------|-----|------|
 | Hunyuan Video     | ❌  | ❓   |
 
 **Legend:**
