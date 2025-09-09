@@ -85,6 +85,8 @@ def usp_inject_callback(
 
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
+
+# Comfy cli args, does not get pass through into ray actor
 class RayWorker:
     def __init__(self, local_rank, world_size, device_id, parallel_dict):
         self.model = None

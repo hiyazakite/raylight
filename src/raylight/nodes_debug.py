@@ -44,6 +44,7 @@ class RayInitializerDebug:
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
         self.parallel_dict = dict()
@@ -54,12 +55,17 @@ class RayInitializerDebug:
         if world_size > max_world_size:
             raise ValueError("To many gpus")
 
-        self.parallel_dict["is_xdit"] = True
+        self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["is_dumb_parallel"] = True
 
         self.parallel_dict["ulysses_degree"] = ulysses_degree
         self.parallel_dict["ring_degree"] = 1
+
+        if ulysses_degree > 0 or ring_degree > 0:
+            self.parallel_dict["is_xdit"] = True
+            self.parallel_dict["ulysses_degree"] = ulysses_degree
+            self.parallel_dict["ring_degree"] = ring_degree
 
         if FSDP:
             self.parallel_dict["is_fsdp"] = True

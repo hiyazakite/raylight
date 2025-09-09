@@ -5,7 +5,7 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-from raylight.comfy_dist.ldm.modules.attention import xfuser_optimized_attention
+from raylight.distributed_modules.attention import xfuser_optimized_attention
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -198,5 +198,6 @@ def usp_attn_forward(self, x, freqs, dtype=torch.bfloat16):
         v,
         heads=self.num_heads,
     )
+    x = x.flatten(2)
     x = self.o(x)
     return x

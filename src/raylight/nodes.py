@@ -8,6 +8,7 @@ import folder_paths
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
+
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
     ensure_fresh_actors,
@@ -49,6 +50,8 @@ class RayInitializer:
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
+        # HF Tokenizer warning when forking
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
         self.parallel_dict = dict()
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
@@ -67,23 +70,14 @@ class RayInitializer:
                 "ERROR, FSDP cannot be use in single cuda/cudalike device"
             )
 
-        try:
-            import flash_attn
-            is_flash_attn_exist = True
-        except ImportError:
-            is_flash_attn_exist = False
-
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["is_dumb_parallel"] = True
 
         if ulysses_degree > 1 or ring_degree > 1:
-            if is_flash_attn_exist is False:
-                raise ValueError("ERROR, Flash Attention is not installed, cannot use USP")
-            else:
-                self.parallel_dict["is_xdit"] = True
-                self.parallel_dict["ulysses_degree"] = ulysses_degree
-                self.parallel_dict["ring_degree"] = ring_degree
+            self.parallel_dict["is_xdit"] = True
+            self.parallel_dict["ulysses_degree"] = ulysses_degree
+            self.parallel_dict["ring_degree"] = ring_degree
 
         if FSDP:
             self.parallel_dict["is_fsdp"] = True

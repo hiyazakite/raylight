@@ -115,30 +115,6 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
 
 ## DEBUG Notes
 
-### Wan T2V 1.3B (bf16) — 1×3090 24G
-
-| Setup                        | VRAM (GB) |
-|------------------------------|-----------|
-| Non-Ulysses                  | 4.6       |
-| Ulysses                      | 5.1       |
-| XDiT Ring + Ulysses          | 9.2       |
-| Ulysses + Sync Module FSDP1  | 9.7       |
-| Ulysses + Unsync Module FSDP1| 5.2       |
-
----
-
-### Wan T2V 14B (fp8) — 1×3090 24G
-
-| Setup                        | VRAM (GB)        |
-|------------------------------|------------------|
-| Non-Ulysses                  | 15.5             |
-| Ulysses                      | 15.9             |
-| Ulysses + Sync Module FSDP1  | OOM (Pred. 47.3) |
-| Ulysses + Unsync Module FSDP1| OOM (Pred. 31.8) |
-| XDiT Ring + Ulysses          | OOM              |
-
----
-
 ### Wan T2V 14B (fp8) — 1×RTX 2000 ADA 16G
 **Resolution:** 480×832 × 33F
 
@@ -159,14 +135,12 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
 ---
 
 ### Notes
-- **FSDP OOM in single-device 14B model** caused by:
-  - Sync Module FSDP: model is first loaded into CUDA, then sharded (not tested on dual GPU).
-  - Lowest possible dtype for FSDP params is **bf16**, hence doubled size compared to fp8.
 - **FSDP2** is now available and can do fp8 calculation, but needs scalar tensors converted into 1D tensors.
 
 
 ## Installation
 
+**Manual**
 1. Clone this repository under `ComfyUI/custom_nodes`.
 2. `cd raylight`
 3. Install dependencies:
@@ -181,6 +155,10 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
      For other versions, check:
         https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/
 5. Restart ComfyUI.
+
+**ComfyUI Manager**
+1. Find raylight in the manager and install it.
+
 
 
 ## Support

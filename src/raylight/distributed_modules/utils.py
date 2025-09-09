@@ -1,6 +1,5 @@
 from torch.distributed._tensor import DTensor
 
-
 def detect_dtype_mismatch(module, ref_dtype):
     ignored_param = set()
     for name, param in module.named_parameters(recurse=True):
