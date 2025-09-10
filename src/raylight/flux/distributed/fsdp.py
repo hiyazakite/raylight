@@ -1,6 +1,7 @@
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 import torch
+from raylight.distributed_modules.utils import ensure_no_scalar
 
 
 def shard_model_fsdp2(model, model_state_dict):
@@ -14,6 +15,7 @@ def shard_model_fsdp2(model, model_state_dict):
 
     # Shard single_blocks
     for i, block in enumerate(diffusion_model.single_blocks):
+        block = ensure_no_scalar(block)
         diffusion_model.single_blocks[i] = fully_shard(
             module=block,
             mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.bfloat16),
@@ -22,6 +24,7 @@ def shard_model_fsdp2(model, model_state_dict):
 
     # Shard double_blocks
     for i, block in enumerate(diffusion_model.double_blocks):
+        block = ensure_no_scalar(block)
         diffusion_model.double_blocks[i] = fully_shard(
             module=block,
             mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.bfloat16),
