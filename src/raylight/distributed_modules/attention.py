@@ -17,7 +17,7 @@ def get_attn_type():
     else:
         return _ATTN_TYPE
 
-
+# TODO, build another function where sage got mask, since FA can't have mask
 def make_xfuser_attention(attn_type):
     print(f"Using XFuser {attn_type} attention")
     if attn_type.upper() == "FLASH_ATTN":
