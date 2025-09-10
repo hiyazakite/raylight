@@ -62,8 +62,8 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 **Qwen**
 | Model             | USP | FSDP |
 |-------------------|-----|------|
-| Qwen Image        | ❌  | ❓   |
-| Qwen Edit         | ❌  | ❓   |
+| Qwen Image/Edit   | ❓  | ❓   |
+| ControlNet        | ❌  | ❌   |
 
 
 **Hunyuan Video**

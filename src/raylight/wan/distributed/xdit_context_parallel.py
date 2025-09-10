@@ -1,4 +1,3 @@
-# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
@@ -176,7 +175,7 @@ def usp_dit_forward(
     return x
 
 
-def usp_attn_forward(self, x, freqs, dtype=torch.bfloat16):
+def usp_self_attn_forward(self, x, freqs, dtype=torch.bfloat16):
     r"""
     Args:
         x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -200,6 +199,46 @@ def usp_attn_forward(self, x, freqs, dtype=torch.bfloat16):
         v,
         heads=self.num_heads,
     )
+    x = x.flatten(2)
+    x = self.o(x)
+    return x
+
+
+def usp_t2v_cross_attn_forward(self, x, context, **kwargs):
+    r"""
+    Args:
+        x(Tensor): Shape [B, L1, C]
+        context(Tensor): Shape [B, L2, C]
+    """
+    q = self.norm_q(self.q(x))
+    k = self.norm_k(self.k(context))
+    v = self.v(context)
+
+    # compute attention
+    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads)
+    x = x.flatten(2)
+    x = self.o(x)
+    return x
+
+
+def usp_i2v_cross_attn_forward(self, x, context, context_img_len):
+    r"""
+    Args:
+        x(Tensor): Shape [B, L1, C]
+        context(Tensor): Shape [B, L2, C]
+    """
+    context_img = context[:, :context_img_len]
+    context = context[:, context_img_len:]
+
+    # compute query, key, value
+    q = self.norm_q(self.q(x))
+    k = self.norm_k(self.k(context))
+    v = self.v(context)
+    k_img = self.norm_k_img(self.k_img(context_img))
+    v_img = self.v_img(context_img)
+    img_x = xfuser_optimized_attention(q, k_img, v_img, heads=self.num_heads)
+    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads)
+    x = x + img_x
     x = x.flatten(2)
     x = self.o(x)
     return x

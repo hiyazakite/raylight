@@ -32,16 +32,21 @@ def usp_inject_callback(
         base_model, model_base.WAN22
     ):
         from ..wan.distributed.xdit_context_parallel import (
-            usp_attn_forward,
+            usp_self_attn_forward,
             usp_dit_forward,
+            usp_i2v_cross_attn_forward,
+            usp_t2v_cross_attn_forward
         )
+        from comfy.ldm.wan.model import WanT2VCrossAttention, WanI2VCrossAttention
 
         model = base_model.diffusion_model
         print("Initializing USP")
         for block in model.blocks:
-            block.self_attn.forward = types.MethodType(
-                usp_attn_forward, block.self_attn
-            )
+            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
+            if isinstance(block.cross_attn, WanT2VCrossAttention):
+                block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+            elif isinstance(block.cross_attn, WanI2VCrossAttention):
+                block.cross_attn.forward = types.MethodType(usp_i2v_cross_attn_forward, block.cross_attn)
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
     elif isinstance(base_model, model_base.Flux):
@@ -54,25 +59,23 @@ def usp_inject_callback(
         model = base_model.diffusion_model
         print("Initializing USP")
         for block in model.double_blocks:
-            block.forward = types.MethodType(
-                usp_double_stream_forward, block
-            )
-
+            block.forward = types.MethodType(usp_double_stream_forward, block)
         for block in model.single_blocks:
-            block.forward = types.MethodType(
-                usp_single_stream_forward, block
-            )
+            block.forward = types.MethodType(usp_single_stream_forward, block)
         model.forward_orig = types.MethodType(usp_dit_forward, model)
         dist.barrier()
 
-    # PlaceHolder For now
     elif isinstance(base_model, model_base.QwenImageTransformer2DModel):
         from ..qwen_image.distributed.xdit_context_parallel import (
             usp_dit_forward,
             usp_attn_forward,
         )
-
         model = base_model.diffusion_model
+        print("Initializing USP")
+        for block in model.transformer_blocks:
+            block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
+
+        model._forward = types.MethodType(usp_dit_forward, model)
         dist.barrier()
 
     else:
