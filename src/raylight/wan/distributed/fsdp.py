@@ -24,15 +24,18 @@ def shard_model_fsdp2(model, model_state_dict):
             ignored_params=ignored_block_params
         )
 
-    fully_shard(diffusion_model, ignored_params=ignored_params)
+    fully_shard(diffusion_model, ignored_params=ignored_params, reshard_after_forward=True)
     model.diffusion_model = diffusion_model
 
+
+    # CPU OFFLOAD ONLY FOR LOW END OF THE LOWEND
     set_model_state_dict(
         model=model,
         model_state_dict=model_state_dict,
         options=StateDictOptions(
             full_state_dict=True,
             broadcast_from_rank0=True,
+            cpu_offload=True
         ),
     )
 

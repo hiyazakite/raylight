@@ -1,4 +1,5 @@
 import torch
+from typing import Optional, Tuple
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -7,21 +8,6 @@ from xfuser.core.distributed import (
 import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
-
-
-def sinusoidal_embedding_1d(dim, position):
-    # preprocess
-    assert dim % 2 == 0
-    half = dim // 2
-    position = position.type(torch.float64)
-
-    # calculationk
-    sinusoid = torch.outer(
-        position, torch.pow(10000, -torch.arange(half).to(position).div(half))
-    )
-    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
-    return x
-
 
 def pad_freqs(original_tensor, target_len):
     """
@@ -45,7 +31,7 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-def apply_rope_sp(xq, xk, freqs_cis):
+def apply_rotary_emb_sp(xq, xk, freqs_cis):
     """
     xq, xk:       [B, L_local, 1, D]
     freqs_cis:    [B, L_global, 1, D/2, 2, 2] — full freq tensor
@@ -67,178 +53,193 @@ def apply_rope_sp(xq, xk, freqs_cis):
     freqs_local = freqs_cis[:, start:end]  # [B, L_local, 1, D/2, 2, 2]
 
     # Prepare xq/xk for RoPE (split real/imag)
-    xq_ = xq.to(dtype=freqs_local.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.to(dtype=freqs_local.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
+    xq_ = xq.reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.reshape(*xk.shape[:-1], -1, 1, 2)
 
     # Apply RoPE using local frequencies
     xq_out = freqs_local[..., 0] * xq_[..., 0] + freqs_local[..., 1] * xq_[..., 1]
     xk_out = freqs_local[..., 0] * xk_[..., 0] + freqs_local[..., 1] * xk_[..., 1]
 
-    return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
+    return xq_out.reshape_as(xq), xk_out.reshape_as(xk)
 
 
-# TODO, implement full USP including context and not only latent tensor
 def usp_dit_forward(
     self,
     x,
-    t,
+    timesteps,
     context,
-    clip_fea=None,
-    freqs=None,
+    attention_mask=None,
+    guidance: torch.Tensor = None,
+    ref_latents=None,
     transformer_options={},
-    **kwargs,
+    control=None,
+    **kwargs
 ):
-    r"""
-    Forward pass through the diffusion model
+    timestep = timesteps
+    encoder_hidden_states = context
+    encoder_hidden_states_mask = attention_mask
 
-    Args:
-        x (Tensor):
-            List of input video tensors with shape [B, C_in, F, H, W]
-        t (Tensor):
-            Diffusion timesteps tensor of shape [B]
-        context (List[Tensor]):
-            List of text embeddings each with shape [B, L, C]
-        seq_len (`int`):
-            Maximum sequence length for positional encoding
-        clip_fea (Tensor, *optional*):
-            CLIP image features for image-to-video mode
-        y (List[Tensor], *optional*):
-            Conditional video inputs for image-to-video mode, same shape as x
+    hidden_states, img_ids, orig_shape = self.process_img(x)
+    if  get_sequence_parallel_rank() == 0:
+        print("FIRST ===============================================================")
+        print(f"{hidden_states.shape=}")
+        print(f"{orig_shape=}")
+    num_embeds = hidden_states.shape[1]
 
-    Returns:
-        List[Tensor]:
-            List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
-    """
-    # embeddings
+    if ref_latents is not None:
+        h = 0
+        w = 0
+        index = 0
+        index_ref_method = kwargs.get("ref_latents_method", "index") == "index"
+        for ref in ref_latents:
+            if index_ref_method:
+                index += 1
+                h_offset = 0
+                w_offset = 0
+            else:
+                index = 1
+                h_offset = 0
+                w_offset = 0
+                if ref.shape[-2] + h > ref.shape[-1] + w:
+                    w_offset = w
+                else:
+                    h_offset = h
+                h = max(h, ref.shape[-2] + h_offset)
+                w = max(w, ref.shape[-1] + w_offset)
 
-    x = self.patch_embedding(x.float()).to(x.dtype)
-    # x = self.patch_embedding(x.to(next(self.patch_embedding.parameters()).dtype, copy=False)).to(x.dtype, copy=False)
-    grid_sizes = x.shape[2:]
-    x = x.flatten(2).transpose(1, 2)
+            kontext, kontext_ids, _ = self.process_img(ref, index=index, h_offset=h_offset, w_offset=w_offset)
+            hidden_states = torch.cat([hidden_states, kontext], dim=1)
+            img_ids = torch.cat([img_ids, kontext_ids], dim=1)
 
-    # time embeddings
-    e = self.time_embedding(
-        sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype)
+    if  get_sequence_parallel_rank() == 0:
+        print("AFTER LATENT ===============================================================")
+        print(f"{hidden_states.shape=}")
+
+    txt_start = round(max(((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2, ((x.shape[-2] + (self.patch_size // 2)) // self.patch_size) // 2))
+    txt_ids = torch.arange(txt_start, txt_start + context.shape[1], device=x.device).reshape(1, -1, 1).repeat(x.shape[0], 1, 3)
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    image_rotary_emb = self.pe_embedder(ids).squeeze(1).unsqueeze(2).to(x.dtype)
+    del ids, txt_ids, img_ids
+
+    hidden_states = self.img_in(hidden_states)
+    encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+    encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+    if guidance is not None:
+        guidance = guidance * 1000
+
+    temb = (
+        self.time_text_embed(timestep, hidden_states)
+        if guidance is None
+        else self.time_text_embed(timestep, guidance, hidden_states)
     )
-    e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
-    # head
-    # context
-    context = self.text_embedding(context)
+    patches_replace = transformer_options.get("patches_replace", {})
+    patches = transformer_options.get("patches", {})
+    blocks_replace = patches_replace.get("dit", {})
 
-    context_img_len = None
-    if clip_fea is not None:
-        if self.img_emb is not None:
-            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
-            context = torch.concat([context_clip, context], dim=1)
-        context_img_len = clip_fea.shape[-2]
+    hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=1)[
+    get_sequence_parallel_rank()
+    ]
 
-    # Context Parallel
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[
+    encoder_hidden_states = torch.chunk(encoder_hidden_states, get_sequence_parallel_world_size(), dim=1)[
         get_sequence_parallel_rank()
     ]
 
-    patches_replace = transformer_options.get("patches_replace", {})
-    blocks_replace = patches_replace.get("dit", {})
-    for i, block in enumerate(self.blocks):
-        if ("double_block", i) in blocks_replace:
+    if  get_sequence_parallel_rank() == 0:
+        print("AFTER CHUNK ===============================================================")
+        print(f"{hidden_states.shape=}")
 
+    for i, block in enumerate(self.transformer_blocks):
+
+        if ("double_block", i) in blocks_replace:
             def block_wrap(args):
                 out = {}
-                out["img"] = block(
-                    args["img"],
-                    context=args["txt"],
-                    e=args["vec"],
-                    freqs=args["pe"],
-                    context_img_len=context_img_len,
-                )
+                out["txt"], out["img"] = block(hidden_states=args["img"], encoder_hidden_states=args["txt"], encoder_hidden_states_mask=encoder_hidden_states_mask, temb=args["vec"], image_rotary_emb=args["pe"])
                 return out
-
-            out = blocks_replace[("double_block", i)](
-                {"img": x, "txt": context, "vec": e0, "pe": freqs},
-                {"original_block": block_wrap},
-            )
-            x = out["img"]
+            out = blocks_replace[("double_block", i)]({"img": hidden_states, "txt": encoder_hidden_states, "vec": temb, "pe": image_rotary_emb}, {"original_block": block_wrap})
+            hidden_states = out["img"]
+            encoder_hidden_states = out["txt"]
         else:
-            x = block(
-                x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
             )
 
-    x = self.head(x, e)
+        if "double_block" in patches:
+            for p in patches["double_block"]:
+                out = p({"img": hidden_states, "txt": encoder_hidden_states, "x": x, "block_index": i})
+                hidden_states = out["img"]
+                encoder_hidden_states = out["txt"]
 
-    # Context Parallel
-    x = get_sp_group().all_gather(x, dim=1)
+        if control is not None:  # Controlnet
+            control_i = control.get("input")
+            if i < len(control_i):
+                add = control_i[i]
+                if add is not None:
+                    hidden_states[:, :add.shape[1]] += add
 
-    # unpatchify
-    x = self.unpatchify(x, grid_sizes)
+    if  get_sequence_parallel_rank() == 0:
+        print("AFTER ATTN ===============================================================")
+        print(f"{hidden_states.shape=}")
 
-    return x
+    hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
+    if  get_sequence_parallel_rank() == 0:
+        print("AFTER  GATHER ===============================================================")
+        print(f"{hidden_states.shape=}")
 
+    hidden_states = self.norm_out(hidden_states, temb)
+    hidden_states = self.proj_out(hidden_states)
 
-def usp_self_attn_forward(self, x, freqs, dtype=torch.bfloat16):
-    r"""
-    Args:
-        x(Tensor): Shape [B, L, num_heads, C / num_heads]
-        freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-    """
-    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+    hidden_states = hidden_states[:, :num_embeds].view(orig_shape[0], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2)
+    hidden_states = hidden_states.permute(0, 3, 1, 4, 2, 5)
 
-    # query, key, value function
-    def qkv_fn(x):
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n * d)
-        return q, k, v
-
-    q, k, v = qkv_fn(x)
-    q, k = apply_rope_sp(q, k, freqs)
-
-    x = xfuser_optimized_attention(
-        q.view(b, s, n * d),
-        k.view(b, s, n * d),
-        v,
-        heads=self.num_heads,
-    )
-    x = x.flatten(2)
-    x = self.o(x)
-    return x
+    return hidden_states.reshape(orig_shape)[:, :, :, :x.shape[-2], :x.shape[-1]]
 
 
-def usp_t2v_cross_attn_forward(self, x, context, **kwargs):
-    r"""
-    Args:
-        x(Tensor): Shape [B, L1, C]
-        context(Tensor): Shape [B, L2, C]
-    """
-    q = self.norm_q(self.q(x))
-    k = self.norm_k(self.k(context))
-    v = self.v(context)
+def usp_attn_forward(
+    self,
+    hidden_states: torch.FloatTensor,  # Image stream
+    encoder_hidden_states: torch.FloatTensor = None,  # Text stream
+    encoder_hidden_states_mask: torch.FloatTensor = None,
+    attention_mask: Optional[torch.FloatTensor] = None,
+    image_rotary_emb: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    seq_txt = encoder_hidden_states.shape[1]
 
-    # compute attention
-    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads)
-    x = x.flatten(2)
-    x = self.o(x)
-    return x
+    img_query = self.to_q(hidden_states).unflatten(-1, (self.heads, -1))
+    img_key = self.to_k(hidden_states).unflatten(-1, (self.heads, -1))
+    img_value = self.to_v(hidden_states).unflatten(-1, (self.heads, -1))
 
+    txt_query = self.add_q_proj(encoder_hidden_states).unflatten(-1, (self.heads, -1))
+    txt_key = self.add_k_proj(encoder_hidden_states).unflatten(-1, (self.heads, -1))
+    txt_value = self.add_v_proj(encoder_hidden_states).unflatten(-1, (self.heads, -1))
 
-def usp_i2v_cross_attn_forward(self, x, context, context_img_len):
-    r"""
-    Args:
-        x(Tensor): Shape [B, L1, C]
-        context(Tensor): Shape [B, L2, C]
-    """
-    context_img = context[:, :context_img_len]
-    context = context[:, context_img_len:]
+    img_query = self.norm_q(img_query)
+    img_key = self.norm_k(img_key)
+    txt_query = self.norm_added_q(txt_query)
+    txt_key = self.norm_added_k(txt_key)
 
-    # compute query, key, value
-    q = self.norm_q(self.q(x))
-    k = self.norm_k(self.k(context))
-    v = self.v(context)
-    k_img = self.norm_k_img(self.k_img(context_img))
-    v_img = self.v_img(context_img)
-    img_x = xfuser_optimized_attention(q, k_img, v_img, heads=self.num_heads)
-    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads)
-    x = x + img_x
-    x = x.flatten(2)
-    x = self.o(x)
-    return x
+    joint_query = torch.cat([txt_query, img_query], dim=1)
+    joint_key = torch.cat([txt_key, img_key], dim=1)
+    joint_value = torch.cat([txt_value, img_value], dim=1)
+
+    joint_query, joint_key = apply_rotary_emb_sp(joint_query, joint_key, image_rotary_emb)
+
+    joint_query = joint_query.flatten(start_dim=2)
+    joint_key = joint_key.flatten(start_dim=2)
+    joint_value = joint_value.flatten(start_dim=2)
+
+    joint_hidden_states = xfuser_optimized_attention(joint_query, joint_key, joint_value, self.heads, attention_mask)
+
+    txt_attn_output = joint_hidden_states[:, :seq_txt, :]
+    img_attn_output = joint_hidden_states[:, seq_txt:, :]
+
+    img_attn_output = self.to_out[0](img_attn_output)
+    img_attn_output = self.to_out[1](img_attn_output)
+    txt_attn_output = self.to_add_out(txt_attn_output)
+
+    return img_attn_output, txt_attn_output

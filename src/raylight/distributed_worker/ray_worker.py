@@ -65,7 +65,7 @@ def usp_inject_callback(
         model.forward_orig = types.MethodType(usp_dit_forward, model)
         dist.barrier()
 
-    elif isinstance(base_model, model_base.QwenImageTransformer2DModel):
+    elif isinstance(base_model, model_base.QwenImage):
         from ..qwen_image.distributed.xdit_context_parallel import (
             usp_dit_forward,
             usp_attn_forward,
@@ -222,6 +222,10 @@ class RayWorker:
 
     def get_lora_list(self,):
         return self.lora_list
+
+    def set_xfuser_attention(self, attn_type):
+        self.parallel_dict["attention"] = attn_type
+        xfuser_attn.set_attn_type(self.parallel_dict["attention"])
 
     def patch_fsdp(self,):
         from torch.distributed.fsdp import FSDPModule
