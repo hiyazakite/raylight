@@ -1,7 +1,7 @@
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 import torch
-from raylight.distributed_modules.utils import ensure_no_scalar
+from raylight.distributed_modules.utils import detect_dtype_mismatch
 
 
 def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
@@ -13,28 +13,33 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
         if (not name.startswith("single_blocks.")) and (not name.startswith("double_blocks.")):
             ignored_params.add(param)
 
+    # Check dtype missmatch from scaled model
+    ref_dtype = diffusion_model.double_blocks[0].img_attn.qkv.weight.dtype
+
     # Shard single_blocks
     for i, block in enumerate(diffusion_model.single_blocks):
-        block = ensure_no_scalar(block)
+        ignored_block_params = detect_dtype_mismatch(block, ref_dtype)
         diffusion_model.single_blocks[i] = fully_shard(
             module=block,
-            mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.bfloat16),
+            mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
+            ignored_params=ignored_block_params,
         )
 
     # Shard double_blocks
     for i, block in enumerate(diffusion_model.double_blocks):
-        block = ensure_no_scalar(block)
+        ignored_block_params = detect_dtype_mismatch(block, ref_dtype)
         diffusion_model.double_blocks[i] = fully_shard(
             module=block,
-            mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.bfloat16),
+            mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
+            ignored_params=ignored_block_params,
         )
 
     # Root wrap with ignored params
     fully_shard(diffusion_model,
                 ignored_params=ignored_params,
-                mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.bfloat16),
+                mp_policy=MixedPrecisionPolicy(),
                 reshard_after_forward=True)
 
     model.diffusion_model = diffusion_model

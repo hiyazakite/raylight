@@ -23,6 +23,7 @@ class RayInitializerDebug:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
+                "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
                 "XFuser_attention": ([
                     "TORCH",
                     "FLASH_ATTN",
@@ -50,6 +51,7 @@ class RayInitializerDebug:
         ulysses_degree,
         ring_degree,
         FSDP,
+        FSDP_CPU_OFFLOAD,
         XFuser_attention
     ):
         # THIS IS PYTORCH DIST ADDRESS
@@ -81,8 +83,8 @@ class RayInitializerDebug:
             self.parallel_dict["ring_degree"] = ring_degree
 
         if FSDP:
+            self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
             self.parallel_dict["is_fsdp"] = True
-            self.parallel_dict["is_fsdp_wrapped"] = False
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error

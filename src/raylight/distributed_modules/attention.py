@@ -54,7 +54,8 @@ def make_xfuser_attention(attn_type):
                 mask = mask.unsqueeze(0)
             if mask.ndim == 3:
                 mask = mask.unsqueeze(1)
-        if join_k is not None:
+        # Check if using join attention, for MMDiT model
+        if join_q is not None:
             out = xfuser_attn(
                 None,
                 q.transpose(1, 2),
@@ -78,47 +79,4 @@ def make_xfuser_attention(attn_type):
             )
         return out
 
-    def _attention_xfuser(q, k, v, heads, join_q=None, join_k=None, join_v=None, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False):
-        if skip_reshape:
-            b, _, _, dim_head = q.shape
-        else:
-            b, _, dim_head = q.shape
-            dim_head //= heads
-            q, k, v = map(
-                lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2),
-                (q, k, v),
-            )
-        if mask is not None:
-            if mask.ndim == 2:
-                mask = mask.unsqueeze(0)
-            if mask.ndim == 3:
-                mask = mask.unsqueeze(1)
-        if join_k is not None:
-            out = xfuser_attn(
-                None,
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                attn_mask=mask,
-                joint_strategy="rear",
-                joint_tensor_query=join_q.transpose(1, 2),
-                joint_tensor_key=join_k.transpose(1, 2),
-                joint_tensor_value=join_v.transpose(1, 2),
-            ).transpose(1, 2)
-        else:
-            out = xfuser_attn(
-                None,
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                attn_mask=mask
-            ).transpose(1, 2)
-        if not skip_output_reshape:
-            out = (
-                out.transpose(1, 2).reshape(b, -1, heads * dim_head)
-            )
-        return out
-    if (attn == AttnType.FA) or (attn == AttnType.FA3):
-        return _attention_xfuser_unmask
-    else:
-        return _attention_xfuser
+    return _attention_xfuser_unmask

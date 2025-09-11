@@ -103,12 +103,32 @@ def apply_rope_sp(xq, xk, freqs_cis):
     return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
 
 
-def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, mask=None) -> Tensor:
-    if pe is not None:
-        q, k = apply_rope_sp(q, k, pe)
+def attention_join(q, k, v, join_q, join_k, join_v, mask=None) -> Tensor:
     heads = q.shape[1]
-    x = xfuser_optimized_attention(q, k, v, heads, skip_reshape=True)
+    x = xfuser_optimized_attention(
+        q,
+        k,
+        v,
+        heads,
+        join_q=join_q,
+        join_k=join_k,
+        join_v=join_v,
+        skip_reshape=True
+    )
     return x
+
+
+def attention(q, k, v, mask=None) -> Tensor:
+    heads = q.shape[1]
+    x = xfuser_optimized_attention(
+        q,
+        k,
+        v,
+        heads,
+        skip_reshape=True
+    )
+    return x
+
 
 def usp_dit_forward(
     self,
@@ -240,7 +260,9 @@ def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mas
     q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     q, k = self.norm(q, k, v)
 
-    attn = attention(q, k, v, pe=pe, mask=attn_mask)
+    if pe is not None:
+        q, k = apply_rope_sp(q, k, pe)
+    attn = attention(q, k, v)
     output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
     x += apply_mod(output, mod.gate, None, modulation_dims)
     if x.dtype == torch.float16:
@@ -266,19 +288,32 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: T
     txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
+    # For context parallel, q == v in shape, and also q = B, _, L, D
+    num_img_q = img_q.shape[2]
+    num_txt_q = txt_q.shape[2]
+
     if self.flipped_img_txt:
+        q = torch.cat((img_q, txt_q), dim=2)
+        k = torch.cat((img_k, txt_k), dim=2)
+        if pe is not None:
+            q, k = apply_rope_sp(q, k, pe)
+
+        img_q, txt_q = q.split([num_img_q, num_txt_q], dim=2)
+        img_k, txt_k = k.split([num_img_q, num_txt_q], dim=2)
+
         # run actual attention
-        attn = attention(torch.cat((img_q, txt_q), dim=2),
-                         torch.cat((img_k, txt_k), dim=2),
-                         torch.cat((img_v, txt_v), dim=2),
-                         pe=pe, mask=attn_mask)
+        attn = attention_join(img_q, img_k, img_v, txt_q, txt_k, txt_v, mask=attn_mask)
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1]:]
     else:
+        q = torch.cat((txt_q, img_q), dim=2)
+        k = torch.cat((txt_k, img_k), dim=2)
+        if pe is not None:
+            q, k = apply_rope_sp(q, k, pe)
+
+        txt_q, img_q = q.split([num_txt_q, num_img_q], dim=2)
+        txt_k, img_k = k.split([num_txt_q, num_img_q], dim=2)
         # run actual attention
-        attn = attention(torch.cat((txt_q, img_q), dim=2),
-                         torch.cat((txt_k, img_k), dim=2),
-                         torch.cat((txt_v, img_v), dim=2),
-                         pe=pe, mask=attn_mask)
+        attn = attention_join(txt_q, txt_k, txt_v, img_q, img_k, img_v, mask=attn_mask)
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
     # calculate the img bloks

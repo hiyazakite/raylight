@@ -1,5 +1,6 @@
 import raylight
 import os
+import gc
 
 import ray
 import torch
@@ -96,7 +97,6 @@ class RayInitializer:
         if FSDP:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
             self.parallel_dict["is_fsdp"] = True
-            self.parallel_dict["is_fsdp_wrapped"] = False
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error
@@ -336,6 +336,10 @@ class XFuserKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
     ):
+        # Clean VRAM for preparation to load model
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
         force_full_denoise = True
         if return_with_leftover_noise == "enable":
             force_full_denoise = False

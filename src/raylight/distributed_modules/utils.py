@@ -12,16 +12,30 @@ def detect_dtype_mismatch(module, ref_dtype):
 
 
 def ensure_no_scalar(module):
-    for name, param in module.named_parameters(recurse=False):
-        if param.ndim == 0:
-            new_param = param.unsqueeze(0)
-            module._parameters[name] = torch.nn.Parameter(new_param)
+    for mod in module.modules():
+        for name, param in list(mod._parameters.items()):
+            if param is None:
+                continue
+            if param.ndim == 0:
+                new_param = torch.nn.Parameter(param.detach().unsqueeze(0))
+                new_param.requires_grad = param.requires_grad
+                mod._parameters[name] = new_param
 
-    for name, buf in module.named_buffers(recurse=False):
-        if buf.ndim == 0:
-            new_buf = buf.unsqueeze(0)
-            module._buffers[name] = new_buf
+        for name, buf in list(mod._buffers.items()):
+            if buf is None:
+                continue
+            if isinstance(buf, torch.Tensor) and buf.ndim == 0:
+                new_buf = buf.detach().unsqueeze(0)
+                mod._buffers[name] = new_buf
+
     return module
+
+
+def adjust_state_dict_scalars(state_dict):
+    for k, v in list(state_dict.items()):
+        if isinstance(v, torch.Tensor) and v.ndim == 0:
+            state_dict[k] = v.unsqueeze(0)
+    return state_dict
 
 
 def inspect_tensor(t):
