@@ -17,7 +17,7 @@ def get_attn_type():
     else:
         return _ATTN_TYPE
 
-# TODO, build another function where sage got mask, since FA can't have mask
+
 def make_xfuser_attention(attn_type):
     print(f"Using XFuser {attn_type} attention")
     if attn_type.upper() == "FLASH_ATTN":
@@ -38,9 +38,8 @@ def make_xfuser_attention(attn_type):
         attn = AttnType.TORCH
 
     xfuser_attn = xFuserLongContextAttention(attn_type=attn)
-    xfuser_attn_fallback = xFuserLongContextAttention(attn_type=AttnType.TORCH)
 
-    def _attention_xfuser(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False):
+    def _attention_xfuser_unmask(q, k, v, heads, join_q=None, join_k=None, join_v=None, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False):
         if skip_reshape:
             b, _, _, dim_head = q.shape
         else:
@@ -55,17 +54,19 @@ def make_xfuser_attention(attn_type):
                 mask = mask.unsqueeze(0)
             if mask.ndim == 3:
                 mask = mask.unsqueeze(1)
-        try:
-            assert mask is None
+        if join_k is not None:
             out = xfuser_attn(
                 None,
                 q.transpose(1, 2),
                 k.transpose(1, 2),
                 v.transpose(1, 2),
+                joint_strategy="rear",
+                joint_tensor_query=join_q.transpose(1, 2),
+                joint_tensor_key=join_k.transpose(1, 2),
+                joint_tensor_value=join_v.transpose(1, 2),
             ).transpose(1, 2)
-        except Exception as e:
-            print(f"XFuser {attn_type} failed, using XFuser Torch: {e}")
-            out = xfuser_attn_fallback(
+        else:
+            out = xfuser_attn(
                 None,
                 q.transpose(1, 2),
                 k.transpose(1, 2),
@@ -76,4 +77,48 @@ def make_xfuser_attention(attn_type):
                 out.transpose(1, 2).reshape(b, -1, heads * dim_head)
             )
         return out
-    return _attention_xfuser
+
+    def _attention_xfuser(q, k, v, heads, join_q=None, join_k=None, join_v=None, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False):
+        if skip_reshape:
+            b, _, _, dim_head = q.shape
+        else:
+            b, _, dim_head = q.shape
+            dim_head //= heads
+            q, k, v = map(
+                lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2),
+                (q, k, v),
+            )
+        if mask is not None:
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0)
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+        if join_k is not None:
+            out = xfuser_attn(
+                None,
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                attn_mask=mask,
+                joint_strategy="rear",
+                joint_tensor_query=join_q.transpose(1, 2),
+                joint_tensor_key=join_k.transpose(1, 2),
+                joint_tensor_value=join_v.transpose(1, 2),
+            ).transpose(1, 2)
+        else:
+            out = xfuser_attn(
+                None,
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                attn_mask=mask
+            ).transpose(1, 2)
+        if not skip_output_reshape:
+            out = (
+                out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+            )
+        return out
+    if (attn == AttnType.FA) or (attn == AttnType.FA3):
+        return _attention_xfuser_unmask
+    else:
+        return _attention_xfuser
