@@ -64,6 +64,21 @@ def apply_rotary_emb_sp(xq, xk, freqs_cis):
     return xq_out.reshape_as(xq), xk_out.reshape_as(xk)
 
 
+def attention_join(q, k, v, join_q, join_k, join_v, mask=None):
+    heads = q.shape[1]
+    x = xfuser_optimized_attention(
+        q,
+        k,
+        v,
+        heads,
+        join_q=join_q,
+        join_k=join_k,
+        join_v=join_v,
+        skip_reshape=True
+    )
+    return x
+
+
 def usp_dit_forward(
     self,
     x,
@@ -118,13 +133,6 @@ def usp_dit_forward(
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
-    # Context parallel
-    sp_rank = get_sequence_parallel_rank()
-    sp_world_size = get_sequence_parallel_world_size()
-    hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
-    encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
-    encoder_hidden_states_mask = torch.chunk(encoder_hidden_states_mask, sp_world_size, dim=1)[sp_rank]
-
     if guidance is not None:
         guidance = guidance * 1000
 
@@ -137,6 +145,13 @@ def usp_dit_forward(
     patches_replace = transformer_options.get("patches_replace", {})
     patches = transformer_options.get("patches", {})
     blocks_replace = patches_replace.get("dit", {})
+
+    # Context parallel
+    sp_rank = get_sequence_parallel_rank()
+    sp_world_size = get_sequence_parallel_world_size()
+    hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
+    encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
+    encoder_hidden_states_mask = torch.chunk(encoder_hidden_states_mask, sp_world_size, dim=1)[sp_rank]
 
     for i, block in enumerate(self.transformer_blocks):
         if ("double_block", i) in blocks_replace:
@@ -201,17 +216,26 @@ def usp_attn_forward(
     txt_query = self.norm_added_q(txt_query)
     txt_key = self.norm_added_k(txt_key)
 
+    # For context parallel, q == v in shape, and also q = B, _, L, D
+    num_img_query = img_query.shape[2]
+    num_txt_query = txt_query.shape[2]
+
     joint_query = torch.cat([txt_query, img_query], dim=1)
     joint_key = torch.cat([txt_key, img_key], dim=1)
-    joint_value = torch.cat([txt_value, img_value], dim=1)
 
     joint_query, joint_key = apply_rotary_emb_sp(joint_query, joint_key, image_rotary_emb)
+    txt_query, img_query = joint_query.split([num_txt_query, num_img_query], dim=2)
+    txt_key, img_key = joint_key.split([num_txt_query, num_img_query], dim=2)
 
-    joint_query = joint_query.flatten(start_dim=2)
-    joint_key = joint_key.flatten(start_dim=2)
-    joint_value = joint_value.flatten(start_dim=2)
+    img_query = img_query.flatten(start_dim=2)
+    img_key = img_key.flatten(start_dim=2)
+    img_value = img_value.flatten(start_dim=2)
 
-    joint_hidden_states = xfuser_optimized_attention(joint_query, joint_key, joint_value, self.heads, attention_mask)
+    txt_query = txt_query.flatten(start_dim=2)
+    txt_key = txt_key.flatten(start_dim=2)
+    txt_value = txt_value.flatten(start_dim=2)
+
+    joint_hidden_states = attention_join(txt_query, txt_key, txt_value, img_query, img_key, img_value)
 
     txt_attn_output = joint_hidden_states[:, :seq_txt, :]
     img_attn_output = joint_hidden_states[:, seq_txt:, :]
