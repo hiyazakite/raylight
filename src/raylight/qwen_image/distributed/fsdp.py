@@ -1,5 +1,6 @@
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
+from raylight.distributed_modules.utils import detect_dtype_mismatch
 
 
 def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
@@ -13,11 +14,14 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
             ignored_params.add(param)
 
     # And also blocks is the most compute heavy part
+    ref_dtype = diffusion_model.transformer_blocks[0].attn.to_q.weight.dtype
     for i, block in enumerate(diffusion_model.transformer_blocks):
+        ignored_block_params = detect_dtype_mismatch(block, ref_dtype)
         diffusion_model.transformer_blocks[i] = fully_shard(
             module=block,
             mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
+            ignored_params=ignored_block_params,
         )
 
     fully_shard(diffusion_model, ignored_params=ignored_params, reshard_after_forward=True)

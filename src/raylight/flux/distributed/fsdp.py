@@ -1,6 +1,5 @@
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
-import torch
 from raylight.distributed_modules.utils import detect_dtype_mismatch
 
 

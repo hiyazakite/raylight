@@ -1,9 +1,22 @@
 # Raylight
 
-Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser and FSDP to implement parallelism
+Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser and FSDP to implement parallelism.
 
-## RTM, Known Issues
+*"Why buy 5090 when you can buy 2x5070s"-Komikndr*
+
+## UPDATE
+- No need to install FlashAttn.
+- SageAttn is now supported.
+- Partial support for USP Flux.
+- Full FSDP support for Qwen and Flux.
+- Flux USP and Qwen USP is in partial testing, you can try but it will suck.
+- Full LoRA support.
+- FSDP CPU offload, analogous to block swap.
+
+## RTM and Known Issues
 - Scroll further down for the installation guide.
+- **Rule of thumb**, if have enough VRAM just use USP, if not, FSDP, if it still not enough, use FSDP CPU Offload
+- FSDP CPU Offload is for ultra low VRAM, there will be a performance hit of course
 - If NCCL communication fails before running (e.g., watchdog timeout), set the following environment variables:
   ```bash
   export NCCL_P2P_DISABLE=1
@@ -13,7 +26,6 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - The tested model is the WanModel variant. The next model to be supported will be determined by usage popularity (Flux, Qwen, Hunyuan).
 - Non-DiT models are not supported.
 - Example WF just open from your comfyui menu and browse templates
-- FSDP CPU Offload for ultra low VRAM, there will be a performance hit of course
 
 ## GPU Architectures
 
@@ -23,7 +35,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
    Please use the previous version instead. FSDP works successfully on Torch 2.7.1 CU128 for Ampere.
    Reference: https://github.com/pytorch/pytorch/issues/162057#issuecomment-3250217122
 
-2. **Turing**: Not tested. Please use FlashAttn1 instead of FlashAttn2.
+2. **Turing**: Not tested. Please use FlashAttn1 instead of FlashAttn2 or Torch Attn.
 
 3. **Ada Lovelace**: There is also an issue with Torch 2.8 which when assigning
    `device_id` to `torch.dist_init_process_group()` cause OOM.
@@ -89,7 +101,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 **Notes:**
 - Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.
-- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.
+- Raylight FSDP can work with scaled model, but it really does not like it. Since FSDP shards must have uniform dtype, if not it will not be sharded.
 
 ## Attention
 
