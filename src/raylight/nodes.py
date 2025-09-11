@@ -28,6 +28,16 @@ class RayInitializer:
                 "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
+                "XFuser_attention": ([
+                    "TORCH",
+                    "FLASH_ATTN",
+                    "FLASH_ATTN_3",
+                    "SAGE_AUTO_DETECT",
+                    "SAGE_FP16_TRITON",
+                    "SAGE_FP16_CUDA",
+                    "SAGE_FP8_CUDA",
+                    "SAGE_FP8_SM90"
+                ], {"default": "TORCH"})
             }
         }
 
@@ -45,7 +55,8 @@ class RayInitializer:
         ulysses_degree,
         ring_degree,
         FSDP,
-        FSDP_CPU_OFFLOAD
+        FSDP_CPU_OFFLOAD,
+        XFuser_attention
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -77,7 +88,7 @@ class RayInitializer:
         self.parallel_dict["is_dumb_parallel"] = True
 
         if ulysses_degree > 1 or ring_degree > 1:
-            self.parallel_dict["attention"] = "TORCH"
+            self.parallel_dict["attention"] = XFuser_attention
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
             self.parallel_dict["ring_degree"] = ring_degree
@@ -104,40 +115,6 @@ class RayInitializer:
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
-
-
-class XFuserAttentionPatch:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "ray_actors": ("RAY_ACTORS_INIT",),
-                "XFuser_attention": ([
-                    "TORCH",
-                    "FLASH_ATTN",
-                    "FLASH_ATTN_3",
-                    "SAGE_AUTO_DETECT",
-                    "SAGE_FP16_TRITON",
-                    "SAGE_FP16_CUDA",
-                    "SAGE_FP8_CUDA",
-                    "SAGE_FP8_SM90"
-                ], {"default": "TORCH"})
-            }
-        }
-
-    RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
-    FUNCTION = "patch_attention"
-
-    CATEGORY = "Raylight"
-
-    def patch_attention(self, ray_actors, XFuser_attention):
-        gpu_workers = ray_actors["workers"]
-        futures = []
-        for actor in gpu_workers:
-            futures.append(actor.set_xfuser_attention.remote(XFuser_attention))
-        ray.get(futures)
-        return (ray_actors,)
 
 
 class RayUNETLoader:
@@ -392,14 +369,12 @@ class XFuserKSamplerAdvanced:
 
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
-    "XFuserAttentionPatch": XFuserAttentionPatch,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "XFuserKSamplerAdvanced": "XFuser KSampler Advanced",
     "XFuserAttentionPatch": "XFuser Attention Patch",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",

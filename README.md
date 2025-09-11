@@ -13,6 +13,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - The tested model is the WanModel variant. The next model to be supported will be determined by usage popularity (Flux, Qwen, Hunyuan).
 - Non-DiT models are not supported.
 - Example WF just open from your comfyui menu and browse templates
+- FSDP CPU Offload for ultra low VRAM, there will be a performance hit of course
 
 ## GPU Architectures
 

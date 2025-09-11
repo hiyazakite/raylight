@@ -4,7 +4,7 @@ import torch
 from raylight.distributed_modules.utils import ensure_no_scalar
 
 
-def shard_model_fsdp2(model, model_state_dict):
+def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     diffusion_model = model.diffusion_model
 
     # Collect params we want to ignore (everything except single_blocks + double_blocks)
@@ -45,7 +45,7 @@ def shard_model_fsdp2(model, model_state_dict):
         options=StateDictOptions(
             full_state_dict=True,
             broadcast_from_rank0=True,
-            cpu_offload=True
+            cpu_offload=enable_cpu_offload
         ),
     )
 

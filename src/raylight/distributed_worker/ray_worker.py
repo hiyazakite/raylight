@@ -223,10 +223,6 @@ class RayWorker:
     def get_lora_list(self,):
         return self.lora_list
 
-    def set_xfuser_attention(self, attn_type):
-        self.parallel_dict["attention"] = attn_type
-        xfuser_attn.set_attn_type(self.parallel_dict["attention"])
-
     def patch_fsdp(self,):
         from torch.distributed.fsdp import FSDPModule
         print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
@@ -234,19 +230,19 @@ class RayWorker:
         if not isinstance(self.model.model.diffusion_model, FSDPModule):
             if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
                 from ..wan.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict)
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
 
             elif isinstance(self.model.model, model_base.Flux):
                 from ..flux.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict)
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
 
             elif isinstance(self.model.model, model_base.QwenImage):
                 from ..qwen_image.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict)
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
 
             elif isinstance(self.model.model, model_base.HunyuanVideo):
                 from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict)
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
 
             else:
                 raise ValueError(f"{type(self.model.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
@@ -321,6 +317,7 @@ class RayWorker:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         if self.parallel_dict["is_fsdp"] is True:
+            self.is_cpu_offload = self.parallel_dict["fsdp_cpu_offload"]
             self.patch_fsdp()
 
         with torch.no_grad():
