@@ -133,11 +133,7 @@ def usp_dit_forward(
         context_img_len = clip_fea.shape[-2]
 
     # Context Parallel
-    sp_rank = get_sequence_parallel_rank()
-    sp_world_size = get_sequence_parallel_world_size()
-    x = torch.chunk(x, sp_world_size, dim=1)[sp_rank]
-    e = torch.chunk(e, sp_world_size, dim=1)[sp_rank]
-    e0 = torch.chunk(e0, sp_world_size, dim=1)[sp_rank]
+    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
