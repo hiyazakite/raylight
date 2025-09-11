@@ -110,7 +110,6 @@ def usp_dit_forward(
             List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
     """
     # embeddings
-
     x = self.patch_embedding(x.float()).to(x.dtype)
     # x = self.patch_embedding(x.to(next(self.patch_embedding.parameters()).dtype, copy=False)).to(x.dtype, copy=False)
     grid_sizes = x.shape[2:]
@@ -134,9 +133,11 @@ def usp_dit_forward(
         context_img_len = clip_fea.shape[-2]
 
     # Context Parallel
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[
-        get_sequence_parallel_rank()
-    ]
+    sp_rank = get_sequence_parallel_rank()
+    sp_world_size = get_sequence_parallel_world_size()
+    x = torch.chunk(x, sp_world_size, dim=1)[sp_rank]
+    e = torch.chunk(e, sp_world_size, dim=1)[sp_rank]
+    e0 = torch.chunk(e0, sp_world_size, dim=1)[sp_rank]
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})

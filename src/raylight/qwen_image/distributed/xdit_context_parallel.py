@@ -118,13 +118,12 @@ def usp_dit_forward(
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
-    hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size(), dim=1)[
-        get_sequence_parallel_rank()
-    ]
-
-    encoder_hidden_states = torch.chunk(encoder_hidden_states, get_sequence_parallel_world_size(), dim=1)[
-        get_sequence_parallel_rank()
-    ]
+    # Context parallel
+    sp_rank = get_sequence_parallel_rank()
+    sp_world_size = get_sequence_parallel_world_size()
+    hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
+    encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
+    encoder_hidden_states_mask = torch.chunk(encoder_hidden_states_mask, sp_world_size, dim=1)[sp_rank]
 
     if guidance is not None:
         guidance = guidance * 1000
@@ -170,12 +169,12 @@ def usp_dit_forward(
                 if add is not None:
                     hidden_states[:, :add.shape[1]] += add
 
+    hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
     hidden_states = self.norm_out(hidden_states, temb)
     hidden_states = self.proj_out(hidden_states)
 
     hidden_states = hidden_states[:, :num_embeds].view(orig_shape[0], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2)
     hidden_states = hidden_states.permute(0, 3, 1, 4, 2, 5)
-    hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
     return hidden_states.reshape(orig_shape)[:, :, :, :x.shape[-2], :x.shape[-1]]
 
 
