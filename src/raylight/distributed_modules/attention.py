@@ -42,6 +42,8 @@ def make_xfuser_attention(attn_type):
     def _attention_xfuser_unmask(q, k, v, heads, join_q=None, join_k=None, join_v=None, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False):
         if skip_reshape:
             b, _, _, dim_head = q.shape
+            if join_q is not None:
+                j_b, _, _, j_dim_head = join_q.shape
         else:
             b, _, dim_head = q.shape
             dim_head //= heads
@@ -49,6 +51,14 @@ def make_xfuser_attention(attn_type):
                 lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2),
                 (q, k, v),
             )
+            if join_q is not None:
+                j_b, _, j_dim_head = join_q.shape
+                j_dim_head //= heads
+                join_q, join_k, join_v = map(
+                    lambda t: t.view(j_b, -1, heads, j_dim_head).transpose(1, 2),
+                    (join_q, join_k, join_v),
+                )
+
         if mask is not None:
             if mask.ndim == 2:
                 mask = mask.unsqueeze(0)

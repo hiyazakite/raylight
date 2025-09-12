@@ -167,12 +167,7 @@ def usp_dit_forward(
     else:
         pe = None
 
-    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[
-        get_sequence_parallel_rank()
-    ]
-    txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[
-        get_sequence_parallel_rank()
-    ]
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.double_blocks):
@@ -209,15 +204,12 @@ def usp_dit_forward(
                     img += add
 
     img = get_sp_group().all_gather(img, dim=1)
-    txt = get_sp_group().all_gather(txt, dim=1)
     img = torch.cat((txt, img), 1)
 
     if img.dtype == torch.float16:
         img = torch.nan_to_num(img, nan=0.0, posinf=65504, neginf=-65504)
 
-    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[
-        get_sequence_parallel_rank()
-    ]
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     for i, block in enumerate(self.single_blocks):
         if ("single_block", i) in blocks_replace:
@@ -288,18 +280,22 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: T
     txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
-    # For context parallel, q == v in shape, and also q = B, _, L, D
-    num_img_q = img_q.shape[2]
-    num_txt_q = txt_q.shape[2]
+    # For context parallel, q = B, _, L, D
+    img_seq_len = img_q.shape[2]
+    txt_seq_len = txt_q.shape[2]
 
+    # I shoul've just divided the RoPE before and inject them in model forward instead of block forward
     if self.flipped_img_txt:
         q = torch.cat((img_q, txt_q), dim=2)
         k = torch.cat((img_k, txt_k), dim=2)
         if pe is not None:
-            q, k = apply_rope_sp(q, k, pe)
+            q[:, :, :img_seq_len, :], k[:, :, :img_seq_len, :] = apply_rope_sp(
+                q[:, :, :img_seq_len, :],
+                k[:, :, :img_seq_len, :],
+                pe)
 
-        img_q, txt_q = q.split([num_img_q, num_txt_q], dim=2)
-        img_k, txt_k = k.split([num_img_q, num_txt_q], dim=2)
+        img_q, txt_q = q.split([img_seq_len, txt_seq_len], dim=2)
+        img_k, txt_k = k.split([img_seq_len, txt_seq_len], dim=2)
 
         # run actual attention
         attn = attention_join(img_q, img_k, img_v, txt_q, txt_k, txt_v, mask=attn_mask)
@@ -307,11 +303,13 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: T
     else:
         q = torch.cat((txt_q, img_q), dim=2)
         k = torch.cat((txt_k, img_k), dim=2)
-        if pe is not None:
-            q, k = apply_rope_sp(q, k, pe)
+        q[:, :, txt_seq_len:, :], k[:, :, txt_seq_len:, :] = apply_rope_sp(
+            q[:, :, txt_seq_len:, :],
+            k[:, :, txt_seq_len:, :],
+            pe)
 
-        txt_q, img_q = q.split([num_txt_q, num_img_q], dim=2)
-        txt_k, img_k = k.split([num_txt_q, num_img_q], dim=2)
+        txt_q, img_q = q.split([txt_seq_len, img_seq_len], dim=2)
+        txt_k, img_k = k.split([txt_seq_len, img_seq_len], dim=2)
         # run actual attention
         attn = attention_join(txt_q, txt_k, txt_v, img_q, img_k, img_v, mask=attn_mask)
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
