@@ -103,22 +103,10 @@ def apply_rope_sp(xq, xk, freqs_cis):
     return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
 
 
-def attention_join(q, k, v, join_q, join_k, join_v, mask=None) -> Tensor:
-    heads = q.shape[1]
-    x = xfuser_optimized_attention(
-        q,
-        k,
-        v,
-        heads,
-        join_q=join_q,
-        join_k=join_k,
-        join_v=join_v,
-        skip_reshape=True
-    )
-    return x
+def attention(q, k, v, pe, mask=None) -> Tensor:
+    if pe is not None:
+        q, k = apply_rope_sp(q, k, pe)
 
-
-def attention(q, k, v, mask=None) -> Tensor:
     heads = q.shape[1]
     x = xfuser_optimized_attention(
         q,
@@ -128,7 +116,6 @@ def attention(q, k, v, mask=None) -> Tensor:
         skip_reshape=True
     )
     return x
-
 
 def usp_dit_forward(
     self,
@@ -168,6 +155,7 @@ def usp_dit_forward(
         pe = None
 
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.double_blocks):
@@ -252,9 +240,7 @@ def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mas
     q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     q, k = self.norm(q, k, v)
 
-    if pe is not None:
-        q, k = apply_rope_sp(q, k, pe)
-    attn = attention(q, k, v)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask)
     output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
     x += apply_mod(output, mod.gate, None, modulation_dims)
     if x.dtype == torch.float16:
@@ -280,38 +266,19 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: T
     txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
     txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
-    # For context parallel, q = B, _, L, D
-    img_seq_len = img_q.shape[2]
-    txt_seq_len = txt_q.shape[2]
-
-    # I shoul've just divided the RoPE before and inject them in model forward instead of block forward
     if self.flipped_img_txt:
-        q = torch.cat((img_q, txt_q), dim=2)
-        k = torch.cat((img_k, txt_k), dim=2)
-        if pe is not None:
-            q[:, :, :img_seq_len, :], k[:, :, :img_seq_len, :] = apply_rope_sp(
-                q[:, :, :img_seq_len, :],
-                k[:, :, :img_seq_len, :],
-                pe)
+        attn = attention(torch.cat((img_q, txt_q), dim=2),
+                         torch.cat((img_k, txt_k), dim=2),
+                         torch.cat((img_v, txt_v), dim=2),
+                         pe=pe, mask=attn_mask)
 
-        img_q, txt_q = q.split([img_seq_len, txt_seq_len], dim=2)
-        img_k, txt_k = k.split([img_seq_len, txt_seq_len], dim=2)
-
-        # run actual attention
-        attn = attention_join(img_q, img_k, img_v, txt_q, txt_k, txt_v, mask=attn_mask)
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1]:]
     else:
-        q = torch.cat((txt_q, img_q), dim=2)
-        k = torch.cat((txt_k, img_k), dim=2)
-        q[:, :, txt_seq_len:, :], k[:, :, txt_seq_len:, :] = apply_rope_sp(
-            q[:, :, txt_seq_len:, :],
-            k[:, :, txt_seq_len:, :],
-            pe)
+        attn = attention(torch.cat((txt_q, img_q), dim=2),
+                         torch.cat((txt_k, img_k), dim=2),
+                         torch.cat((txt_v, img_v), dim=2),
+                         pe=pe, mask=attn_mask)
 
-        txt_q, img_q = q.split([txt_seq_len, img_seq_len], dim=2)
-        txt_k, img_k = k.split([txt_seq_len, img_seq_len], dim=2)
-        # run actual attention
-        attn = attention_join(txt_q, txt_k, txt_v, img_q, img_k, img_v, mask=attn_mask)
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
     # calculate the img bloks

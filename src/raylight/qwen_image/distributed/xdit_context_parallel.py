@@ -118,12 +118,6 @@ def usp_dit_forward(
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
-    # Context parallel
-    sp_rank = get_sequence_parallel_rank()
-    sp_world_size = get_sequence_parallel_world_size()
-    hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
-    encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
-
     if guidance is not None:
         guidance = guidance * 1000
 
@@ -132,6 +126,12 @@ def usp_dit_forward(
         if guidance is None
         else self.time_text_embed(timestep, guidance, hidden_states)
     )
+
+    # Context parallel
+    sp_rank = get_sequence_parallel_rank()
+    sp_world_size = get_sequence_parallel_world_size()
+    hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
+    encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
 
     patches_replace = transformer_options.get("patches_replace", {})
     patches = transformer_options.get("patches", {})
