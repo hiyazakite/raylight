@@ -28,9 +28,24 @@ def usp_inject_callback(
 ):
     base_model = model_patcher.model
 
-    if isinstance(base_model, model_base.WAN21) or isinstance(
-        base_model, model_base.WAN22
-    ):
+    if isinstance(base_model, model_base.WAN22_S2V):
+        from ..wan.distributed.xdit_context_parallel import (
+            usp_audio_dit_forward,
+            usp_self_attn_forward,
+            usp_t2v_cross_attn_forward
+        )
+
+        model = base_model.diffusion_model
+        print("Initializing USP")
+        for block in model.blocks:
+            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
+            block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+
+        for inject in model.audio_injector.injector:
+            inject.forward = types.MethodType(usp_t2v_cross_attn_forward, inject)
+        model.forward_orig = types.MethodType(usp_audio_dit_forward, model)
+
+    elif isinstance(base_model, model_base.WAN21):
         from ..wan.distributed.xdit_context_parallel import (
             usp_self_attn_forward,
             usp_dit_forward,
