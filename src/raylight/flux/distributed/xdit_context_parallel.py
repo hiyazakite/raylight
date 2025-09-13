@@ -85,7 +85,7 @@ def apply_rope_sp(xq, xk, freqs_cis):
     L_global = L_local * sp_size
 
     # Ensure freqs_cis has length L_global
-    freqs_cis = pad_freqs(freqs_cis, L_global)
+    # freqs_cis = pad_freqs(freqs_cis, L_global)
 
     # Slice the correct frequency chunk for this rank
     start = sp_rank * L_local
@@ -101,6 +101,55 @@ def apply_rope_sp(xq, xk, freqs_cis):
     xk_out = freqs_local[..., 0] * xk_[..., 0] + freqs_local[..., 1] * xk_[..., 1]
 
     return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
+
+
+def attention_join(q, k, v, join_q, join_k, join_v, mask=None) -> Tensor:
+    heads = q.shape[1]
+    x = xfuser_optimized_attention(
+        q,
+        k,
+        v,
+        heads,
+        join_q=join_q,
+        join_k=join_k,
+        join_v=join_v,
+        skip_reshape=True
+    )
+    return x
+
+# def attention(q, k, v, pe, mask=None) -> Tensor:
+#     if pe is not None:
+#         sp_rank = get_sequence_parallel_rank()
+#         # sp_size = get_sequence_parallel_world_size()
+#
+#         B, _, L_local, D = q.shape
+#         # L_global = L_local * sp_size
+#
+#         # Ensure freqs_cis has length L_global
+#         # pe = pad_freqs(pe, L_global)
+#
+#         # Slice the correct frequency chunk for this rank
+#         start = sp_rank * L_local
+#         end = start + L_local
+#         pe_local = pe[:, :, start:end]  # [B, 1, L_local, D]
+#
+#         # Prepare xq/xk for RoPE (split real/imag)
+#         q = q.to(dtype=pe_local.dtype).reshape(*q.shape[:-1], -1, 1, 2)
+#         k = k.to(dtype=pe_local.dtype).reshape(*k.shape[:-1], -1, 1, 2)
+#
+#         # Apply RoPE using local frequencies
+#         q = (pe_local[..., 0] * q[..., 0] + pe_local[..., 1] * k[..., 1]).reshape(*q.shape).type_as(v)
+#         k = (pe_local[..., 0] * k[..., 0] + pe_local[..., 1] * k[..., 1]).reshape(*k.shape).type_as(v)
+#
+#     heads = q.shape[1]
+#     x = xfuser_optimized_attention(
+#         q,
+#         k,
+#         v,
+#         heads,
+#         skip_reshape=True
+#     )
+#     return x
 
 
 def attention(q, k, v, pe, mask=None) -> Tensor:
