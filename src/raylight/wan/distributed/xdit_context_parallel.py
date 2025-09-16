@@ -1,4 +1,5 @@
 import torch
+from einops import rearrange
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -208,8 +209,6 @@ def usp_audio_dit_forward(
 
     cond_mask_weight = comfy.model_management.cast_to(self.trainable_cond_mask.weight, dtype=x.dtype, device=x.device).unsqueeze(1).unsqueeze(1)
     x = x + cond_mask_weight[0]
-    # Context Parallel
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     if reference_latent is not None:
         ref = self.patch_embedding(reference_latent.float()).to(x.dtype)
@@ -240,6 +239,21 @@ def usp_audio_dit_forward(
     # context
     context = self.text_embedding(context)
 
+    # context_parallel
+    print("shape of e0", e0.shape)
+    print("shape of e", e.shape)
+    print("shape of x", x.shape)
+    sp_rank = get_sequence_parallel_rank()
+    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)
+    sq_size = [u.shape[1] for u in x]
+    sp_rank = get_sequence_parallel_rank()
+    sq_start_size = sum(sq_size[:sp_rank])
+    x = x[sp_rank]
+    print("shape of sq_start_size", sq_start_size.shape)
+    seg_idx = e0[1] - sq_start_size
+    e0[1] = seg_idx
+    freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=1)[sp_rank]
+
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.blocks):
@@ -256,9 +270,8 @@ def usp_audio_dit_forward(
             x = self.audio_injector(x, i, audio_emb, audio_emb_global, seq_len)
 
     # head
-    x = self.head(x, e)
-
     x = get_sp_group().all_gather(x, dim=1)
+    x = self.head(x, e)
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
@@ -331,4 +344,28 @@ def usp_i2v_cross_attn_forward(self, x, context, context_img_len):
     x = x + img_x
     x = x.flatten(2)
     x = self.o(x)
+    return x
+
+
+def usp_audio_injector(self, x, block_id, audio_emb, audio_emb_global, seq_len):
+    audio_attn_id = self.injected_block_id.get(block_id, None)
+    x = get_sp_group().all_gather(x, dim=1)
+    if audio_attn_id is None:
+        return x
+
+    num_frames = audio_emb.shape[1]
+    input_hidden_states = rearrange(x[:, :seq_len], "b (t n) c -> (b t) n c", t=num_frames)
+    if self.enable_adain and self.adain_mode == "attn_norm":
+        audio_emb_global = rearrange(audio_emb_global, "b t n c -> (b t) n c")
+        adain_hidden_states = self.injector_adain_layers[audio_attn_id](input_hidden_states, temb=audio_emb_global[:, 0])
+        attn_hidden_states = adain_hidden_states
+    else:
+        attn_hidden_states = self.injector_pre_norm_feat[audio_attn_id](input_hidden_states)
+    audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c", t=num_frames)
+    attn_audio_emb = audio_emb
+    residual_out = self.injector[audio_attn_id](x=attn_hidden_states, context=attn_audio_emb)
+    residual_out = rearrange(
+        residual_out, "(b t) n c -> b (t n) c", t=num_frames)
+    x[:, :seq_len] = x[:, :seq_len] + residual_out
+    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     return x
