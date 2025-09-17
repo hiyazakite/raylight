@@ -240,18 +240,14 @@ def usp_audio_dit_forward(
     context = self.text_embedding(context)
 
     # context_parallel
-    print("shape of e0", e0.shape)
-    print("shape of e", e.shape)
-    print("shape of x", x.shape)
     sp_rank = get_sequence_parallel_rank()
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)
     sq_size = [u.shape[1] for u in x]
     sp_rank = get_sequence_parallel_rank()
     sq_start_size = sum(sq_size[:sp_rank])
     x = x[sp_rank]
-    print("shape of sq_start_size", sq_start_size.shape)
-    seg_idx = e0[1] - sq_start_size
-    e0[1] = seg_idx
+    seg_idx = e0[0, 1] - sq_start_size
+    e0[0, 1] = seg_idx
     freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=1)[sp_rank]
 
     patches_replace = transformer_options.get("patches_replace", {})
@@ -278,7 +274,7 @@ def usp_audio_dit_forward(
     return x
 
 
-def usp_self_attn_forward(self, x, freqs, dtype=torch.bfloat16):
+def usp_self_attn_forward(self, x, freqs, **kwargs):
     r"""
     Args:
         x(Tensor): Shape [B, L, num_heads, C / num_heads]

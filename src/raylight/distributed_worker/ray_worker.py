@@ -32,7 +32,8 @@ def usp_inject_callback(
         from ..wan.distributed.xdit_context_parallel import (
             usp_audio_dit_forward,
             usp_self_attn_forward,
-            usp_t2v_cross_attn_forward
+            usp_t2v_cross_attn_forward,
+            usp_audio_injector
         )
 
         model = base_model.diffusion_model
@@ -41,8 +42,10 @@ def usp_inject_callback(
             block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
             block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
 
+        model.audio_injector.forward = types.MethodType(usp_audio_injector, model.audio_injector)
         for inject in model.audio_injector.injector:
             inject.forward = types.MethodType(usp_t2v_cross_attn_forward, inject)
+
         model.forward_orig = types.MethodType(usp_audio_dit_forward, model)
 
     elif isinstance(base_model, model_base.WAN21):
