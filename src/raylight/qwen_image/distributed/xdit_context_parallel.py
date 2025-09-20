@@ -94,7 +94,7 @@ def usp_dit_forward(
     # Context parallel
     sp_rank = get_sequence_parallel_rank()
     sp_world_size = get_sequence_parallel_world_size()
-    hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size, dim=1)[sp_rank]
+    hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
     encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
     image_rotary_emb = torch.chunk(image_rotary_emb, sp_world_size, dim=1)[sp_rank]
 
@@ -149,6 +149,7 @@ def usp_attn_forward(
     encoder_hidden_states_mask: torch.FloatTensor = None,
     attention_mask: Optional[torch.FloatTensor] = None,
     image_rotary_emb: Optional[torch.Tensor] = None,
+    **kwargs
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     seq_txt = encoder_hidden_states.shape[1]
 
@@ -186,5 +187,3 @@ def usp_attn_forward(
     txt_attn_output = self.to_add_out(txt_attn_output)
 
     return img_attn_output, txt_attn_output
-
-
