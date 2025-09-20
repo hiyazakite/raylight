@@ -25,7 +25,7 @@ def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
     xk_ = xk.to(dtype=freqs_cis.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
     xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
     xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+    return xq_out.reshape(*xq.shape), xk_out.reshape(*xk.shape)
 
 
 def usp_dit_forward(
@@ -75,11 +75,8 @@ def usp_dit_forward(
             hidden_states = torch.cat([hidden_states, kontext], dim=1)
             img_ids = torch.cat([img_ids, kontext_ids], dim=1)
 
-    txt_start = round(max(((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2, ((x.shape[-2] + (self.patch_size // 2)) // self.patch_size) // 2))
-    txt_ids = torch.arange(txt_start, txt_start + context.shape[1], device=x.device).reshape(1, -1, 1).repeat(x.shape[0], 1, 3)
-
     image_rotary_emb = self.pe_embedder(img_ids).squeeze(1).unsqueeze(2).to(x.dtype)
-    del txt_ids, img_ids
+    del img_ids
 
     hidden_states = self.img_in(hidden_states)
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
@@ -99,6 +96,7 @@ def usp_dit_forward(
     sp_world_size = get_sequence_parallel_world_size()
     hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size, dim=1)[sp_rank]
     encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
+    image_rotary_emb = torch.chunk(image_rotary_emb, sp_world_size, dim=1)[sp_rank]
 
     patches_replace = transformer_options.get("patches_replace", {})
     patches = transformer_options.get("patches", {})
@@ -164,14 +162,15 @@ def usp_attn_forward(
 
     img_query = self.norm_q(img_query)
     img_key = self.norm_k(img_key)
+
+    img_query, img_key = apply_rope(img_query, img_key, image_rotary_emb)
+
     txt_query = self.norm_added_q(txt_query)
     txt_key = self.norm_added_k(txt_key)
 
     joint_query = torch.cat([txt_query, img_query], dim=1)
     joint_key = torch.cat([txt_key, img_key], dim=1)
     joint_value = torch.cat([txt_value, img_value], dim=1)
-
-    joint_query, joint_key = apply_rope(joint_query, joint_key, image_rotary_emb)
 
     joint_query = joint_query.flatten(start_dim=2)
     joint_key = joint_key.flatten(start_dim=2)
@@ -187,3 +186,5 @@ def usp_attn_forward(
     txt_attn_output = self.to_add_out(txt_attn_output)
 
     return img_attn_output, txt_attn_output
+
+
