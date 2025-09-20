@@ -13,6 +13,15 @@ attn_type = xfuser_attn.get_attn_type()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
 
 
+def pad_if_odd(t: torch.Tensor, dim: int = 1):
+    if t.size(dim) % 2 != 0:
+        pad_shape = list(t.shape)
+        pad_shape[dim] = 1  # add one element along target dim
+        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+        t = torch.cat([t, pad_tensor], dim=dim)
+    return t
+
+
 def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
     if modulation_dims is None:
         if m_add is not None:
@@ -86,6 +95,11 @@ def usp_dit_forward(
     attn_mask: Tensor = None,
 ) -> Tensor:
 
+    # Seq is odd (idk how) if the w == h, so just pad 0 to the end
+    img = pad_if_odd(img, dim=1)
+    img_ids = pad_if_odd(img_ids, dim=1)
+    txt = pad_if_odd(txt, dim=1)
+    txt_ids = pad_if_odd(txt_ids, dim=1)
     if y is None:
         y = torch.zeros((img.shape[0], self.params.vec_in_dim), device=img.device, dtype=img.dtype)
 
@@ -105,13 +119,18 @@ def usp_dit_forward(
 
     if img_ids is not None:
         ids = torch.cat((txt_ids, img_ids), dim=1)
-        pe = self.pe_embedder(ids)
+        pe_combine = self.pe_embedder(ids)
+        pe_image = self.pe_embedder(img_ids)
+        # seq parallel
+        pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+        pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
     else:
-        pe = None
+        pe_combine = None
+        pe_image = None
 
     # seq parallel
-    # img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
-    # txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.double_blocks):
@@ -128,7 +147,7 @@ def usp_dit_forward(
             out = blocks_replace[("double_block", i)]({"img": img,
                                                        "txt": txt,
                                                        "vec": vec,
-                                                       "pe": pe,
+                                                       "pe": pe_image,
                                                        "attn_mask": attn_mask},
                                                       {"original_block": block_wrap})
             txt = out["txt"]
@@ -137,7 +156,7 @@ def usp_dit_forward(
             img, txt = block(img=img,
                              txt=txt,
                              vec=vec,
-                             pe=pe,
+                             pe=pe_image,
                              attn_mask=attn_mask)
 
         if control is not None:  # Controlnet
@@ -150,10 +169,8 @@ def usp_dit_forward(
     if img.dtype == torch.float16:
         img = torch.nan_to_num(img, nan=0.0, posinf=65504, neginf=-65504)
 
-    # img = get_sp_group().all_gather(img, dim=1)
-    # txt = get_sp_group().all_gather(txt, dim=1)
-    if pe is not None:
-        pe = torch.chunk(pe, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    img = get_sp_group().all_gather(img, dim=1)
+    txt = get_sp_group().all_gather(txt, dim=1)
 
     img = torch.cat((txt, img), 1)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
@@ -169,12 +186,12 @@ def usp_dit_forward(
 
             out = blocks_replace[("single_block", i)]({"img": img,
                                                        "vec": vec,
-                                                       "pe": pe,
+                                                       "pe": pe_combine,
                                                        "attn_mask": attn_mask},
                                                       {"original_block": block_wrap})
             img = out["img"]
         else:
-            img = block(img, vec=vec, pe=pe, attn_mask=attn_mask)
+            img = block(img, vec=vec, pe=pe_combine, attn_mask=attn_mask)
 
         if control is not None:  # Controlnet
             control_o = control.get("output")
@@ -225,17 +242,21 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: T
     txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
     if self.flipped_img_txt:
+        img_q, img_k = apply_rope(img_q, img_k, pe)
         attn = attention(torch.cat((img_q, txt_q), dim=2),
                          torch.cat((img_k, txt_k), dim=2),
                          torch.cat((img_v, txt_v), dim=2),
-                         pe=pe, mask=attn_mask)
+                         pe=None,
+                         mask=attn_mask)
 
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1]:]
     else:
+        img_q, img_k = apply_rope(img_q, img_k, pe)
         attn = attention(torch.cat((txt_q, img_q), dim=2),
                          torch.cat((txt_k, img_k), dim=2),
                          torch.cat((txt_v, img_v), dim=2),
-                         pe=pe, mask=attn_mask)
+                         pe=None,
+                         mask=attn_mask)
 
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
