@@ -361,7 +361,11 @@ class RayWorker:
             out = latent.copy()
             out["samples"] = samples
 
-        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] == "0":
+        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
+            self.model.detach()
+
+        # I haven't implemented for non FSDP detached, so all rank model will be move into RAM
+        else:
             self.model.detach()
         comfy.model_management.soft_empty_cache()
         gc.collect()

@@ -1,4 +1,5 @@
 import torch
+from torch import Tensor
 from typing import Optional, Tuple
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
@@ -10,58 +11,21 @@ attn_type = xfuser_attn.get_attn_type()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
 
 
-def pad_freqs(original_tensor, target_len):
-    """
-    original_tensor: [B, L_global, 1, D/2, 2, 2] — full freq tensor
-    """
-    b, seq_len, z, dim, a, c = original_tensor.shape
-    pad_size = target_len - seq_len
-    if pad_size <= 0:
-        return original_tensor
-    padding_tensor = torch.ones(
-        b,
-        pad_size,
-        z,
-        dim,
-        a,
-        c,
-        dtype=original_tensor.dtype,
-        device=original_tensor.device,
-    )
-    padded_tensor = torch.cat([original_tensor, padding_tensor], dim=1)
-    return padded_tensor
+def pad_if_odd(t: torch.Tensor, dim: int = 1):
+    if t.size(dim) % 2 != 0:
+        pad_shape = list(t.shape)
+        pad_shape[dim] = 1  # add one element along target dim
+        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+        t = torch.cat([t, pad_tensor], dim=dim)
+    return t
 
 
-def apply_rotary_emb_sp(xq, xk, freqs_cis):
-    """
-    xq, xk:       [B, L_local, 1, D]
-    freqs_cis:    [B, L_global, 1, D/2, 2, 2] — full freq tensor
-    Returns:      RoPE-applied local xq, xk
-    """
-
-    sp_rank = get_sequence_parallel_rank()
-    sp_size = get_sequence_parallel_world_size()
-
-    B, L_local, _, D = xq.shape
-    L_global = L_local * sp_size
-
-    # Ensure freqs_cis has length L_global
-    freqs_cis = pad_freqs(freqs_cis, L_global)
-
-    # Slice the correct frequency chunk for this rank
-    start = sp_rank * L_local
-    end = start + L_local
-    freqs_local = freqs_cis[:, start:end]  # [B, L_local, 1, D/2, 2, 2]
-
-    # Prepare xq/xk for RoPE (split real/imag)
-    xq_ = xq.reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.reshape(*xk.shape[:-1], -1, 1, 2)
-
-    # Apply RoPE using local frequencies
-    xq_out = freqs_local[..., 0] * xq_[..., 0] + freqs_local[..., 1] * xq_[..., 1]
-    xk_out = freqs_local[..., 0] * xk_[..., 0] + freqs_local[..., 1] * xk_[..., 1]
-
-    return xq_out.reshape_as(xq), xk_out.reshape_as(xk)
+def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
+    xq_ = xq.to(dtype=freqs_cis.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.to(dtype=freqs_cis.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
+    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
 def usp_dit_forward(
@@ -76,6 +40,9 @@ def usp_dit_forward(
     control=None,
     **kwargs
 ):
+    x = pad_if_odd(x, dim=1)
+    context = pad_if_odd(context, dim=1)
+
     timestep = timesteps
     encoder_hidden_states = context
     encoder_hidden_states_mask = attention_mask
@@ -110,9 +77,9 @@ def usp_dit_forward(
 
     txt_start = round(max(((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2, ((x.shape[-2] + (self.patch_size // 2)) // self.patch_size) // 2))
     txt_ids = torch.arange(txt_start, txt_start + context.shape[1], device=x.device).reshape(1, -1, 1).repeat(x.shape[0], 1, 3)
-    ids = torch.cat((txt_ids, img_ids), dim=1)
-    image_rotary_emb = self.pe_embedder(ids).squeeze(1).unsqueeze(2).to(x.dtype)
-    del ids, txt_ids, img_ids
+
+    image_rotary_emb = self.pe_embedder(img_ids).squeeze(1).unsqueeze(2).to(x.dtype)
+    del txt_ids, img_ids
 
     hidden_states = self.img_in(hidden_states)
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
@@ -130,7 +97,7 @@ def usp_dit_forward(
     # Context parallel
     sp_rank = get_sequence_parallel_rank()
     sp_world_size = get_sequence_parallel_world_size()
-    hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
+    hidden_states = torch.chunk(hidden_states, get_sequence_parallel_world_size, dim=1)[sp_rank]
     encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
 
     patches_replace = transformer_options.get("patches_replace", {})
@@ -204,7 +171,7 @@ def usp_attn_forward(
     joint_key = torch.cat([txt_key, img_key], dim=1)
     joint_value = torch.cat([txt_value, img_value], dim=1)
 
-    joint_query, joint_key = apply_rotary_emb_sp(joint_query, joint_key, image_rotary_emb)
+    joint_query, joint_key = apply_rope(joint_query, joint_key, image_rotary_emb)
 
     joint_query = joint_query.flatten(start_dim=2)
     joint_key = joint_key.flatten(start_dim=2)
