@@ -49,63 +49,17 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     return embedding
 
 
-def pad_freqs(original_tensor, target_len):
-    """
-    original_tensor: [B, 1, L_global, D/2, 2, 2] — full freq tensor
-    """
-    b, z, seq_len, dim, a, c = original_tensor.shape
-    pad_size = target_len - seq_len
-    if pad_size <= 0:
-        return original_tensor
-    padding_tensor = torch.ones(
-        b,
-        z,
-        pad_size,
-        dim,
-        a,
-        c,
-        dtype=original_tensor.dtype,
-        device=original_tensor.device,
-    )
-    padded_tensor = torch.cat([original_tensor, padding_tensor], dim=1)
-    return padded_tensor
-
-
-def apply_rope_sp(xq, xk, v, freqs_cis):
-    """
-    xq, xk:       [B, 1, L_local, D]
-    freqs_cis:    [B, 1, L_global, D/2, 2, 2] — full freq tensor
-    Returns:      RoPE-applied local xq, xk
-    """
-
-    sp_rank = get_sequence_parallel_rank()
-    sp_size = get_sequence_parallel_world_size()
-
-    B, _, L_local, D = xq.shape
-    L_global = L_local * sp_size
-
-    # Ensure freqs_cis has length L_global
-    freqs_cis = pad_freqs(freqs_cis, L_global)
-
-    # Slice the correct frequency chunk for this rank
-    start = sp_rank * L_local
-    end = start + L_local
-    freqs_local = freqs_cis[:, :, start:end]  # [B, 1, L_local, D]
-
-    # Prepare xq/xk for RoPE (split real/imag)
-    xq_ = xq.to(dtype=freqs_local.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.to(dtype=freqs_local.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
-
-    # Apply RoPE using local frequencies
-    xq_out = freqs_local[..., 0] * xq_[..., 0] + freqs_local[..., 1] * xq_[..., 1]
-    xk_out = freqs_local[..., 0] * xk_[..., 0] + freqs_local[..., 1] * xk_[..., 1]
-
-    return xq_out.reshape_as(xq).type_as(v), xk_out.reshape_as(xk).type_as(v)
+def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
+    xq_ = xq.to(dtype=freqs_cis.dtype).reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.to(dtype=freqs_cis.dtype).reshape(*xk.shape[:-1], -1, 1, 2)
+    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
 def attention(q, k, v, pe, mask=None) -> Tensor:
     if pe is not None:
-        q, k = apply_rope_sp(q, k, v, pe)
+        q, k = apply_rope(q, k, pe)
 
     heads = q.shape[1]
     x = xfuser_optimized_attention(
@@ -116,6 +70,7 @@ def attention(q, k, v, pe, mask=None) -> Tensor:
         skip_reshape=True
     )
     return x
+
 
 def usp_dit_forward(
     self,
@@ -155,8 +110,8 @@ def usp_dit_forward(
         pe = None
 
     # seq parallel
-    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
-    txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.double_blocks):
@@ -195,8 +150,10 @@ def usp_dit_forward(
     if img.dtype == torch.float16:
         img = torch.nan_to_num(img, nan=0.0, posinf=65504, neginf=-65504)
 
-    img = get_sp_group().all_gather(img, dim=1)
-    txt = get_sp_group().all_gather(txt, dim=1)
+    # img = get_sp_group().all_gather(img, dim=1)
+    # txt = get_sp_group().all_gather(txt, dim=1)
+    if pe is not None:
+        pe = torch.chunk(pe, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
 
     img = torch.cat((txt, img), 1)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
@@ -294,4 +251,3 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: T
         txt = torch.nan_to_num(txt, nan=0.0, posinf=65504, neginf=-65504)
 
     return img, txt
-
