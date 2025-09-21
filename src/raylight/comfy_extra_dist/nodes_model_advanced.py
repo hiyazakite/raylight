@@ -172,7 +172,7 @@ class RayModelSamplingSD3:
         return m
 
 
-class RayModelSamplingAuraFlow(RayModelSamplingSD3):
+class RayModelSamplingAuraFlow:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -185,11 +185,25 @@ class RayModelSamplingAuraFlow(RayModelSamplingSD3):
             }
         }
 
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch_aura"
+    CATEGORY = "Raylight/extra"
 
     @ray_patch
-    def patch_aura(self, model, shift):
-        return self.patch(model, shift, multiplier=1.0)
+    def patch_aura(self, model, shift, multiplier=1.0):
+        m = model.clone()
+
+        sampling_base = comfy.model_sampling.ModelSamplingDiscreteFlow
+        sampling_type = comfy.model_sampling.CONST
+
+        class ModelSamplingAdvanced(sampling_base, sampling_type):
+            pass
+
+        model_sampling = ModelSamplingAdvanced(model.model.model_config)
+        model_sampling.set_parameters(shift=shift, multiplier=multiplier)
+        m.add_object_patch("model_sampling", model_sampling)
+        return m
 
 
 class RayModelSamplingFlux:

@@ -1,8 +1,8 @@
 {
   "id": "91f6bbe2-ed41-4fd6-bac7-71d5b5864ecb",
   "revision": 0,
-  "last_node_id": 86,
-  "last_link_id": 146,
+  "last_node_id": 87,
+  "last_link_id": 148,
   "nodes": [
     {
       "id": 39,
@@ -97,58 +97,6 @@
       ]
     },
     {
-      "id": 38,
-      "type": "CLIPLoader",
-      "pos": [
-        47.023075103759766,
-        247.90655517578125
-      ],
-      "size": [
-        252.79127502441406,
-        115.79065704345703
-      ],
-      "flags": {},
-      "order": 2,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "CLIP",
-          "type": "CLIP",
-          "slot_index": 0,
-          "links": [
-            74,
-            75
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "CLIPLoader",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.48",
-        "models": [
-          {
-            "name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
-            "directory": "text_encoders"
-          }
-        ],
-        "enableTabs": false,
-        "tabWidth": 65,
-        "tabXOffset": 10,
-        "hasSecondTab": false,
-        "secondTabText": "Send Back",
-        "secondTabOffset": 80,
-        "secondTabWidth": 65,
-        "widget_ue_connectable": {}
-      },
-      "widgets_values": [
-        "qwen_vl.safetensors",
-        "qwen_image",
-        "default"
-      ]
-    },
-    {
       "id": 78,
       "type": "easy cleanGpuUsed",
       "pos": [
@@ -160,7 +108,7 @@
         26
       ],
       "flags": {},
-      "order": 13,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
@@ -195,7 +143,7 @@
         26
       ],
       "flags": {},
-      "order": 14,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
@@ -232,7 +180,7 @@
       "flags": {
         "collapsed": false
       },
-      "order": 17,
+      "order": 18,
       "mode": 0,
       "inputs": [
         {
@@ -283,7 +231,7 @@
         567.6331787109375
       ],
       "flags": {},
-      "order": 18,
+      "order": 19,
       "mode": 0,
       "inputs": [
         {
@@ -322,7 +270,7 @@
         164.31304931640625
       ],
       "flags": {},
-      "order": 10,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
@@ -375,7 +323,7 @@
       "flags": {
         "collapsed": false
       },
-      "order": 11,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -426,7 +374,7 @@
         130.21559143066406
       ],
       "flags": {},
-      "order": 3,
+      "order": 2,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -450,7 +398,7 @@
         819.131103515625
       ],
       "flags": {},
-      "order": 4,
+      "order": 3,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -474,7 +422,7 @@
         104.63211822509766
       ],
       "flags": {},
-      "order": 12,
+      "order": 10,
       "mode": 0,
       "inputs": [
         {
@@ -494,7 +442,7 @@
           "name": "ray_actors",
           "type": "RAY_ACTORS",
           "links": [
-            145
+            147
           ]
         }
       ],
@@ -518,7 +466,7 @@
         127.1243667602539
       ],
       "flags": {},
-      "order": 5,
+      "order": 4,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -541,7 +489,7 @@
         133.14552307128906
       ],
       "flags": {},
-      "order": 6,
+      "order": 5,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -565,7 +513,7 @@
         118.91608428955078
       ],
       "flags": {},
-      "order": 7,
+      "order": 6,
       "mode": 0,
       "inputs": [],
       "outputs": [],
@@ -589,7 +537,7 @@
         276.91986083984375
       ],
       "flags": {},
-      "order": 8,
+      "order": 7,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -627,7 +575,7 @@
         334
       ],
       "flags": {},
-      "order": 16,
+      "order": 17,
       "mode": 0,
       "inputs": [
         {
@@ -692,43 +640,6 @@
       ]
     },
     {
-      "id": 86,
-      "type": "RayTorchCompileModel",
-      "pos": [
-        932.6710205078125,
-        -166.06484985351562
-      ],
-      "size": [
-        289.5777282714844,
-        58
-      ],
-      "flags": {},
-      "order": 15,
-      "mode": 4,
-      "inputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "link": 145
-        }
-      ],
-      "outputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "links": [
-            146
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayTorchCompileModel"
-      },
-      "widgets_values": [
-        "inductor"
-      ]
-    },
-    {
       "id": 80,
       "type": "RayLoraLoader",
       "pos": [
@@ -740,7 +651,7 @@
         82.87737274169922
       ],
       "flags": {},
-      "order": 9,
+      "order": 8,
       "mode": 4,
       "inputs": [
         {
@@ -765,6 +676,132 @@
       "widgets_values": [
         "Qwen-Image-Lightning-4steps-V1.0.safetensors",
         1
+      ]
+    },
+    {
+      "id": 86,
+      "type": "RayTorchCompileModel",
+      "pos": [
+        932.6710205078125,
+        -166.06484985351562
+      ],
+      "size": [
+        289.5777282714844,
+        58
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 148
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            146
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayTorchCompileModel"
+      },
+      "widgets_values": [
+        "inductor"
+      ]
+    },
+    {
+      "id": 87,
+      "type": "RayModelSamplingAuraFlow",
+      "pos": [
+        936.3601684570312,
+        -268.2687683105469
+      ],
+      "size": [
+        283.0555419921875,
+        58
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 147
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            148
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayModelSamplingAuraFlow"
+      },
+      "widgets_values": [
+        3.1
+      ]
+    },
+    {
+      "id": 38,
+      "type": "CLIPLoader",
+      "pos": [
+        47.023075103759766,
+        247.90655517578125
+      ],
+      "size": [
+        252.79127502441406,
+        115.79065704345703
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "slot_index": 0,
+          "links": [
+            74,
+            75
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.48",
+        "models": [
+          {
+            "name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            "directory": "text_encoders"
+          }
+        ],
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "widget_ue_connectable": {}
+      },
+      "widgets_values": [
+        "qwen_vl.safetensors",
+        "qwen_image",
+        "default"
       ]
     }
   ],
@@ -866,18 +903,26 @@
       "RAY_LORA"
     ],
     [
-      145,
-      76,
-      0,
-      86,
-      0,
-      "RAY_ACTORS"
-    ],
-    [
       146,
       86,
       0,
       77,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      147,
+      76,
+      0,
+      87,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      148,
+      87,
+      0,
+      86,
       0,
       "RAY_ACTORS"
     ]
@@ -886,13 +931,13 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.9419566621258355,
+      "scale": 0.8563242382962141,
       "offset": [
-        453.949536510544,
-        189.71768784494998
+        579.6892091264243,
+        335.4658260259888
       ]
     },
-    "frontendVersion": "1.26.13",
+    "frontendVersion": "1.26.11",
     "ue_links": [],
     "links_added_by_ue": [],
     "VHS_latentpreview": false,
