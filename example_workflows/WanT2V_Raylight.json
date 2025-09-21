@@ -136,49 +136,6 @@
       ]
     },
     {
-      "id": 17,
-      "type": "CLIPTextEncode",
-      "pos": [
-        940,
-        610
-      ],
-      "size": [
-        424.6909484863281,
-        88
-      ],
-      "flags": {},
-      "order": 11,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 15
-        }
-      ],
-      "outputs": [
-        {
-          "name": "CONDITIONING",
-          "type": "CONDITIONING",
-          "slot_index": 0,
-          "links": [
-            31
-          ]
-        }
-      ],
-      "title": "CLIP Text Encode (Positive Prompt)",
-      "properties": {
-        "Node name for S&R": "CLIPTextEncode",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.55"
-      },
-      "widgets_values": [
-        "a fox moving quickly in a beautiful winter scenery nature trees mountains daytime tracking camera"
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
       "id": 33,
       "type": "easy cleanGpuUsed",
       "pos": [
@@ -709,66 +666,6 @@
       ]
     },
     {
-      "id": 38,
-      "type": "RayInitializer",
-      "pos": [
-        623.9815063476562,
-        358.7467346191406
-      ],
-      "size": [
-        270.17230224609375,
-        179.84591674804688
-      ],
-      "flags": {},
-      "order": 8,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "ray_actors_init",
-          "type": "RAY_ACTORS_INIT",
-          "links": [
-            40
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayInitializer"
-      },
-      "widgets_values": [
-        "local",
-        "default",
-        2,
-        2,
-        1,
-        false
-      ]
-    },
-    {
-      "id": 44,
-      "type": "MarkdownNote",
-      "pos": [
-        240.78379821777344,
-        -17.8378849029541
-      ],
-      "size": [
-        363.9535217285156,
-        819.131103515625
-      ],
-      "flags": {},
-      "order": 9,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Introduction",
-      "properties": {},
-      "widgets_values": [
-        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\nMore info: [Raylight on GitHub](https://github.com/komikndr/raylight)\n\n\n## Supported Models\n\n| Model             | USP | FSDP |\n|-------------------|-----|------|\n| Wan2.1 1.3B T2V      | ✅  | ✅   |\n| Wan2.1 14B T2V       | ✅  | ✅   |\n| Wan2.1 14B I2V       | ✅  | ✅   |\n| Wan2.1 Vace             | ✅  | ❌   |\n| Wan2.2 5B TI2V       | ✅  | ✅   |\n| Wan2.2 14B I2V       | ✅  | ✅   |\n| Flux Dev          | ❌  | ✅   |\n| Flux Konteks      | ❌  | ❓   |\n| Flux ControlNet   | ❌  | ❌   |\n| Qwen Image        | ❌  | ❓   |\n| Hunyuan Video     | ❌  | ❓   |\n\n**Legend:**\n- ✅ = Supported\n- ❌ = Not currently supported\n- ❓ = Maybe work?\n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
       "id": 39,
       "type": "RayTorchCompileModel",
       "pos": [
@@ -804,6 +701,111 @@
       "widgets_values": [
         "inductor"
       ]
+    },
+    {
+      "id": 44,
+      "type": "MarkdownNote",
+      "pos": [
+        240.78379821777344,
+        -17.8378849029541
+      ],
+      "size": [
+        363.9535217285156,
+        819.131103515625
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Introduction",
+      "properties": {},
+      "widgets_values": [
+        "## Raylight Overview\n\nAs the name implies, **Raylight** uses Ray workers, called *Actors*.  \nEach worker is its own Python process. While this allows splitting across multiple VRAMs,  \nit does increase overall RAM usage.  \n\nThat said, RAM is generally much cheaper than VRAM, so this trade-off is acceptable in most cases.  \n\n---\n\nMore info: [Raylight on GitHub](https://github.com/komikndr/raylight)\n\n\n## Supported Models\n\n| Model             | USP | FSDP |\n|-------------------|-----|------|\n| Wan2.1 1.3B T2V      | ✅  | ✅   |\n| Wan2.1 14B T2V       | ✅  | ✅   |\n| Wan2.1 14B I2V       | ✅  | ✅   |\n| Wan2.1 Vace             | ✅  | ❌   |\n| Wan2.2 5B TI2V       | ✅  | ✅   |\n| Wan2.2 14B I2V       | ✅  | ✅   |\n| Flux Dev          | ✅  | ✅   |\n| Flux Konteks      | ✅  | ✅   |\n| Flux ControlNet   | ❌  | ❌   |\n| Qwen Image        | ✅  | ✅   |\n| Hunyuan Video     | ❌  | ❓   |\n\n**Legend:**\n- ✅ = Supported\n- ❌ = Not currently supported\n- ❓ = Maybe work?\n\n**Notes:**\n- Non standard Wan variant (Phantom, S2V, etc...) is not tested\n\n## Scaled vs Non-Scaled Models\n\n| Model       | USP | FSDP |\n|-------------|-----|------|\n| Non-Scaled  | ✅  | ✅   |\n| Scaled      | ✅  | ⚠️ |\n\n**Notes:**\n- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.\n- Only Ada Lovelace and newer GPUs support **FP8 scaled FSDP2**.\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 38,
+      "type": "RayInitializer",
+      "pos": [
+        625.0982666015625,
+        329.71026611328125
+      ],
+      "size": [
+        270.17230224609375,
+        226
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "ray_actors_init",
+          "type": "RAY_ACTORS_INIT",
+          "links": [
+            40
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayInitializer"
+      },
+      "widgets_values": [
+        "local",
+        "default",
+        2,
+        2,
+        1,
+        false,
+        false,
+        "TORCH"
+      ]
+    },
+    {
+      "id": 17,
+      "type": "CLIPTextEncode",
+      "pos": [
+        940,
+        610
+      ],
+      "size": [
+        424.6909484863281,
+        88
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            31
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Positive Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.55"
+      },
+      "widgets_values": [
+        "A crow standing on top of 2 graphic cards on top of building in london theme city, raining, dark sky"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
     }
   ],
   "links": [
@@ -940,13 +942,13 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 1.1918176537727252,
+      "scale": 0.9849732675807645,
       "offset": [
-        -166.49442913846104,
-        114.29264488602716
+        -172.7423342712569,
+        -154.56567408144443
       ]
     },
-    "frontendVersion": "1.25.11"
+    "frontendVersion": "1.26.13"
   },
   "version": 0.4
 }
