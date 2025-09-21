@@ -47,6 +47,7 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
+# No need to this anymore in other model, just toch chunk the pe
 def apply_rope_sp(xq, xk, freqs_cis):
     """
     xq, xk:       [B, L_local, 1, D]
@@ -79,7 +80,6 @@ def apply_rope_sp(xq, xk, freqs_cis):
     return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
 
 
-# TODO, implement full USP including context and not only latent tensor
 def usp_dit_forward(
     self,
     x,
