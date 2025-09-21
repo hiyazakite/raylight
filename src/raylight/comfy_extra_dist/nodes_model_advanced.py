@@ -4,56 +4,25 @@ import comfy.latent_formats
 import nodes
 import torch
 import node_helpers
-
-import ray
-
-
-class RayTorchCompileModel:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "ray_actors": ("RAY_ACTORS",),
-                "backend": (["inductor", "cudagraphs"],),
-            }
-        }
-
-    RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
-    FUNCTION = "patch"
-    CATEGORY = "Raylight extra"
-
-    def patch(self, ray_actors, backend):
-
-        def _patch(model, backend):
-            print(f"Compiler {backend} registered")
-            m = model.clone()
-            set_torch_compile_wrapper(model=m, backend=backend)
-            return m
-
-        gpu_workers = ray_actors["workers"]
-        futures = []
-        for actor in gpu_workers:
-            futures.append(actor.model_function_runner.remote(_patch, backend))
-
-        ray.get(futures)
-        return (ray_actors,)
-
+from .ray_patch_decorator import ray_patch
 
 
 class LCM(comfy.model_sampling.EPS):
     def calculate_denoised(self, sigma, model_output, model_input):
-        timestep = self.timestep(sigma).view(sigma.shape[:1] + (1,) * (model_output.ndim - 1))
+        timestep = self.timestep(sigma).view(
+            sigma.shape[:1] + (1,) * (model_output.ndim - 1)
+        )
         sigma = sigma.view(sigma.shape[:1] + (1,) * (model_output.ndim - 1))
         x0 = model_input - model_output * sigma
 
         sigma_data = 0.5
-        scaled_timestep = timestep * 10.0 #timestep_scaling
+        scaled_timestep = timestep * 10.0
 
         c_skip = sigma_data**2 / (scaled_timestep**2 + sigma_data**2)
         c_out = scaled_timestep / (scaled_timestep**2 + sigma_data**2) ** 0.5
 
         return c_out * x0 + c_skip * model_input
+
 
 class ModelSamplingDiscreteDistilled(comfy.model_sampling.ModelSamplingDiscrete):
     original_timesteps = 50
@@ -65,17 +34,27 @@ class ModelSamplingDiscreteDistilled(comfy.model_sampling.ModelSamplingDiscrete)
 
         sigmas_valid = torch.zeros((self.original_timesteps), dtype=torch.float32)
         for x in range(self.original_timesteps):
-            sigmas_valid[self.original_timesteps - 1 - x] = self.sigmas[self.num_timesteps - 1 - x * self.skip_steps]
+            sigmas_valid[self.original_timesteps - 1 - x] = self.sigmas[
+                self.num_timesteps - 1 - x * self.skip_steps
+            ]
 
         self.set_sigmas(sigmas_valid)
 
     def timestep(self, sigma):
         log_sigma = sigma.log()
         dists = log_sigma.to(self.log_sigmas.device) - self.log_sigmas[:, None]
-        return (dists.abs().argmin(dim=0).view(sigma.shape) * self.skip_steps + (self.skip_steps - 1)).to(sigma.device)
+        return (
+            dists.abs().argmin(dim=0).view(sigma.shape) * self.skip_steps + (self.skip_steps - 1)
+        ).to(sigma.device)
 
     def sigma(self, timestep):
-        t = torch.clamp(((timestep.float().to(self.log_sigmas.device) - (self.skip_steps - 1)) / self.skip_steps).float(), min=0, max=(len(self.sigmas) - 1))
+        t = torch.clamp(
+            (
+                (timestep.float().to(self.log_sigmas.device) - (self.skip_steps - 1)) / self.skip_steps
+            ).float(),
+            min=0,
+            max=(len(self.sigmas) - 1),
+        )
         low_idx = t.floor().long()
         high_idx = t.ceil().long()
         w = t.frac()
@@ -83,19 +62,23 @@ class ModelSamplingDiscreteDistilled(comfy.model_sampling.ModelSamplingDiscrete)
         return log_sigma.exp().to(timestep.device)
 
 
-class ModelSamplingDiscrete:
+class RayModelSamplingDiscrete:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "ray_actors": ("RAY_ACTORS",),
-                              "sampling": (["eps", "v_prediction", "lcm", "x0", "img_to_img"],),
-                              "zsnr": ("BOOLEAN", {"default": False}),
-                              }}
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "sampling": (["eps", "v_prediction", "lcm", "x0", "img_to_img"],),
+                "zsnr": ("BOOLEAN", {"default": False}),
+            }
+        }
 
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
+    @ray_patch
     def patch(self, model, sampling, zsnr):
         m = model.clone()
 
@@ -118,20 +101,28 @@ class ModelSamplingDiscrete:
         model_sampling = ModelSamplingAdvanced(model.model.model_config, zsnr=zsnr)
 
         m.add_object_patch("model_sampling", model_sampling)
-        return (m, )
+        return m
 
-class ModelSamplingStableCascade:
+
+class RayModelSamplingStableCascade:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "model": ("MODEL",),
-                              "shift": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 100.0, "step":0.01}),
-                              }}
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "shift": (
+                    "FLOAT",
+                    {"default": 2.0, "min": 0.0, "max": 100.0, "step": 0.01},
+                ),
+            }
+        }
 
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
+    @ray_patch
     def patch(self, model, shift):
         m = model.clone()
 
@@ -144,20 +135,28 @@ class ModelSamplingStableCascade:
         model_sampling = ModelSamplingAdvanced(model.model.model_config)
         model_sampling.set_parameters(shift)
         m.add_object_patch("model_sampling", model_sampling)
-        return (m, )
+        return m
 
-class ModelSamplingSD3:
+
+class RayModelSamplingSD3:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "model": ("MODEL",),
-                              "shift": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0, "step":0.01}),
-                              }}
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "shift": (
+                    "FLOAT",
+                    {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.01},
+                ),
+            }
+        }
 
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
+    @ray_patch
     def patch(self, model, shift, multiplier=1000):
         m = model.clone()
 
@@ -170,35 +169,70 @@ class ModelSamplingSD3:
         model_sampling = ModelSamplingAdvanced(model.model.model_config)
         model_sampling.set_parameters(shift=shift, multiplier=multiplier)
         m.add_object_patch("model_sampling", model_sampling)
-        return (m, )
+        return m
 
-class ModelSamplingAuraFlow(ModelSamplingSD3):
+
+class RayModelSamplingAuraFlow(RayModelSamplingSD3):
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "model": ("MODEL",),
-                              "shift": ("FLOAT", {"default": 1.73, "min": 0.0, "max": 100.0, "step":0.01}),
-                              }}
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "shift": (
+                    "FLOAT",
+                    {"default": 1.73, "min": 0.0, "max": 100.0, "step": 0.01},
+                ),
+            }
+        }
 
     FUNCTION = "patch_aura"
 
+    @ray_patch
     def patch_aura(self, model, shift):
         return self.patch(model, shift, multiplier=1.0)
 
-class ModelSamplingFlux:
+
+class RayModelSamplingFlux:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "model": ("MODEL",),
-                              "max_shift": ("FLOAT", {"default": 1.15, "min": 0.0, "max": 100.0, "step":0.01}),
-                              "base_shift": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 100.0, "step":0.01}),
-                              "width": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8}),
-                              "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8}),
-                              }}
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "max_shift": (
+                    "FLOAT",
+                    {"default": 1.15, "min": 0.0, "max": 100.0, "step": 0.01},
+                ),
+                "base_shift": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.0, "max": 100.0, "step": 0.01},
+                ),
+                "width": (
+                    "INT",
+                    {
+                        "default": 1024,
+                        "min": 16,
+                        "max": nodes.MAX_RESOLUTION,
+                        "step": 8,
+                    },
+                ),
+                "height": (
+                    "INT",
+                    {
+                        "default": 1024,
+                        "min": 16,
+                        "max": nodes.MAX_RESOLUTION,
+                        "step": 8,
+                    },
+                ),
+            }
+        }
 
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
+    @ray_patch
     def patch(self, model, max_shift, base_shift, width, height):
         m = model.clone()
 
@@ -217,23 +251,53 @@ class ModelSamplingFlux:
         model_sampling = ModelSamplingAdvanced(model.model.model_config)
         model_sampling.set_parameters(shift=shift)
         m.add_object_patch("model_sampling", model_sampling)
-        return (m, )
+        return m
 
 
-class ModelSamplingContinuousEDM:
+class RayModelSamplingContinuousEDM:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "model": ("MODEL",),
-                              "sampling": (["v_prediction", "edm", "edm_playground_v2.5", "eps", "cosmos_rflow"],),
-                              "sigma_max": ("FLOAT", {"default": 120.0, "min": 0.0, "max": 1000.0, "step":0.001, "round": False}),
-                              "sigma_min": ("FLOAT", {"default": 0.002, "min": 0.0, "max": 1000.0, "step":0.001, "round": False}),
-                              }}
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "sampling": (
+                    [
+                        "v_prediction",
+                        "edm",
+                        "edm_playground_v2.5",
+                        "eps",
+                        "cosmos_rflow",
+                    ],
+                ),
+                "sigma_max": (
+                    "FLOAT",
+                    {
+                        "default": 120.0,
+                        "min": 0.0,
+                        "max": 1000.0,
+                        "step": 0.001,
+                        "round": False,
+                    },
+                ),
+                "sigma_min": (
+                    "FLOAT",
+                    {
+                        "default": 0.002,
+                        "min": 0.0,
+                        "max": 1000.0,
+                        "step": 0.001,
+                        "round": False,
+                    },
+                ),
+            }
+        }
 
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
+    @ray_patch
     def patch(self, model, sampling, sigma_max, sigma_min):
         m = model.clone()
 
@@ -263,22 +327,45 @@ class ModelSamplingContinuousEDM:
         m.add_object_patch("model_sampling", model_sampling)
         if latent_format is not None:
             m.add_object_patch("latent_format", latent_format)
-        return (m, )
+        return m
 
-class ModelSamplingContinuousV:
+
+class RayModelSamplingContinuousV:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "model": ("MODEL",),
-                              "sampling": (["v_prediction"],),
-                              "sigma_max": ("FLOAT", {"default": 500.0, "min": 0.0, "max": 1000.0, "step":0.001, "round": False}),
-                              "sigma_min": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 1000.0, "step":0.001, "round": False}),
-                              }}
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "sampling": (["v_prediction"],),
+                "sigma_max": (
+                    "FLOAT",
+                    {
+                        "default": 500.0,
+                        "min": 0.0,
+                        "max": 1000.0,
+                        "step": 0.001,
+                        "round": False,
+                    },
+                ),
+                "sigma_min": (
+                    "FLOAT",
+                    {
+                        "default": 0.03,
+                        "min": 0.0,
+                        "max": 1000.0,
+                        "step": 0.001,
+                        "round": False,
+                    },
+                ),
+            }
+        }
 
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
+    @ray_patch
     def patch(self, model, sampling, sigma_max, sigma_min):
         m = model.clone()
 
@@ -286,25 +373,36 @@ class ModelSamplingContinuousV:
         if sampling == "v_prediction":
             sampling_type = comfy.model_sampling.V_PREDICTION
 
-        class ModelSamplingAdvanced(comfy.model_sampling.ModelSamplingContinuousV, sampling_type):
+        class ModelSamplingAdvanced(
+            comfy.model_sampling.ModelSamplingContinuousV, sampling_type
+        ):
             pass
 
         model_sampling = ModelSamplingAdvanced(model.model.model_config)
         model_sampling.set_parameters(sigma_min, sigma_max, sigma_data)
         m.add_object_patch("model_sampling", model_sampling)
-        return (m, )
+        return m
 
-class RescaleCFG:
+
+class RayRescaleCFG:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "model": ("MODEL",),
-                              "multiplier": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01}),
-                              }}
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "multiplier": (
+                    "FLOAT",
+                    {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+            }
+        }
+
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
+    @ray_patch
     def patch(self, model, multiplier):
         def rescale_cfg(args):
             cond = args["cond"]
@@ -314,15 +412,15 @@ class RescaleCFG:
             sigma = sigma.view(sigma.shape[:1] + (1,) * (cond.ndim - 1))
             x_orig = args["input"]
 
-            #rescale cfg has to be done on v-pred model output
+            # rescale cfg has to be done on v-pred model output
             x = x_orig / (sigma * sigma + 1.0)
-            cond = ((x - (x_orig - cond)) * (sigma ** 2 + 1.0) ** 0.5) / (sigma)
-            uncond = ((x - (x_orig - uncond)) * (sigma ** 2 + 1.0) ** 0.5) / (sigma)
+            cond = ((x - (x_orig - cond)) * (sigma**2 + 1.0) ** 0.5) / (sigma)
+            uncond = ((x - (x_orig - uncond)) * (sigma**2 + 1.0) ** 0.5) / (sigma)
 
-            #rescalecfg
+            # rescalecfg
             x_cfg = uncond + cond_scale * (cond - uncond)
-            ro_pos = torch.std(cond, dim=(1,2,3), keepdim=True)
-            ro_cfg = torch.std(x_cfg, dim=(1,2,3), keepdim=True)
+            ro_pos = torch.std(cond, dim=(1, 2, 3), keepdim=True)
+            ro_cfg = torch.std(x_cfg, dim=(1, 2, 3), keepdim=True)
 
             x_rescaled = x_cfg * (ro_pos / ro_cfg)
             x_final = multiplier * x_rescaled + (1.0 - multiplier) * x_cfg
@@ -331,34 +429,39 @@ class RescaleCFG:
 
         m = model.clone()
         m.set_model_sampler_cfg_function(rescale_cfg)
-        return (m, )
+        return m
 
-class ModelComputeDtype:
+
+class RayModelComputeDtype:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "model": ("MODEL",),
-                              "dtype": (["default", "fp32", "fp16", "bf16"],),
-                              }}
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS",),
+                "dtype": (["default", "fp32", "fp16", "bf16"],),
+            }
+        }
 
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
+    @ray_patch
     def patch(self, model, dtype):
         m = model.clone()
         m.set_model_compute_dtype(node_helpers.string_to_torch_dtype(dtype))
-        return (m, )
+        return m
 
 
 NODE_CLASS_MAPPINGS = {
-    "ModelSamplingDiscrete": ModelSamplingDiscrete,
-    "ModelSamplingContinuousEDM": ModelSamplingContinuousEDM,
-    "ModelSamplingContinuousV": ModelSamplingContinuousV,
-    "ModelSamplingStableCascade": ModelSamplingStableCascade,
-    "ModelSamplingSD3": ModelSamplingSD3,
-    "ModelSamplingAuraFlow": ModelSamplingAuraFlow,
-    "ModelSamplingFlux": ModelSamplingFlux,
-    "RescaleCFG": RescaleCFG,
-    "ModelComputeDtype": ModelComputeDtype,
+    "RayModelSamplingDiscrete": RayModelSamplingDiscrete,
+    "RayModelSamplingContinuousEDM": RayModelSamplingContinuousEDM,
+    "RayModelSamplingContinuousV": RayModelSamplingContinuousV,
+    "RayModelSamplingStableCascade": RayModelSamplingStableCascade,
+    "RayModelSamplingSD3": RayModelSamplingSD3,
+    "RayModelSamplingAuraFlow": RayModelSamplingAuraFlow,
+    "RayModelSamplingFlux": RayModelSamplingFlux,
+    "RayRescaleCFG": RayRescaleCFG,
+    "RayModelComputeDtype": RayModelComputeDtype,
 }

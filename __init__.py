@@ -22,6 +22,7 @@ from raylight.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 # Extra nodes
 from raylight.comfy_extra_dist.nodes_torch_compile import NODE_CLASS_MAPPINGS as COMPILE_NODE_CLASS_MAPPINGS
 from raylight.comfy_extra_dist.nodes_torch_compile import NODE_DISPLAY_NAME_MAPPINGS as COMPILE_DISPLAY_NAME_MAPPINGS
+from raylight.comfy_extra_dist.nodes_model_advanced import NODE_CLASS_MAPPINGS as MODEL_ADV_CLASS_MAPPINGS
 
 if os.getenv("debug_raylight") == "1":
     print("RAYLIGHT DEBUG MODE")
@@ -33,6 +34,7 @@ if os.getenv("debug_raylight") == "1":
 
 # CLASS
 NODE_CLASS_MAPPINGS.update(COMPILE_NODE_CLASS_MAPPINGS)
+NODE_CLASS_MAPPINGS.update(MODEL_ADV_CLASS_MAPPINGS)
 
 
 # DISPLAY
