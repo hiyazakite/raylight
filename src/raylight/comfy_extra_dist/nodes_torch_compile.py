@@ -15,7 +15,7 @@ class RayTorchCompileModel:
     RETURN_TYPES = ("RAY_ACTORS",)
     RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
-    CATEGORY = "Raylight"
+    CATEGORY = "Raylight/extra"
 
     def patch(self, ray_actors, backend):
 
