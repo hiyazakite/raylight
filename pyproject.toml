@@ -39,7 +39,7 @@ Repository = "https://github.com/komikndr/raylight"
 PublisherId = "komikndr"
 DisplayName = "raylight"
 repository = "https://github.com/komikndr/raylight"
-Icon = "https://github.com/komikndr/raylight/blob/main/icon.png"
+Icon = "https://github.com/komikndr/raylight/blob/main/icon.png?raw=true"
 
 
 [tool.setuptools.package-data]
