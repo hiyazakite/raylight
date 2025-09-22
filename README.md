@@ -185,6 +185,7 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
    - Inside the top-most Raylight folder (where `pyproject.toml` exists), run:
 
    ```bash
+   ..\..\..\python_embeded\python.exe -m pip install -r .\requirements.txt
    ..\..\..\python_embeded\python.exe -m pip install -e .
    ```
 4. Highly experimental — please open an issue if you encounter errors.
@@ -196,3 +197,4 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
 ## Support
 [PayPal](https://paypal.me/Komikndr)
 Thanks for the support :) (I want to buy 2nd GPU (5060Ti) so i dont have to rent cloud GPU)
+[RunPod](https://runpod.io?ref=yruu07gh)
