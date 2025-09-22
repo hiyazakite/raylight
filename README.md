@@ -7,7 +7,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 ## UPDATE
 - No need to install FlashAttn.
 - SageAttn is now supported.
-- Full FSDP support for Qwen and Flux.
+- Full FSDP support for Qwen, Flux, and Hunyuan Video.
 - Qwen USP can't do any square dimension, only 1280x1280 that's working, so pick any dim that's is not square
 - Full LoRA support.
 - FSDP CPU offload, analogous to block swap.

@@ -73,9 +73,10 @@ class RayInitializer:
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = GPU
+        # TODO, in asymmetric GPU setup where the user select main GPU, this could raise error
         max_world_size = torch.cuda.device_count()
         if world_size > max_world_size:
-            raise ValueError("To many gpus")
+            raise ValueError("Too many gpus")
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree:
