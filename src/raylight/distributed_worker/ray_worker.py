@@ -1,5 +1,6 @@
 import types
 import os
+import sys
 import gc
 from datetime import timedelta
 
@@ -143,13 +144,23 @@ class RayWorker:
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
-            dist.init_process_group(
-                "nccl",
-                rank=local_rank,
-                world_size=self.world_size,
-                timeout=timedelta(minutes=1),
-                # device_id=self.device
-            )
+            if sys.platform.startswith("linux"):
+                dist.init_process_group(
+                    "nccl",
+                    rank=local_rank,
+                    world_size=self.world_size,
+                    timeout=timedelta(minutes=1),
+                    # device_id=self.device
+                )
+            elif sys.platform.startswith("win"):
+                os.environ["USE_LIBUV"] = "0"
+                dist.init_process_group(
+                    "gloo",
+                    rank=local_rank,
+                    world_size=self.world_size,
+                    timeout=timedelta(minutes=1),
+                    # device_id=self.device
+                )
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
             pg = dist.group.WORLD
             cp.set_cp_group(pg, list(range(self.world_size)), local_rank)
@@ -283,7 +294,6 @@ class RayWorker:
             self.state_dict = None
             comfy.model_management.soft_empty_cache()
             gc.collect()
-            dist.barrier()
             print("FSDP registered")
         else:
             print("FSDP already registered, skip wrapping...")
@@ -387,25 +397,34 @@ class RayWorker:
         return (out,)
 
 
-class RayNCCLTester:
+class RayCOMMTester:
     def __init__(self, local_rank, world_size, device_id):
-        local_rank = local_rank
-        world_size = world_size
-        device_id = device_id
         device = torch.device(f"cuda:{device_id}")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
 
-        dist.init_process_group(
-            "nccl",
-            rank=local_rank,
-            world_size=world_size,
-            timeout=timedelta(minutes=1),
-            device_id=device
-        )
+        if sys.platform.startswith("linux"):
+            dist.init_process_group(
+                "nccl",
+                rank=local_rank,
+                world_size=self.world_size,
+                timeout=timedelta(minutes=1),
+                # device_id=self.device
+            )
+        elif sys.platform.startswith("win"):
+            os.environ["USE_LIBUV"] = "0"
+            if local_rank == 0:
+                print("Windows detected, falling back to GLOO backend, consider using WSL, GLOO is slower than NCCL")
+            dist.init_process_group(
+                "gloo",
+                rank=local_rank,
+                world_size=self.world_size,
+                timeout=timedelta(minutes=1),
+                # device_id=self.device
+            )
         pg = dist.group.WORLD
         cp.set_cp_group(pg, list(range(world_size)), local_rank)
 
-        print("Running NCCL COMM pre-run")
+        print("Running COMM pre-run")
 
         # Each rank contributes rank+1
         x = torch.ones(1, device=device) * (local_rank + 1)
@@ -423,7 +442,6 @@ class RayNCCLTester:
             )
         else:
             print(f"[Rank {local_rank}] COMM test passed ✅ (result={result})")
-        dist.barrier()
 
     def kill(self):
         dist.destroy_process_group()
@@ -431,7 +449,7 @@ class RayNCCLTester:
 
 
 def ray_nccl_tester(world_size):
-    gpu_actor = ray.remote(RayNCCLTester)
+    gpu_actor = ray.remote(RayCOMMTester)
     gpu_actors = []
 
     for local_rank in range(world_size):
