@@ -406,7 +406,7 @@ class RayCOMMTester:
             dist.init_process_group(
                 "nccl",
                 rank=local_rank,
-                world_size=self.world_size,
+                world_size=world_size,
                 timeout=timedelta(minutes=1),
                 # device_id=self.device
             )
@@ -417,7 +417,7 @@ class RayCOMMTester:
             dist.init_process_group(
                 "gloo",
                 rank=local_rank,
-                world_size=self.world_size,
+                world_size=world_size,
                 timeout=timedelta(minutes=1),
                 # device_id=self.device
             )
