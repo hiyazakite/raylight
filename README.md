@@ -81,7 +81,8 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 **Hunyuan Video**
 | Model             | USP | FSDP |
 |-------------------|-----|------|
-| Hunyuan Video     | ❌  | ❓   |
+| Hunyuan Video     | ✅  | ✅   |
+| ControlNet        | ❌  | ❌   |
 
 **Legend:**
 - ✅ = Supported

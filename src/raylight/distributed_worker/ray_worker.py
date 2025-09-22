@@ -81,7 +81,23 @@ def usp_inject_callback(
         for block in model.single_blocks:
             block.forward = types.MethodType(usp_single_stream_forward, block)
         model.forward_orig = types.MethodType(usp_dit_forward, model)
-        dist.barrier()
+
+    elif isinstance(base_model, model_base.HunyuanVideo):
+        from ..flux.distributed.xdit_context_parallel import (
+            usp_single_stream_forward,
+            usp_double_stream_forward
+        )
+        from ..hunyuan_video.distributed.xdit_context_paralllel import (
+            usp_dit_forward
+        )
+
+        model = base_model.diffusion_model
+        print("Initializing USP")
+        for block in model.double_blocks:
+            block.forward = types.MethodType(usp_double_stream_forward, block)
+        for block in model.single_blocks:
+            block.forward = types.MethodType(usp_single_stream_forward, block)
+        model.forward_orig = types.MethodType(usp_dit_forward, model)
 
     elif isinstance(base_model, model_base.QwenImage):
         from ..qwen_image.distributed.xdit_context_parallel import (
@@ -94,10 +110,9 @@ def usp_inject_callback(
             block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
 
         model._forward = types.MethodType(usp_dit_forward, model)
-        dist.barrier()
 
     else:
-        print(
+        raise ValueError(
             f"Model: {type(base_model).__name__}, is not yet supported for USP Parallelism"
         )
 

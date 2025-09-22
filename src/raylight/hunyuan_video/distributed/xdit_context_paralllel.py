@@ -11,6 +11,17 @@ import raylight.distributed_modules.attention as xfuser_attn
 attn_type = xfuser_attn.get_attn_type()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
 
+# HunyuanVid use the same DiT single/double block as Flux
+
+
+def pad_if_odd(t: torch.Tensor, dim: int = 1):
+    if t.size(dim) % 2 != 0:
+        pad_shape = list(t.shape)
+        pad_shape[dim] = 1  # add one element along target dim
+        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+        t = torch.cat([t, pad_tensor], dim=dim)
+    return t
+
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
     """
@@ -49,8 +60,13 @@ def usp_dit_forward(
     control=None,
     transformer_options={},
 ) -> Tensor:
-    patches_replace = transformer_options.get("patches_replace", {})
+    # Seq is odd (idk how) if the w == h, so just pad 0 to the end
+    img = pad_if_odd(img, dim=1)
+    img_ids = pad_if_odd(img_ids, dim=1)
+    txt = pad_if_odd(txt, dim=1)
+    txt_ids = pad_if_odd(txt_ids, dim=1)
 
+    patches_replace = transformer_options.get("patches_replace", {})
     initial_shape = list(img.shape)
     # running on sequences img
     img = self.img_in(img)
@@ -85,8 +101,15 @@ def usp_dit_forward(
 
     txt = self.txt_in(txt, timesteps, txt_mask)
 
-    ids = torch.cat((img_ids, txt_ids), dim=1)
-    pe = self.pe_embedder(ids)
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    pe_combine = self.pe_embedder(ids)
+    pe_image = self.pe_embedder(img_ids)
+    # seq parallel
+    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     img_len = img.shape[1]
     if txt_mask is not None:
@@ -104,11 +127,11 @@ def usp_dit_forward(
                 out["img"], out["txt"] = block(img=args["img"], txt=args["txt"], vec=args["vec"], pe=args["pe"], attn_mask=args["attention_mask"], modulation_dims_img=args["modulation_dims_img"], modulation_dims_txt=args["modulation_dims_txt"])
                 return out
 
-            out = blocks_replace[("double_block", i)]({"img": img, "txt": txt, "vec": vec, "pe": pe, "attention_mask": attn_mask, 'modulation_dims_img': modulation_dims, 'modulation_dims_txt': modulation_dims_txt}, {"original_block": block_wrap})
+            out = blocks_replace[("double_block", i)]({"img": img, "txt": txt, "vec": vec, "pe": pe_image, "attention_mask": attn_mask, 'modulation_dims_img': modulation_dims, 'modulation_dims_txt': modulation_dims_txt}, {"original_block": block_wrap})
             txt = out["txt"]
             img = out["img"]
         else:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask, modulation_dims_img=modulation_dims, modulation_dims_txt=modulation_dims_txt)
+            img, txt = block(img=img, txt=txt, vec=vec, pe=pe_image, attn_mask=attn_mask, modulation_dims_img=modulation_dims, modulation_dims_txt=modulation_dims_txt)
 
         if control is not None:  # Controlnet
             control_i = control.get("input")
@@ -117,7 +140,14 @@ def usp_dit_forward(
                 if add is not None:
                     img += add
 
+    # Seq gather
+    img = get_sp_group().all_gather(img, dim=1)
+    txt = get_sp_group().all_gather(txt, dim=1)
+
     img = torch.cat((img, txt), 1)
+
+    # Seq parallel
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     for i, block in enumerate(self.single_blocks):
         if ("single_block", i) in blocks_replace:
@@ -126,10 +156,10 @@ def usp_dit_forward(
                 out["img"] = block(args["img"], vec=args["vec"], pe=args["pe"], attn_mask=args["attention_mask"], modulation_dims=args["modulation_dims"])
                 return out
 
-            out = blocks_replace[("single_block", i)]({"img": img, "vec": vec, "pe": pe, "attention_mask": attn_mask, 'modulation_dims': modulation_dims}, {"original_block": block_wrap})
+            out = blocks_replace[("single_block", i)]({"img": img, "vec": vec, "pe": pe_combine, "attention_mask": attn_mask, 'modulation_dims': modulation_dims}, {"original_block": block_wrap})
             img = out["img"]
         else:
-            img = block(img, vec=vec, pe=pe, attn_mask=attn_mask, modulation_dims=modulation_dims)
+            img = block(img, vec=vec, pe=pe_combine, attn_mask=attn_mask, modulation_dims=modulation_dims)
 
         if control is not None:  # Controlnet
             control_o = control.get("output")
