@@ -64,6 +64,9 @@ class RayInitializer:
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
+
+        os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
+        os.environ["NCCL_DEBUG"] = "WARN"
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         self.parallel_dict = dict()
