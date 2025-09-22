@@ -523,3 +523,4 @@ def ensure_fresh_actors(ray_actors_init):
     parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
 
     return ray_actors, gpu_actors, parallel_dict
+

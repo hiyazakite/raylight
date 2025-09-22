@@ -21,7 +21,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
   export NCCL_P2P_DISABLE=1
   export NCCL_SHM_DISABLE=1
   ```
-- Windows is not tested; I only have access to Linux cloud multi-GPU environments.
+- **Windows** is in partial testing, switch to `dev` branch to test it. And scroll down below for more information
 - The tested model is the WanModel variant. The next model to be supported will be determined by usage popularity (Flux, Qwen, Hunyuan).
 - Non-DiT models are not supported.
 - Example WF just open from your comfyui menu and browse templates
@@ -163,14 +163,33 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
      pip install flash-attn --no-build-isolation
    - Option B (recommended, use prebuilt wheel):
      For Torch 2.8:
-       `wget https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.3.14/flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl -O flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl`
-       `pip install flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl`
+       ```bash
+       wget https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.3.14/flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl -O flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl
+       ```
+       ```bash
+       pip install flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl`
+       ```
      For other versions, check:
         https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/
 5. Restart ComfyUI.
 
 **ComfyUI Manager**
 1. Find raylight in the manager and install it.
+
+**Windows**
+1. Only works for **PyTorch 2.7**, because of [pytorch/pytorch#150381](https://github.com/pytorch/pytorch/issues/150381)
+2. POSIX and Win32 style paths can cause issues when importing **raylight**.
+3. Recommended steps:
+   - Manually clone the **Raylight** repo
+   - Switch to the `dev` branch for now
+   - Inside the top-most Raylight folder (where `pyproject.toml` exists), run:
+
+   ```bash
+   ..\..\..\python_embeded\python.exe -m pip install -e .
+   ```
+4. Highly experimental — please open an issue if you encounter errors.
+5. Advisable to run in WSL since windows does not have NCCL support from PyTorch, raylight will run using GLOO,
+   which is slower than NCCL
 
 
 
