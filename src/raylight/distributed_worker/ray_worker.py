@@ -228,36 +228,26 @@ class RayWorker:
         )
         print("USP registered")
 
-    def set_meta_model(self, model):
-        first_param_device = next(model.model.parameters()).device
-        if first_param_device == torch.device("meta"):
-            self.model = model
-            self.model.config_fsdp(self.local_rank, self.device_mesh)
-        else:
-            raise ValueError("Model being set is not meta, can cause OOM in large model")
-
-    def get_meta_model(self):
-        first_param_device = next(self.model.model.parameters()).device
-        if first_param_device == torch.device("meta"):
-            return self.model
-        else:
-            raise ValueError("Model recieved is not meta, can cause OOM in large model")
-
     def load_unet(self, unet_path, model_options):
-        self.model = comfy.sd.load_diffusion_model(
-            unet_path, model_options=model_options,
-        )
-        if self.lora_list is not None:
-            self.load_lora()
-
         if self.parallel_dict["is_fsdp"] is True:
             import comfy.model_patcher as model_patcher
             from raylight.comfy_dist.model_patcher import LowVramPatch
+            from raylight.comfy_dist.sd import fsdp_load_diffusion_model
             model_patcher.LowVramPatch = LowVramPatch
 
+            self.model = fsdp_load_diffusion_model(
+                unet_path, model_options=model_options,
+            )
             self.model = FSDPModelPatcher.clone(self.model)
             self.state_dict = self.model.model_state_dict()
             self.model.config_fsdp(self.local_rank, self.device_mesh)
+        else:
+            self.model = comfy.sd.load_diffusion_model(
+                unet_path, model_options=model_options,
+            )
+
+        if self.lora_list is not None:
+            self.load_lora()
 
         self.is_model_loaded = True
 
@@ -266,37 +256,6 @@ class RayWorker:
 
     def get_lora_list(self,):
         return self.lora_list
-
-    def patch_fsdp(self,):
-        from torch.distributed.fsdp import FSDPModule
-        print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
-
-        if not isinstance(self.model.model.diffusion_model, FSDPModule):
-            if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
-                from ..wan.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model.model, model_base.Flux):
-                from ..flux.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model.model, model_base.QwenImage):
-                from ..qwen_image.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model.model, model_base.HunyuanVideo):
-                from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            else:
-                raise ValueError(f"{type(self.model.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
-
-            self.state_dict = None
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
-            print("FSDP registered")
-        else:
-            print("FSDP already registered, skip wrapping...")
 
     def load_lora(self,):
         for lora in self.lora_list:
@@ -358,10 +317,6 @@ class RayWorker:
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-
-        if self.parallel_dict["is_fsdp"] is True:
-            self.is_cpu_offload = self.parallel_dict["fsdp_cpu_offload"]
-            self.patch_fsdp()
 
         with torch.no_grad():
             samples = comfy.sample.sample(
@@ -511,6 +466,7 @@ def ensure_fresh_actors(ray_actors_init):
         # Actor already dead or crashed
         needs_restart = True
 
+    needs_restart = False
     if needs_restart:
         for actor in gpu_actors:
             try:
