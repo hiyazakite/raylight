@@ -1,9 +1,13 @@
 import logging
-from raylight import comfy_dist
-import comfy
+import gc
 
+import torch.distributed as dist
+
+from raylight import comfy_dist
+
+import comfy
 from comfy.sd import model_detection_error_hint
-from comfy import model_detection, model_management
+from comfy import model_detection, model_management, model_base
 
 
 def load_lora_for_models(model, lora, strength_model):
@@ -30,10 +34,35 @@ def load_lora_for_models(model, lora, strength_model):
     return new_modelpatcher
 
 
-def load_diffusion_model_state_dict(sd, model_options={}):
-    dtype = model_options.get("dtype", None)
+def apply_fsdp(model, state_dict, is_cpu_offload):
+    print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(model.model.diffusion_model).__name__}")
 
-    # Allow loading unets from checkpoint files
+    if isinstance(model.model, model_base.WAN21) or isinstance(model.model, model_base.WAN22):
+        from ..wan.distributed.fsdp import shard_model_fsdp2
+        model.model = shard_model_fsdp2(model.model, state_dict, is_cpu_offload)
+
+    elif isinstance(model.model, model_base.Flux):
+        from ..flux.distributed.fsdp import shard_model_fsdp2
+        model.model = shard_model_fsdp2(model.model, state_dict, is_cpu_offload)
+
+    elif isinstance(model.model, model_base.QwenImage):
+        from ..qwen_image.distributed.fsdp import shard_model_fsdp2
+        model.model = shard_model_fsdp2(model.model, state_dict, is_cpu_offload)
+
+    elif isinstance(model.model, model_base.HunyuanVideo):
+        from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
+        model.model = shard_model_fsdp2(model.model, state_dict, is_cpu_offload)
+    else:
+        raise ValueError(f"{type(model.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
+
+    comfy.model_management.soft_empty_cache()
+    gc.collect()
+    dist.barrier()
+
+
+def fsdp_load_diffusion_model_state_dict(unet_path, rank, model_options={}):
+    sd = comfy.utils.load_torch_file(unet_path)
+    dtype = model_options.get("dtype", None)
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
     temp_sd = comfy.utils.state_dict_prefix_replace(sd, {diffusion_model_prefix: ""}, filter_keys=True)
     if len(temp_sd) > 0:
@@ -92,13 +121,9 @@ def load_diffusion_model_state_dict(sd, model_options={}):
 
     from ..wan.distributed.fsdp import shard_model_fsdp2
     model = shard_model_fsdp2(model, new_sd, False)
-    return comfy_dist.model_patcher.FSDPModelPatcher(model, load_device=load_device, offload_device=offload_device)
+    model_patcher = comfy_dist.model_patcher.FSDPModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
-
-def fsdp_load_diffusion_model(unet_path, model_options={}):
-    sd = comfy.utils.load_torch_file(unet_path)
-    model = load_diffusion_model_state_dict(sd, model_options=model_options)
-    if model is None:
+    if model_patcher is None:
         logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
-    return model
+    return model_patcher
