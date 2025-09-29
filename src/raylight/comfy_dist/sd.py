@@ -60,7 +60,7 @@ def apply_fsdp(model, state_dict, is_cpu_offload):
     dist.barrier()
 
 
-def fsdp_load_diffusion_model_state_dict(unet_path, rank, model_options={}):
+def fsdp_load_diffusion_model(unet_path, model_options={}):
     sd = comfy.utils.load_torch_file(unet_path)
     dtype = model_options.get("dtype", None)
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
@@ -113,14 +113,13 @@ def fsdp_load_diffusion_model_state_dict(unet_path, rank, model_options={}):
         model_config.optimizations["fp8"] = True
 
     model = model_config.get_model(new_sd, "")
-    model = model.to("meta")
     model.load_model_weights(new_sd, "")
     left_over = sd.keys()
     if len(left_over) > 0:
         logging.info("left over keys in diffusion model: {}".format(left_over))
 
-    from ..wan.distributed.fsdp import shard_model_fsdp2
-    model = shard_model_fsdp2(model, new_sd, False)
+    # from ..wan.distributed.fsdp import shard_model_fsdp2_test
+    # model = shard_model_fsdp2_test(model, False)
     model_patcher = comfy_dist.model_patcher.FSDPModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
     if model_patcher is None:

@@ -203,6 +203,13 @@ class RayWorker:
                     ulysses_degree=ulysses_degree,
                 )
 
+    def set_meta_model(self, model):
+        self.model = model
+        self.model.config_fsdp(self.local_rank, self.device_mesh)
+
+    def get_meta_model(self):
+        self.model
+
     def get_compute_capability(self):
         return self.compute_capability
 
@@ -227,6 +234,38 @@ class RayWorker:
             usp_inject_callback,
         )
         print("USP registered")
+
+    def patch_fsdp(self,):
+        from torch.distributed.fsdp import FSDPModule
+        print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
+
+        if not isinstance(self.model.model.diffusion_model, FSDPModule):
+            if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
+                from ..wan.distributed.fsdp import shard_model_fsdp2
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
+
+            elif isinstance(self.model.model, model_base.Flux):
+                from ..flux.distributed.fsdp import shard_model_fsdp2
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
+
+            elif isinstance(self.model.model, model_base.QwenImage):
+                from ..qwen_image.distributed.fsdp import shard_model_fsdp2
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
+
+            elif isinstance(self.model.model, model_base.HunyuanVideo):
+                from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
+                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
+
+            else:
+                raise ValueError(f"{type(self.model.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
+
+            self.state_dict = None
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
+            dist.barrier()
+            print("FSDP registered")
+        else:
+            print("FSDP already registered, skip wrapping...")
 
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:
@@ -309,6 +348,9 @@ class RayWorker:
             noise = comfy.sample.prepare_noise(
                 latent_image, seed + self.noise_add, batch_inds
             )
+        if self.parallel_dict["is_fsdp"] is True:
+            self.is_cpu_offload = self.parallel_dict["fsdp_cpu_offload"]
+            self.patch_fsdp()
 
         noise_mask = None
         if "noise_mask" in latent:

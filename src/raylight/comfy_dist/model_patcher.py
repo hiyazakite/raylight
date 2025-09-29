@@ -185,7 +185,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
     def config_fsdp(self, rank, device_mesh):
         self.rank = rank
         self.device_mesh = device_mesh
-        # self.model.to("meta")
+        self.model.to("meta")
 
     def clone(self, *args, **kwargs):
         src_cls = self.__class__
