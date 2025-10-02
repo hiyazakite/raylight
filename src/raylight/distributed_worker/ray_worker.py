@@ -141,6 +141,7 @@ class RayWorker:
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
 
         self.is_model_loaded = False
+        self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
@@ -191,7 +192,7 @@ class RayWorker:
                 initialize_model_parallel(
                     sequence_parallel_degree=self.world_size,
                     ring_degree=1,
-                    ulysses_degree=cp_size,
+                    ulysses_degree=cp_size
                 )
             else:
                 print(
@@ -203,12 +204,23 @@ class RayWorker:
                     ulysses_degree=ulysses_degree,
                 )
 
-    def set_meta_model(self, model):
-        self.model = model
-        self.model.config_fsdp(self.local_rank, self.device_mesh)
-
     def get_meta_model(self):
-        self.model
+        first_param_device = next(self.model.model.parameters()).device
+        if first_param_device == torch.device("meta"):
+            return self.model
+        else:
+            raise ValueError("Model recieved is not meta, can cause OOM in large model")
+
+    def set_meta_model(self, model):
+        first_param_device = next(model.model.parameters()).device
+        if first_param_device == torch.device("meta"):
+            self.model = model
+            self.model.config_fsdp(self.local_rank, self.device_mesh)
+        else:
+            raise ValueError("Model being set is not meta, can cause OOM in large model")
+
+    def set_state_dict(self):
+        self.model.set_fsdp_state_dict(self.state_dict)
 
     def get_compute_capability(self):
         return self.compute_capability
@@ -235,38 +247,6 @@ class RayWorker:
         )
         print("USP registered")
 
-    def patch_fsdp(self,):
-        from torch.distributed.fsdp import FSDPModule
-        print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
-
-        if not isinstance(self.model.model.diffusion_model, FSDPModule):
-            if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
-                from ..wan.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model.model, model_base.Flux):
-                from ..flux.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model.model, model_base.QwenImage):
-                from ..qwen_image.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model.model, model_base.HunyuanVideo):
-                from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            else:
-                raise ValueError(f"{type(self.model.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
-
-            self.state_dict = None
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
-            dist.barrier()
-            print("FSDP registered")
-        else:
-            print("FSDP already registered, skip wrapping...")
-
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:
             import comfy.model_patcher as model_patcher
@@ -274,12 +254,13 @@ class RayWorker:
             from raylight.comfy_dist.sd import fsdp_load_diffusion_model
             model_patcher.LowVramPatch = LowVramPatch
 
-            self.model = fsdp_load_diffusion_model(
-                unet_path, model_options=model_options,
+            self.model, self.state_dict = fsdp_load_diffusion_model(
+                unet_path,
+                self.local_rank,
+                self.device_mesh,
+                self.is_cpu_offload,
+                model_options=model_options,
             )
-            self.model = FSDPModelPatcher.clone(self.model)
-            self.state_dict = self.model.model_state_dict()
-            self.model.config_fsdp(self.local_rank, self.device_mesh)
         else:
             self.model = comfy.sd.load_diffusion_model(
                 unet_path, model_options=model_options,
@@ -348,9 +329,6 @@ class RayWorker:
             noise = comfy.sample.prepare_noise(
                 latent_image, seed + self.noise_add, batch_inds
             )
-        if self.parallel_dict["is_fsdp"] is True:
-            self.is_cpu_offload = self.parallel_dict["fsdp_cpu_offload"]
-            self.patch_fsdp()
 
         noise_mask = None
         if "noise_mask" in latent:
@@ -359,6 +337,9 @@ class RayWorker:
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
+        if self.parallel_dict["is_fsdp"] is True:
+            self.model.patch_fsdp()
 
         with torch.no_grad():
             samples = comfy.sample.sample(

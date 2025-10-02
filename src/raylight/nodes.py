@@ -204,6 +204,12 @@ class RayUNETLoader:
 
             ray.get(loaded_futures)
             loaded_futures = []
+
+            for actor in gpu_actors:
+                loaded_futures.append(actor.set_state_dict.remote())
+
+            ray.get(loaded_futures)
+            loaded_futures = []
         else:
             for actor in gpu_actors:
                 loaded_futures.append(
