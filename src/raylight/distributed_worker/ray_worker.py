@@ -155,11 +155,15 @@ class RayWorker:
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:
             import comfy.model_patcher as model_patcher
+            import comfy.model_management as model_management
+
+            from raylight.comfy_dist.model_management import cleanup_models_gc
             from raylight.comfy_dist.model_patcher import LowVramPatch
+
             from raylight.comfy_dist.sd import fsdp_load_diffusion_model
             from torch.distributed.fsdp import FSDPModule
             model_patcher.LowVramPatch = LowVramPatch
-
+            model_management.cleanup_models_gc = cleanup_models_gc
             m = getattr(self.model, "model", None)
             if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
                 del self.model
