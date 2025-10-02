@@ -14,6 +14,8 @@ from raylight import comfy_dist
 from comfy.patcher_extension import CallbacksMP
 from comfy import model_base
 import logging
+from torch.distributed.utils import _free_storage
+from torch.distributed.tensor import DTensor
 
 
 class LowVramPatch:
@@ -290,3 +292,18 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             comfy.utils.set_attr(self.model, k, self.object_patches_backup[k])
 
         self.object_patches_backup.clear()
+
+    def __del__(self):
+        self.detach(unpatch_all=False)
+        for m in self.model.modules():
+            for p in m.parameters(recurse=False):
+                if isinstance(p, DTensor):
+                    local = p.to_local()
+                    _free_storage(local.data)
+                elif isinstance(p, torch.Tensor):
+                    _free_storage(p.data)
+
+        self.model.to("meta")
+        del self.model
+        self.model = None
+        comfy.model_management.soft_empty_cache()

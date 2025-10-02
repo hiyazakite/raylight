@@ -1,4 +1,3 @@
-import types
 import os
 import sys
 import gc
@@ -15,107 +14,13 @@ from comfy import (
     utils,
 )  # Must manually insert comfy package or ray cannot import raylight to cluster
 import comfy.patcher_extension as pe
-from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
 import raylight.distributed_modules.attention as xfuser_attn
-from raylight.comfy_dist.model_patcher import FSDPModelPatcher
+from raylight.distributed_modules.usp import usp_inject_callback
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from ray.exceptions import RayActorError
 
-
-def usp_inject_callback(
-    model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load
-):
-    base_model = model_patcher.model
-
-    if isinstance(base_model, model_base.WAN22_S2V):
-        from ..wan.distributed.xdit_context_parallel import (
-            usp_audio_dit_forward,
-            usp_self_attn_forward,
-            usp_t2v_cross_attn_forward,
-            usp_audio_injector
-        )
-
-        model = base_model.diffusion_model
-        print("Initializing USP")
-        for block in model.blocks:
-            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
-            block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
-
-        model.audio_injector.forward = types.MethodType(usp_audio_injector, model.audio_injector)
-        for inject in model.audio_injector.injector:
-            inject.forward = types.MethodType(usp_t2v_cross_attn_forward, inject)
-
-        model.forward_orig = types.MethodType(usp_audio_dit_forward, model)
-
-    elif isinstance(base_model, model_base.WAN21):
-        from ..wan.distributed.xdit_context_parallel import (
-            usp_self_attn_forward,
-            usp_dit_forward,
-            usp_i2v_cross_attn_forward,
-            usp_t2v_cross_attn_forward
-        )
-        from comfy.ldm.wan.model import WanT2VCrossAttention, WanI2VCrossAttention
-
-        model = base_model.diffusion_model
-        print("Initializing USP")
-        for block in model.blocks:
-            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
-            if isinstance(block.cross_attn, WanT2VCrossAttention):
-                block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
-            elif isinstance(block.cross_attn, WanI2VCrossAttention):
-                block.cross_attn.forward = types.MethodType(usp_i2v_cross_attn_forward, block.cross_attn)
-        model.forward_orig = types.MethodType(usp_dit_forward, model)
-
-    elif isinstance(base_model, model_base.Flux):
-        from ..flux.distributed.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_single_stream_forward,
-            usp_double_stream_forward
-        )
-
-        model = base_model.diffusion_model
-        print("Initializing USP")
-        for block in model.double_blocks:
-            block.forward = types.MethodType(usp_double_stream_forward, block)
-        for block in model.single_blocks:
-            block.forward = types.MethodType(usp_single_stream_forward, block)
-        model.forward_orig = types.MethodType(usp_dit_forward, model)
-
-    elif isinstance(base_model, model_base.HunyuanVideo):
-        from ..flux.distributed.xdit_context_parallel import (
-            usp_single_stream_forward,
-            usp_double_stream_forward
-        )
-        from ..hunyuan_video.distributed.xdit_context_paralllel import (
-            usp_dit_forward
-        )
-
-        model = base_model.diffusion_model
-        print("Initializing USP")
-        for block in model.double_blocks:
-            block.forward = types.MethodType(usp_double_stream_forward, block)
-        for block in model.single_blocks:
-            block.forward = types.MethodType(usp_single_stream_forward, block)
-        model.forward_orig = types.MethodType(usp_dit_forward, model)
-
-    elif isinstance(base_model, model_base.QwenImage):
-        from ..qwen_image.distributed.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_attn_forward,
-        )
-        model = base_model.diffusion_model
-        print("Initializing USP")
-        for block in model.transformer_blocks:
-            block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
-
-        model._forward = types.MethodType(usp_dit_forward, model)
-
-    else:
-        raise ValueError(
-            f"Model: {type(base_model).__name__}, is not yet supported for USP Parallelism"
-        )
 
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
 # the model need to be serialized, send to object store and can cause OOM !, so setter and getter is the pattern !
@@ -252,8 +157,13 @@ class RayWorker:
             import comfy.model_patcher as model_patcher
             from raylight.comfy_dist.model_patcher import LowVramPatch
             from raylight.comfy_dist.sd import fsdp_load_diffusion_model
+            from torch.distributed.fsdp import FSDPModule
             model_patcher.LowVramPatch = LowVramPatch
 
+            m = getattr(self.model, "model", None)
+            if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
+                del self.model
+                self.model = None
             self.model, self.state_dict = fsdp_load_diffusion_model(
                 unet_path,
                 self.local_rank,
@@ -502,4 +412,3 @@ def ensure_fresh_actors(ray_actors_init):
     parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
 
     return ray_actors, gpu_actors, parallel_dict
-
