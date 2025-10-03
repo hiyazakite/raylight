@@ -16,9 +16,12 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - FSDP CPU offload, analogous to block swap/DisTorch.
 
 ## What exactly is Raylight
+
 Raylight is a parallelism node for ComfyUI, where the tensor of an image or video sequence
 is split among GPU ranks. Raylight, as its partial namesake, uses [Ray](https://docs.ray.io/en/latest/ray-core/walkthrough.html)
 to manage its GPU workers.
+
+<img width="830" height="665" alt="image" src="https://github.com/user-attachments/assets/ea78f3d3-41cb-4620-b4b6-65f8229293b2" />
 
 So how does it split among the ranks? It uses Unified Sequence Parallelism (USP), embedded inside
 [XDiT](https://github.com/xdit-project/xDiT), a core library of Raylight that splits and allgathers tensors among GPU ranks.
@@ -37,7 +40,7 @@ Its job is to split the model weights among GPUs.
 
 - [ComfyUI Worksplit branch](https://github.com/comfyanonymous/ComfyUI/tree/worksplit-multigpu)
   Splits workload at the CFG level, not at the tensor level.
-  Since most workflows use `CFG=1.0`, this approach provides limited performance gains.
+  Since most workflows use `CFG=1.0` like Wan with Lora, this approach provides limited use cases.
 
 - **Raylight**
   Provides both tensor parallelism (USP) and model weight sharding (FSDP).
@@ -157,6 +160,11 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
 
 ## Wan T2V 14B on RTX 2000 ADA ≈ RTX 4060 TI 16GB
 <img width="1117" height="716" alt="Screenshot 2025-08-20 125936" src="https://github.com/user-attachments/assets/b2ea1621-4be1-4925-8f4a-3ff9542c6415" />
+
+## Qwen Image 20B on RTX 2000 ADA ≈ RTX 4060 TI 16GB , 4x Playback speed up
+
+https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
+
 
 ## DEBUG Notes
 
