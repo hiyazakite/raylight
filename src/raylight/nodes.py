@@ -9,6 +9,7 @@ import folder_paths
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
+from raylight.comfy_extra_dist.ray_patch_decorator import ray_patch
 
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
@@ -180,8 +181,6 @@ class RayUNETLoader:
             )
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
-
-        # Kill actor if model exist
 
         loaded_futures = []
         patched_futures = []
