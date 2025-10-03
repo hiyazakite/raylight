@@ -5,12 +5,47 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
 ## UPDATE
+- Reworked the entire FSDP loader. Model loading should now be more stable and faster,
+  as Raylight no longer kills active workers to reset the model state.
+  Previously, this was necessary because Comfy could not remove FSDP models from VRAM, which caused memory leaks.
 - No need to install FlashAttn.
 - SageAttn is now supported.
-- Full FSDP support for Qwen and Flux.
+- Full FSDP support for Qwen, Flux, and Hunyuan Video.
 - Qwen USP can't do any square dimension, only 1280x1280 that's working, so pick any dim that's is not square
 - Full LoRA support.
-- FSDP CPU offload, analogous to block swap.
+- FSDP CPU offload, analogous to block swap/DisTorch.
+
+## What exactly is Raylight
+
+Raylight is a parallelism node for ComfyUI, where the tensor of an image or video sequence
+is split among GPU ranks. Raylight, as its partial namesake, uses [Ray](https://docs.ray.io/en/latest/ray-core/walkthrough.html)
+to manage its GPU workers.
+
+<img width="830" height="665" alt="image" src="https://github.com/user-attachments/assets/ea78f3d3-41cb-4620-b4b6-65f8229293b2" />
+
+So how does it split among the ranks? It uses Unified Sequence Parallelism (USP), embedded inside
+[XDiT](https://github.com/xdit-project/xDiT), a core library of Raylight that splits and allgathers tensors among GPU ranks.
+
+Unfortunately, although it splits across GPUs, each GPU must still load the full model weight.
+And let's be honest, most of us do not have a 4090 or 5090. In my opinion, buying a second 4070
+is monetarily less painful than buying a 5090. This is where [FSDP](https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html) comes in.
+Its job is to split the model weights among GPUs.
+
+**TLDR:** Raylight is multi-GPU nodes for Comfy, USP for splitting the work, and FSDP for splitting the model weights.
+
+### Raylight vs MultiGPU vs ComfyUI Worksplit branch
+- [MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU)
+  Loads models selectively on specified GPUs without sharing workload.
+  Includes CPU RAM offloading, which benefits single-GPU users.
+
+- [ComfyUI Worksplit branch](https://github.com/comfyanonymous/ComfyUI/tree/worksplit-multigpu)
+  Splits workload at the CFG level, not at the tensor level.
+  Since most workflows use `CFG=1.0` like Wan with Lora, this approach provides limited use cases.
+
+- **Raylight**
+  Provides both tensor parallelism (USP) and model weight sharding (FSDP).
+  This enables efficient multi-GPU utilization and scales beyond single high-memory GPUs (e.g., RTX 4090/5090).
+
 
 ## RTM and Known Issues
 - Scroll further down for the installation guide.
@@ -21,7 +56,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
   export NCCL_P2P_DISABLE=1
   export NCCL_SHM_DISABLE=1
   ```
-- Windows is not tested; I only have access to Linux cloud multi-GPU environments.
+- **Windows** is in partial testing, switch to `dev` branch to test it. And scroll down below for more information
 - The tested model is the WanModel variant. The next model to be supported will be determined by usage popularity (Flux, Qwen, Hunyuan).
 - Non-DiT models are not supported.
 - Example WF just open from your comfyui menu and browse templates
@@ -81,7 +116,8 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 **Hunyuan Video**
 | Model             | USP | FSDP |
 |-------------------|-----|------|
-| Hunyuan Video     | ❌  | ❓   |
+| Hunyuan Video     | ✅  | ✅   |
+| ControlNet        | ❌  | ❌   |
 
 **Legend:**
 - ✅ = Supported
@@ -125,6 +161,11 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
 ## Wan T2V 14B on RTX 2000 ADA ≈ RTX 4060 TI 16GB
 <img width="1117" height="716" alt="Screenshot 2025-08-20 125936" src="https://github.com/user-attachments/assets/b2ea1621-4be1-4925-8f4a-3ff9542c6415" />
 
+## Qwen Image 20B on RTX 2000 ADA ≈ RTX 4060 TI 16GB , 4x Playback speed up
+
+https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
+
+
 ## DEBUG Notes
 
 ### Wan T2V 14B (fp8) — 1×RTX 2000 ADA 16G
@@ -162,8 +203,12 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
      pip install flash-attn --no-build-isolation
    - Option B (recommended, use prebuilt wheel):
      For Torch 2.8:
-       `wget https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.3.14/flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl -O flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl`
-       `pip install flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl`
+       ```bash
+       wget https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.3.14/flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl -O flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl
+       ```
+       ```bash
+       pip install flash_attn-2.8.2+cu128torch2.7-cp311-cp311-linux_x86_64.whl`
+       ```
      For other versions, check:
         https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/
 5. Restart ComfyUI.
@@ -171,8 +216,25 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
 **ComfyUI Manager**
 1. Find raylight in the manager and install it.
 
+**Windows**
+1. Only works for **PyTorch 2.7**, because of [pytorch/pytorch#150381](https://github.com/pytorch/pytorch/issues/150381)
+2. POSIX and Win32 style paths can cause issues when importing **raylight**.
+3. Recommended steps:
+   - Manually clone the **Raylight** repo
+   - Switch to the `dev` branch for now
+   - Inside the top-most Raylight folder (where `pyproject.toml` exists), run:
+
+   ```bash
+   ..\..\..\python_embeded\python.exe -m pip install -r .\requirements.txt
+   ..\..\..\python_embeded\python.exe -m pip install -e .
+   ```
+4. Highly experimental — please open an issue if you encounter errors.
+5. Advisable to run in WSL since windows does not have NCCL support from PyTorch, raylight will run using GLOO,
+   which is slower than NCCL
+
 
 
 ## Support
 [PayPal](https://paypal.me/Komikndr)
 Thanks for the support :) (I want to buy 2nd GPU (5060Ti) so i dont have to rent cloud GPU)
+[RunPod](https://runpod.io?ref=yruu07gh)

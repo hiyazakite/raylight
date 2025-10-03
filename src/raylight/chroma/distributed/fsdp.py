@@ -12,6 +12,13 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
         if (not name.startswith("single_blocks.")) and (not name.startswith("double_blocks.")):
             ignored_params.add(param)
 
+    # Shard distilled_guidance_layer
+    diffusion_model.distilled_guidance_layer = fully_shard(
+        module=diffusion_model.distilled_guidance_layer,
+        mp_policy=MixedPrecisionPolicy(),
+        reshard_after_forward=True,
+    )
+
     # Check dtype missmatch from scaled model
     ref_dtype = diffusion_model.double_blocks[0].img_attn.qkv.weight.dtype
 

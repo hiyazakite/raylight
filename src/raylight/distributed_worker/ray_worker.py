@@ -1,5 +1,5 @@
-import types
 import os
+import sys
 import gc
 from datetime import timedelta
 
@@ -14,92 +14,13 @@ from comfy import (
     utils,
 )  # Must manually insert comfy package or ray cannot import raylight to cluster
 import comfy.patcher_extension as pe
-from comfy import model_base
 
 import raylight.distributed_worker.context_parallel as cp
 import raylight.distributed_modules.attention as xfuser_attn
-from raylight.comfy_dist.model_patcher import FSDPModelPatcher
+from raylight.distributed_modules.usp import usp_inject_callback
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from ray.exceptions import RayActorError
 
-
-def usp_inject_callback(
-    model_patcher, device_to, lowvram_model_memory, force_patch_weights, full_load
-):
-    base_model = model_patcher.model
-
-    if isinstance(base_model, model_base.WAN22_S2V):
-        from ..wan.distributed.xdit_context_parallel import (
-            usp_audio_dit_forward,
-            usp_self_attn_forward,
-            usp_t2v_cross_attn_forward,
-            usp_audio_injector
-        )
-
-        model = base_model.diffusion_model
-        print("Initializing USP")
-        for block in model.blocks:
-            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
-            block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
-
-        model.audio_injector.forward = types.MethodType(usp_audio_injector, model.audio_injector)
-        for inject in model.audio_injector.injector:
-            inject.forward = types.MethodType(usp_t2v_cross_attn_forward, inject)
-
-        model.forward_orig = types.MethodType(usp_audio_dit_forward, model)
-
-    elif isinstance(base_model, model_base.WAN21):
-        from ..wan.distributed.xdit_context_parallel import (
-            usp_self_attn_forward,
-            usp_dit_forward,
-            usp_i2v_cross_attn_forward,
-            usp_t2v_cross_attn_forward
-        )
-        from comfy.ldm.wan.model import WanT2VCrossAttention, WanI2VCrossAttention
-
-        model = base_model.diffusion_model
-        print("Initializing USP")
-        for block in model.blocks:
-            block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
-            if isinstance(block.cross_attn, WanT2VCrossAttention):
-                block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
-            elif isinstance(block.cross_attn, WanI2VCrossAttention):
-                block.cross_attn.forward = types.MethodType(usp_i2v_cross_attn_forward, block.cross_attn)
-        model.forward_orig = types.MethodType(usp_dit_forward, model)
-
-    elif isinstance(base_model, model_base.Flux):
-        from ..flux.distributed.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_single_stream_forward,
-            usp_double_stream_forward
-        )
-
-        model = base_model.diffusion_model
-        print("Initializing USP")
-        for block in model.double_blocks:
-            block.forward = types.MethodType(usp_double_stream_forward, block)
-        for block in model.single_blocks:
-            block.forward = types.MethodType(usp_single_stream_forward, block)
-        model.forward_orig = types.MethodType(usp_dit_forward, model)
-        dist.barrier()
-
-    elif isinstance(base_model, model_base.QwenImage):
-        from ..qwen_image.distributed.xdit_context_parallel import (
-            usp_dit_forward,
-            usp_attn_forward,
-        )
-        model = base_model.diffusion_model
-        print("Initializing USP")
-        for block in model.transformer_blocks:
-            block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
-
-        model._forward = types.MethodType(usp_dit_forward, model)
-        dist.barrier()
-
-    else:
-        print(
-            f"Model: {type(base_model).__name__}, is not yet supported for USP Parallelism"
-        )
 
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
 # the model need to be serialized, send to object store and can cause OOM !, so setter and getter is the pattern !
@@ -125,16 +46,27 @@ class RayWorker:
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
 
         self.is_model_loaded = False
+        self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
-            dist.init_process_group(
-                "nccl",
-                rank=local_rank,
-                world_size=self.world_size,
-                timeout=timedelta(minutes=1),
-                # device_id=self.device
-            )
+            if sys.platform.startswith("linux"):
+                dist.init_process_group(
+                    "nccl",
+                    rank=local_rank,
+                    world_size=self.world_size,
+                    timeout=timedelta(minutes=1),
+                    # device_id=self.device
+                )
+            elif sys.platform.startswith("win"):
+                os.environ["USE_LIBUV"] = "0"
+                dist.init_process_group(
+                    "gloo",
+                    rank=local_rank,
+                    world_size=self.world_size,
+                    timeout=timedelta(minutes=1),
+                    # device_id=self.device
+                )
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
             pg = dist.group.WORLD
             cp.set_cp_group(pg, list(range(self.world_size)), local_rank)
@@ -165,7 +97,7 @@ class RayWorker:
                 initialize_model_parallel(
                     sequence_parallel_degree=self.world_size,
                     ring_degree=1,
-                    ulysses_degree=cp_size,
+                    ulysses_degree=cp_size
                 )
             else:
                 print(
@@ -176,6 +108,24 @@ class RayWorker:
                     ring_degree=ring_degree,
                     ulysses_degree=ulysses_degree,
                 )
+
+    def get_meta_model(self):
+        first_param_device = next(self.model.model.parameters()).device
+        if first_param_device == torch.device("meta"):
+            return self.model
+        else:
+            raise ValueError("Model recieved is not meta, can cause OOM in large model")
+
+    def set_meta_model(self, model):
+        first_param_device = next(model.model.parameters()).device
+        if first_param_device == torch.device("meta"):
+            self.model = model
+            self.model.config_fsdp(self.local_rank, self.device_mesh)
+        else:
+            raise ValueError("Model being set is not meta, can cause OOM in large model")
+
+    def set_state_dict(self):
+        self.model.set_fsdp_state_dict(self.state_dict)
 
     def get_compute_capability(self):
         return self.compute_capability
@@ -202,36 +152,36 @@ class RayWorker:
         )
         print("USP registered")
 
-    def set_meta_model(self, model):
-        first_param_device = next(model.model.parameters()).device
-        if first_param_device == torch.device("meta"):
-            self.model = model
-            self.model.config_fsdp(self.local_rank, self.device_mesh)
-        else:
-            raise ValueError("Model being set is not meta, can cause OOM in large model")
-
-    def get_meta_model(self):
-        first_param_device = next(self.model.model.parameters()).device
-        if first_param_device == torch.device("meta"):
-            return self.model
-        else:
-            raise ValueError("Model recieved is not meta, can cause OOM in large model")
-
     def load_unet(self, unet_path, model_options):
-        self.model = comfy.sd.load_diffusion_model(
-            unet_path, model_options=model_options,
-        )
-        if self.lora_list is not None:
-            self.load_lora()
-
         if self.parallel_dict["is_fsdp"] is True:
             import comfy.model_patcher as model_patcher
-            from raylight.comfy_dist.model_patcher import LowVramPatch
-            model_patcher.LowVramPatch = LowVramPatch
+            import comfy.model_management as model_management
 
-            self.model = FSDPModelPatcher.clone(self.model)
-            self.state_dict = self.model.model_state_dict()
-            self.model.config_fsdp(self.local_rank, self.device_mesh)
+            from raylight.comfy_dist.model_management import cleanup_models_gc
+            from raylight.comfy_dist.model_patcher import LowVramPatch
+
+            from raylight.comfy_dist.sd import fsdp_load_diffusion_model
+            from torch.distributed.fsdp import FSDPModule
+            model_patcher.LowVramPatch = LowVramPatch
+            model_management.cleanup_models_gc = cleanup_models_gc
+            m = getattr(self.model, "model", None)
+            if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
+                del self.model
+                self.model = None
+            self.model, self.state_dict = fsdp_load_diffusion_model(
+                unet_path,
+                self.local_rank,
+                self.device_mesh,
+                self.is_cpu_offload,
+                model_options=model_options,
+            )
+        else:
+            self.model = comfy.sd.load_diffusion_model(
+                unet_path, model_options=model_options,
+            )
+
+        if self.lora_list is not None:
+            self.load_lora()
 
         self.is_model_loaded = True
 
@@ -240,38 +190,6 @@ class RayWorker:
 
     def get_lora_list(self,):
         return self.lora_list
-
-    def patch_fsdp(self,):
-        from torch.distributed.fsdp import FSDPModule
-        print(f"[Rank {dist.get_rank()}] Applying FSDP to {type(self.model.model.diffusion_model).__name__}")
-
-        if not isinstance(self.model.model.diffusion_model, FSDPModule):
-            if isinstance(self.model.model, model_base.WAN21) or isinstance(self.model.model, model_base.WAN22):
-                from ..wan.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model.model, model_base.Flux):
-                from ..flux.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model.model, model_base.QwenImage):
-                from ..qwen_image.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model.model, model_base.HunyuanVideo):
-                from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
-                self.model.model = shard_model_fsdp2(self.model.model, self.state_dict, self.is_cpu_offload)
-
-            else:
-                raise ValueError(f"{type(self.model.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
-
-            self.state_dict = None
-            comfy.model_management.soft_empty_cache()
-            gc.collect()
-            dist.barrier()
-            print("FSDP registered")
-        else:
-            print("FSDP already registered, skip wrapping...")
 
     def load_lora(self,):
         for lora in self.lora_list:
@@ -335,8 +253,7 @@ class RayWorker:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         if self.parallel_dict["is_fsdp"] is True:
-            self.is_cpu_offload = self.parallel_dict["fsdp_cpu_offload"]
-            self.patch_fsdp()
+            self.model.patch_fsdp()
 
         with torch.no_grad():
             samples = comfy.sample.sample(
@@ -372,25 +289,34 @@ class RayWorker:
         return (out,)
 
 
-class RayNCCLTester:
+class RayCOMMTester:
     def __init__(self, local_rank, world_size, device_id):
-        local_rank = local_rank
-        world_size = world_size
-        device_id = device_id
         device = torch.device(f"cuda:{device_id}")
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
 
-        dist.init_process_group(
-            "nccl",
-            rank=local_rank,
-            world_size=world_size,
-            timeout=timedelta(minutes=1),
-            device_id=device
-        )
+        if sys.platform.startswith("linux"):
+            dist.init_process_group(
+                "nccl",
+                rank=local_rank,
+                world_size=world_size,
+                timeout=timedelta(minutes=1),
+                # device_id=self.device
+            )
+        elif sys.platform.startswith("win"):
+            os.environ["USE_LIBUV"] = "0"
+            if local_rank == 0:
+                print("Windows detected, falling back to GLOO backend, consider using WSL, GLOO is slower than NCCL")
+            dist.init_process_group(
+                "gloo",
+                rank=local_rank,
+                world_size=world_size,
+                timeout=timedelta(minutes=1),
+                # device_id=self.device
+            )
         pg = dist.group.WORLD
         cp.set_cp_group(pg, list(range(world_size)), local_rank)
 
-        print("Running NCCL COMM pre-run")
+        print("Running COMM pre-run")
 
         # Each rank contributes rank+1
         x = torch.ones(1, device=device) * (local_rank + 1)
@@ -408,7 +334,6 @@ class RayNCCLTester:
             )
         else:
             print(f"[Rank {local_rank}] COMM test passed ✅ (result={result})")
-        dist.barrier()
 
     def kill(self):
         dist.destroy_process_group()
@@ -416,7 +341,7 @@ class RayNCCLTester:
 
 
 def ray_nccl_tester(world_size):
-    gpu_actor = ray.remote(RayNCCLTester)
+    gpu_actor = ray.remote(RayCOMMTester)
     gpu_actors = []
 
     for local_rank in range(world_size):
@@ -478,6 +403,7 @@ def ensure_fresh_actors(ray_actors_init):
         # Actor already dead or crashed
         needs_restart = True
 
+    needs_restart = False
     if needs_restart:
         for actor in gpu_actors:
             try:

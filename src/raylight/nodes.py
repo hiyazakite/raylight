@@ -9,6 +9,7 @@ import folder_paths
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
+from raylight.comfy_extra_dist.ray_patch_decorator import ray_patch
 
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
@@ -64,15 +65,19 @@ class RayInitializer:
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
+
+        os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
+        os.environ["NCCL_DEBUG"] = "WARN"
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         self.parallel_dict = dict()
 
         # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = GPU
+        # TODO, in asymmetric GPU setup where the user select main GPU, this could raise error
         max_world_size = torch.cuda.device_count()
         if world_size > max_world_size:
-            raise ValueError("To many gpus")
+            raise ValueError("Too many gpus")
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree:
@@ -177,8 +182,6 @@ class RayUNETLoader:
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
-        # Kill actor if model exist
-
         loaded_futures = []
         patched_futures = []
 
@@ -197,6 +200,12 @@ class RayUNETLoader:
             for actor in gpu_actors:
                 if actor != worker0:
                     loaded_futures.append(actor.set_meta_model.remote(meta_model))
+
+            ray.get(loaded_futures)
+            loaded_futures = []
+
+            for actor in gpu_actors:
+                loaded_futures.append(actor.set_state_dict.remote())
 
             ray.get(loaded_futures)
             loaded_futures = []
