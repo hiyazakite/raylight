@@ -68,17 +68,29 @@ This mode splits the sequence among GPUs, the full model will be loaded into eac
 Use the XFuser KSampler to increase the Ulysses degree according to the number of your GPUs,
 while keeping the Ring degree at 1 for small systems.
 
+<img width="834" height="437" alt="ValidUSP1" src="https://github.com/user-attachments/assets/c5430825-4db5-4b7d-aa44-b40d0ea0f516" />
+
+---
+
 **Data Parallel**
 The full sequence will be processed independently on each GPU.
 Use the Data Parallel KSampler. There are two options, enable FSDP, or disable all options in `Ray Init Actor`.
 By disabling them, it will run in DP mode. Both FSDP and DP modes must have the Ulysses and Ring degrees set to
-either 0 or 1. If you want to use acceleration such as SageAttn, you must set both Ulysses and Ring to 1.
+0.
 
 FSDP will shard the weights, but each GPU will still work independently,
 as the name suggests, Fully Sharded (Weight) Data Parallel.
 
+<img width="892" height="638" alt="ValidDataParallel" src="https://github.com/user-attachments/assets/c9688e6b-7b0e-4b15-8279-2c94da46f78c" />
+
+---
+
 **Sequence + FSDP**
 Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser KSampler.
+
+<img width="833" height="427" alt="ValidUSP" src="https://github.com/user-attachments/assets/9c5571ca-ae4c-4deb-97da-c3552ff43cea" />
+
+---
 
 ### Side Notes
 - **Rule of thumb**, if you have enough VRAM, just use USP, if not, enable the FSDP, and if that is still not enough,
