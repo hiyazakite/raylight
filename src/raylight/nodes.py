@@ -496,7 +496,7 @@ class DPKSamplerAdvanced:
         if parallel_dict["ulysses_degree"] > 0 or parallel_dict["ring_degree"] > 0:
             raise ValueError("""
             Data Parallel KSampler only supports FSDP or standard Data Parallel (DP).
-            Please set both 'ulysses_degree' and 'ring_degree' to 0 or 1,
+            Please set both 'ulysses_degree' and 'ring_degree' to 0,
             or use the XFuser KSampler instead. More info on Raylight mode https://github.com/komikndr/raylight
             """)
 
