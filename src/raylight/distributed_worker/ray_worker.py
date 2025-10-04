@@ -34,7 +34,6 @@ class RayWorker:
     def __init__(self, local_rank, world_size, device_id, parallel_dict):
         self.model = None
         self.model_type = None
-        self.noise_add = 0
         self.state_dict = None
 
         self.local_rank = local_rank
@@ -47,6 +46,9 @@ class RayWorker:
 
         self.is_model_loaded = False
         self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
+
+        os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
+        os.environ["NCCL_DEBUG"] = "WARN"
 
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(self.device_id)
@@ -74,7 +76,6 @@ class RayWorker:
             print(
                 f"Running Ray in normal seperate sampler with: {self.world_size} number of workers"
             )
-            self.noise_add = self.local_rank
 
         # From mochi-xdit, xdit, pipelines.py
         if self.parallel_dict["is_xdit"]:
@@ -231,6 +232,9 @@ class RayWorker:
         latent_image = latent["samples"]
         latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
 
+        if self.parallel_dict["is_fsdp"] is True:
+            self.model.patch_fsdp()
+
         if disable_noise:
             noise = torch.zeros(
                 latent_image.size(),
@@ -241,7 +245,7 @@ class RayWorker:
         else:
             batch_inds = latent["batch_index"] if "batch_index" in latent else None
             noise = comfy.sample.prepare_noise(
-                latent_image, seed + self.noise_add, batch_inds
+                latent_image, seed, batch_inds
             )
 
         noise_mask = None
@@ -251,9 +255,6 @@ class RayWorker:
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-
-        if self.parallel_dict["is_fsdp"] is True:
-            self.model.patch_fsdp()
 
         with torch.no_grad():
             samples = comfy.sample.sample(

@@ -66,8 +66,6 @@ class RayInitializer:
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 
-        os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
-        os.environ["NCCL_DEBUG"] = "WARN"
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         self.parallel_dict = dict()
@@ -320,9 +318,6 @@ class XFuserKSamplerAdvanced:
 
     RETURN_TYPES = (
         "LATENT",
-        "LATENT",
-        "LATENT",
-        "LATENT",
     )
     FUNCTION = "ray_sample"
 
@@ -377,18 +372,182 @@ class XFuserKSamplerAdvanced:
         ]
 
         results = ray.get(futures)
-        return tuple(result[0] for result in results[0:4])
+        return (results[0][0],)
+
+
+class DPKSamplerAdvanced:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "add_noise": (["enable", "disable"],),
+                "noise_seed_1": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "control_after_generate": True,
+                    },
+                ),
+                "noise_seed_2": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "control_after_generate": True,
+                    },
+                ),
+                "noise_seed_3": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "control_after_generate": True,
+                    },
+                ),
+                "noise_seed_4": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                        "control_after_generate": True,
+                    },
+                ),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                "cfg": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.1,
+                        "round": 0.01,
+                    },
+                ),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "ray_actors": (
+                    "RAY_ACTORS",
+                    {"tooltip": "Ray Actor to submit the model into"},
+                ),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent_image": ("LATENT",),
+                "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
+                "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
+                "return_with_leftover_noise": (["disable", "enable"],),
+            }
+        }
+
+    RETURN_TYPES = (
+        "LATENT",
+    )
+    OUTPUT_IS_LIST = (True, )
+    INPUT_IS_LIST = True
+    FUNCTION = "ray_sample"
+
+    CATEGORY = "Raylight"
+
+    def ray_sample(
+        self,
+        ray_actors,
+        add_noise,
+        noise_seed_1,  # Yep for now i do this
+        noise_seed_2,
+        noise_seed_3,
+        noise_seed_4,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        positive,
+        negative,
+        latent_image,
+        start_at_step,
+        end_at_step,
+        return_with_leftover_noise,
+        denoise=1.0,
+    ):
+
+        ray_actors = ray_actors[0]
+        add_noise = add_noise[0]
+        noise_seed_1 = noise_seed_1[0]
+        noise_seed_2 = noise_seed_2[0]
+        noise_seed_3 = noise_seed_3[0]
+        noise_seed_4 = noise_seed_4[0]
+        steps = steps[0]
+        cfg = cfg[0]
+        sampler_name = sampler_name[0]
+        scheduler = scheduler[0]
+        positive = positive[0]
+        negative = negative[0]
+        start_at_step = start_at_step[0]
+        end_at_step = end_at_step[0]
+        return_with_leftover_noise = return_with_leftover_noise[0]
+
+        latent_image = latent_image
+
+        gpu_actors = ray_actors["workers"]
+        parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
+        if parallel_dict["ulysses_degree"] > 0 or parallel_dict["ring_degree"] > 0:
+            raise ValueError("""
+            Data Parallel KSampler only supports FSDP or standard Data Parallel (DP).
+            Please set both 'ulysses_degree' and 'ring_degree' to 0 or 1,
+            or use the XFuser KSampler instead. More info on Raylight mode https://github.com/komikndr/raylight
+            """)
+
+        # Clean VRAM for preparation to load model
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        force_full_denoise = True
+        if return_with_leftover_noise == "enable":
+            force_full_denoise = False
+        disable_noise = False
+        if add_noise == "disable":
+            disable_noise = True
+
+        noise_seeds = [noise_seed_1, noise_seed_2, noise_seed_3, noise_seed_4]
+
+        futures = [
+            actor.common_ksampler.remote(
+                noise_seeds[i],
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                positive,
+                negative,
+                latent_image[i],
+                denoise=denoise,
+                disable_noise=disable_noise,
+                start_step=start_at_step,
+                last_step=end_at_step,
+                force_full_denoise=force_full_denoise,
+            )
+            for i, actor in enumerate(gpu_actors)
+        ]
+
+        results = ray.get(futures)
+        results = [result[0] for result in results]
+        return (results,)
 
 
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
+    "DPKSamplerAdvanced": DPKSamplerAdvanced,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "XFuserAttentionPatch": "XFuser Attention Patch",
+    "XFuserKSamplerAdvanced": "XFuser KSampler (Advanced)",
+    "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",

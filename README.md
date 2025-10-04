@@ -49,8 +49,6 @@ Its job is to split the model weights among GPUs.
 
 ## RTM and Known Issues
 - Scroll further down for the installation guide.
-- **Rule of thumb**, if have enough VRAM just use USP, if not, FSDP, if it still not enough, use FSDP CPU Offload
-- FSDP CPU Offload is for ultra low VRAM, there will be a performance hit of course
 - If NCCL communication fails before running (e.g., watchdog timeout), set the following environment variables:
   ```bash
   export NCCL_P2P_DISABLE=1
@@ -60,6 +58,33 @@ Its job is to split the model weights among GPUs.
 - The tested model is the WanModel variant. The next model to be supported will be determined by usage popularity (Flux, Qwen, Hunyuan).
 - Non-DiT models are not supported.
 - Example WF just open from your comfyui menu and browse templates
+
+## Operation
+
+### Mode
+
+**Sequence Parallel**
+This mode splits the sequence among GPUs, the full model will be loaded into each GPU.
+Use the XFuser KSampler to increase the Ulysses degree according to the number of your GPUs,
+while keeping the Ring degree at 1 for small systems.
+
+**Data Parallel**
+The full sequence will be processed independently on each GPU.
+Use the Data Parallel KSampler. There are two options, enable FSDP, or disable all options in `Ray Init Actor`.
+By disabling them, it will run in DP mode. Both FSDP and DP modes must have the Ulysses and Ring degrees set to
+either 0 or 1. If you want to use acceleration such as SageAttn, you must set both Ulysses and Ring to 1.
+
+FSDP will shard the weights, but each GPU will still work independently,
+as the name suggests, Fully Sharded (Weight) Data Parallel.
+
+**Sequence + FSDP**
+Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser KSampler.
+
+### Side Notes
+- **Rule of thumb**, if you have enough VRAM, just use USP, if not, enable the FSDP, and if that is still not enough,
+  enable also the FSDP CPU Offload.
+- FSDP CPU Offload is intended for systems with very low VRAM, though it will come with a performance hit work akin to
+  DisTorch from MultiGPU.
 
 ## GPU Architectures
 
