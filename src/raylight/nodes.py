@@ -489,16 +489,17 @@ class DPKSamplerAdvanced:
         end_at_step = end_at_step[0]
         return_with_leftover_noise = return_with_leftover_noise[0]
 
-        latent_image = latent_image
-
         gpu_actors = ray_actors["workers"]
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
-        if parallel_dict["ulysses_degree"] > 0 or parallel_dict["ring_degree"] > 0:
+        if parallel_dict["is_xdit"] is True:
             raise ValueError("""
             Data Parallel KSampler only supports FSDP or standard Data Parallel (DP).
             Please set both 'ulysses_degree' and 'ring_degree' to 0,
             or use the XFuser KSampler instead. More info on Raylight mode https://github.com/komikndr/raylight
             """)
+
+        if len(latent_image) != len(gpu_actors):
+            latent_image = [latent_image[0]] * len(gpu_actors)
 
         # Clean VRAM for preparation to load model
         gc.collect()
@@ -552,3 +553,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
 }
+
