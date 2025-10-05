@@ -37,5 +37,4 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
         ),
     )
 
-    print("SHARD COMPLETE")
     return model
