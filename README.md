@@ -44,6 +44,7 @@ Its job is to split the model weights among GPUs.
 
 - **Raylight**
   Provides both tensor parallelism (USP) and model weight sharding (FSDP).
+  Your GPUs will 100% being used at the same time.
   This enables efficient multi-GPU utilization and scales beyond single high-memory GPUs (e.g., RTX 4090/5090).
 
 

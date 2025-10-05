@@ -1,8 +1,8 @@
 {
   "id": "b590dcc4-90de-4786-b0a4-6b9020fb3eb3",
   "revision": 0,
-  "last_node_id": 45,
-  "last_link_id": 42,
+  "last_node_id": 46,
+  "last_link_id": 48,
   "nodes": [
     {
       "id": 20,
@@ -65,7 +65,7 @@
         {
           "name": "samples",
           "type": "LATENT",
-          "link": 23
+          "link": 48
         },
         {
           "name": "vae",
@@ -328,7 +328,7 @@
           "type": "LATENT",
           "slot_index": 0,
           "links": [
-            18
+            46
           ]
         }
       ],
@@ -656,121 +656,6 @@
       ]
     },
     {
-      "id": 14,
-      "type": "XFuserKSamplerAdvanced",
-      "pos": [
-        1640,
-        340
-      ],
-      "size": [
-        304.748046875,
-        334
-      ],
-      "flags": {},
-      "order": 18,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "link": 42
-        },
-        {
-          "name": "positive",
-          "type": "CONDITIONING",
-          "link": 32
-        },
-        {
-          "name": "negative",
-          "type": "CONDITIONING",
-          "link": 34
-        },
-        {
-          "name": "latent_image",
-          "type": "LATENT",
-          "link": 18
-        }
-      ],
-      "outputs": [
-        {
-          "name": "LATENT",
-          "type": "LATENT",
-          "links": [
-            23
-          ]
-        },
-        {
-          "name": "LATENT",
-          "type": "LATENT",
-          "links": null
-        },
-        {
-          "name": "LATENT",
-          "type": "LATENT",
-          "links": null
-        },
-        {
-          "name": "LATENT",
-          "type": "LATENT",
-          "links": null
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "XFuserKSamplerAdvanced",
-        "cnr_id": "raylight",
-        "ver": "0.2.0"
-      },
-      "widgets_values": [
-        "enable",
-        546815791065292,
-        "randomize",
-        4,
-        1,
-        "uni_pc",
-        "simple",
-        0,
-        10000,
-        "disable"
-      ]
-    },
-    {
-      "id": 34,
-      "type": "easy cleanGpuUsed",
-      "pos": [
-        1397.2000732421875,
-        751.2163696289062
-      ],
-      "size": [
-        157.38925170898438,
-        26
-      ],
-      "flags": {},
-      "order": 15,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "anything",
-          "type": "*",
-          "link": 33
-        }
-      ],
-      "outputs": [
-        {
-          "name": "output",
-          "type": "*",
-          "links": [
-            34
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "easy cleanGpuUsed",
-        "cnr_id": "comfyui-easy-use",
-        "ver": "3f37ba9491fa7f6c8520dda6cf92a8e2dcbee8fa"
-      },
-      "widgets_values": []
-    },
-    {
       "id": 33,
       "type": "easy cleanGpuUsed",
       "pos": [
@@ -796,7 +681,7 @@
           "name": "output",
           "type": "*",
           "links": [
-            32
+            44
           ]
         }
       ],
@@ -833,7 +718,7 @@
           "name": "ray_actors",
           "type": "RAY_ACTORS",
           "links": [
-            42
+            43
           ]
         }
       ],
@@ -842,6 +727,104 @@
       },
       "widgets_values": [
         8
+      ]
+    },
+    {
+      "id": 34,
+      "type": "easy cleanGpuUsed",
+      "pos": [
+        1397.2000732421875,
+        751.2163696289062
+      ],
+      "size": [
+        157.38925170898438,
+        26
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "type": "*",
+          "link": 33
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            47
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "easy cleanGpuUsed",
+        "cnr_id": "comfyui-easy-use",
+        "ver": "3f37ba9491fa7f6c8520dda6cf92a8e2dcbee8fa"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 46,
+      "type": "XFuserKSamplerAdvanced",
+      "pos": [
+        1634.181884765625,
+        336.6947937011719
+      ],
+      "size": [
+        304.748046875,
+        334
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 43
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 44
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 47
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 46
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            48
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "XFuserKSamplerAdvanced"
+      },
+      "widgets_values": [
+        "enable",
+        0,
+        "randomize",
+        4,
+        1,
+        "euler",
+        "simple",
+        0,
+        10000,
+        "disable"
       ]
     }
   ],
@@ -863,14 +846,6 @@
       "CLIP"
     ],
     [
-      18,
-      19,
-      0,
-      14,
-      3,
-      "LATENT"
-    ],
-    [
       21,
       21,
       0,
@@ -885,14 +860,6 @@
       23,
       0,
       "VIDEO"
-    ],
-    [
-      23,
-      14,
-      0,
-      21,
-      0,
-      "LATENT"
     ],
     [
       24,
@@ -919,28 +886,12 @@
       "*"
     ],
     [
-      32,
-      33,
-      0,
-      14,
-      1,
-      "CONDITIONING"
-    ],
-    [
       33,
       20,
       0,
       34,
       0,
       "*"
-    ],
-    [
-      34,
-      34,
-      0,
-      14,
-      2,
-      "CONDITIONING"
     ],
     [
       35,
@@ -975,22 +926,54 @@
       "RAY_ACTORS"
     ],
     [
-      42,
+      43,
       45,
       0,
-      14,
+      46,
       0,
       "RAY_ACTORS"
+    ],
+    [
+      44,
+      33,
+      0,
+      46,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      46,
+      19,
+      0,
+      46,
+      3,
+      "LATENT"
+    ],
+    [
+      47,
+      34,
+      0,
+      46,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      48,
+      46,
+      0,
+      21,
+      0,
+      "LATENT"
     ]
   ],
   "groups": [],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.9849732675807645,
+      "scale": 1.0834705943388416,
       "offset": [
-        -268.67507908422994,
-        -177.98118962197037
+        -892.1209140026943,
+        -99.49371810617129
       ]
     },
     "frontendVersion": "1.26.11"
