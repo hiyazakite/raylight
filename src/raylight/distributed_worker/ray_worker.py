@@ -188,6 +188,7 @@ class RayWorker:
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
         if self.parallel_dict["is_fsdp"] is True:
+            raise ValueError("FSDP Sharding of GGUF is not supported")
             import comfy.model_patcher as model_patcher
             import comfy.model_management as model_management
 
