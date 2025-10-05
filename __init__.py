@@ -1,5 +1,7 @@
 import sys
 import os
+from pathlib import Path
+import importlib.util
 
 # Comfy dynamic lib loader cause the module imported as a path instead of normal python path
 # e.g /home/user/ComfyUI/custom_nodes/raylight.src.raylight.etc
@@ -15,6 +17,28 @@ if src_dir not in sys.path:
 comfy_dir = os.path.abspath(os.path.join(this_dir, "../../comfy"))
 if comfy_dir not in sys.path:
     sys.path.insert(0, comfy_dir)
+
+
+# For ComfyUI GGUF
+try:
+    current_file = Path(__file__).resolve()
+
+    comfy_root = None
+    for parent in current_file.parents:
+        if parent.name == "ComfyUI":
+            comfy_root = parent
+            break
+
+    gguf_path = comfy_root / "custom_nodes" / "ComfyUI-GGUF"
+    module_init = gguf_path / "__init__.py"
+
+    spec = importlib.util.spec_from_file_location("comfyui_gguf", module_init)
+    comfyui_gguf = importlib.util.module_from_spec(spec)
+    sys.modules["comfyui_gguf"] = comfyui_gguf
+    spec.loader.exec_module(comfyui_gguf)
+except Exception as e:
+    print("City96-GGUF Not available")
+# For ComfyUI GGUF
 
 
 from raylight.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS

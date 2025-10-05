@@ -1,13 +1,12 @@
 import logging
-import gc
 
-import torch.distributed as dist
+import torch
 
 from raylight import comfy_dist
 
 import comfy
 from comfy.sd import model_detection_error_hint
-from comfy import model_detection, model_management, model_base
+from comfy import model_detection, model_management
 
 
 def load_lora_for_models(model, lora, strength_model):
@@ -34,8 +33,7 @@ def load_lora_for_models(model, lora, strength_model):
     return new_modelpatcher
 
 
-def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}):
-    sd = comfy.utils.load_torch_file(unet_path)
+def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={}):
     dtype = model_options.get("dtype", None)
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
     temp_sd = comfy.utils.state_dict_prefix_replace(
@@ -113,11 +111,42 @@ def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, mode
     state_dict = model_patcher.model_state_dict()
     model_patcher.model.to("meta")
 
-    if model_patcher is None:
-        logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
-        raise RuntimeError(
-            "ERROR: Could not detect model type of: {}\n{}".format(
-                unet_path, model_detection_error_hint(unet_path, sd)
-            )
-        )
     return model_patcher, state_dict
+
+
+def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}):
+    sd = comfy.utils.load_torch_file(unet_path)
+    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options=model_options)
+    if model is None:
+        logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
+        raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
+    return model, state_dict
+
+
+def fsdp_gguf_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}, dequant_dtype=None, patch_dtype=None):
+    from comfyui_gguf.ops import GGMLOps
+    from comfyui_gguf.loader import gguf_sd_loader
+
+    ops = GGMLOps()
+
+    if dequant_dtype in ("default", None):
+        ops.Linear.dequant_dtype = None
+    elif dequant_dtype in ["target"]:
+        ops.Linear.dequant_dtype = dequant_dtype
+    else:
+        ops.Linear.dequant_dtype = getattr(torch, dequant_dtype)
+
+    if patch_dtype in ("default", None):
+        ops.Linear.patch_dtype = None
+    elif patch_dtype in ["target"]:
+        ops.Linear.patch_dtype = patch_dtype
+    else:
+        ops.Linear.patch_dtype = getattr(torch, patch_dtype)
+
+    # init model
+    sd = gguf_sd_loader(unet_path)
+    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options=model_options)
+    if model is None:
+        logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
+        raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
+    return model, state_dict

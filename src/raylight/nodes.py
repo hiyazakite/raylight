@@ -14,7 +14,7 @@ from raylight.comfy_extra_dist.ray_patch_decorator import ray_patch
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
     ensure_fresh_actors,
-    ray_nccl_tester
+    ray_nccl_tester,
 )
 
 
@@ -30,16 +30,19 @@ class RayInitializer:
                 "ring_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
-                "XFuser_attention": ([
-                    "TORCH",
-                    "FLASH_ATTN",
-                    "FLASH_ATTN_3",
-                    "SAGE_AUTO_DETECT",
-                    "SAGE_FP16_TRITON",
-                    "SAGE_FP16_CUDA",
-                    "SAGE_FP8_CUDA",
-                    "SAGE_FP8_SM90"
-                ], {"default": "TORCH"})
+                "XFuser_attention": (
+                    [
+                        "TORCH",
+                        "FLASH_ATTN",
+                        "FLASH_ATTN_3",
+                        "SAGE_AUTO_DETECT",
+                        "SAGE_FP16_TRITON",
+                        "SAGE_FP16_CUDA",
+                        "SAGE_FP8_CUDA",
+                        "SAGE_FP8_SM90",
+                    ],
+                    {"default": "TORCH"},
+                ),
             }
         }
 
@@ -58,7 +61,7 @@ class RayInitializer:
         ring_degree,
         FSDP,
         FSDP_CPU_OFFLOAD,
-        XFuser_attention
+        XFuser_attention,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -83,9 +86,7 @@ class RayInitializer:
                 f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}"
             )
         if FSDP is True and (world_size == 1):
-            raise ValueError(
-                "ERROR, FSDP cannot be use in single cuda/cudalike device"
-            )
+            raise ValueError("ERROR, FSDP cannot be use in single cuda/cudalike device")
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
@@ -127,7 +128,14 @@ class RayUNETLoader:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "weight_dtype": (
-                    ["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2", "bf16", "fp16"],
+                    [
+                        "default",
+                        "fp8_e4m3fn",
+                        "fp8_e4m3fn_fast",
+                        "fp8_e5m2",
+                        "bf16",
+                        "fp16",
+                    ],
                 ),
                 "ray_actors_init": (
                     "RAY_ACTORS_INIT",
@@ -155,28 +163,97 @@ class RayUNETLoader:
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
 
-        #  Collect compute capabilities from Ray workers
-        cc_futures = []
+        unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+
+        loaded_futures = []
+        patched_futures = []
+
         for actor in gpu_actors:
-            cc_futures.append(
-                actor.get_compute_capability.remote()
-            )
+            loaded_futures.append(actor.set_lora_list.remote(lora))
+        ray.get(loaded_futures)
+        loaded_futures = []
 
-        compute_capabilities = [ray.get(cc) for cc in cc_futures]
-        unique_cc = set(compute_capabilities)
+        if parallel_dict["is_fsdp"] is True:
+            worker0 = ray.get_actor("RayWorker:0")
+            ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
+            meta_model = ray.get(worker0.get_meta_model.remote())
 
-        if len(unique_cc) > 1:
-            print(f"Multiple device architectures detected: {unique_cc}, choosing the oldest")
-            oldest = min(unique_cc)
+            for actor in gpu_actors:
+                if actor != worker0:
+                    loaded_futures.append(actor.set_meta_model.remote(meta_model))
+
+            ray.get(loaded_futures)
+            loaded_futures = []
+
+            for actor in gpu_actors:
+                loaded_futures.append(actor.set_state_dict.remote())
+
+            ray.get(loaded_futures)
+            loaded_futures = []
         else:
-            oldest = next(iter(unique_cc))
+            for actor in gpu_actors:
+                loaded_futures.append(
+                    actor.load_unet.remote(unet_path, model_options=model_options)
+                )
+            ray.get(loaded_futures)
+            loaded_futures = []
 
-        device_arch = oldest
-        # Check for flash_attn compatibility
-        if parallel_dict["is_xdit"] is True and device_arch <= 61:
-            raise ValueError(
-                f"Pascal detected (sm{device_arch}), cannot use USP"
-            )
+        for actor in gpu_actors:
+            if parallel_dict["is_xdit"]:
+                patched_futures.append(actor.patch_usp.remote())
+
+        ray.get(patched_futures)
+
+        return (ray_actors,)
+
+
+class RayGGUFLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "unet_name": (folder_paths.get_filename_list("unet"),),
+                "dequant_dtype": (
+                    ["default", "target", "float32", "float16", "bfloat16"],
+                    {"default": "default"},
+                ),
+                "patch_dtype": (
+                    ["default", "target", "float32", "float16", "bfloat16"],
+                    {"default": "default"},
+                ),
+                "ray_actors_init": (
+                    "RAY_ACTORS_INIT",
+                    {"tooltip": "Ray Actor to submit the model into"},
+                ),
+            },
+            "optional": {"lora": ("RAY_LORA", {"default": None})},
+        }
+
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
+    FUNCTION = "load_ray_unet"
+
+    CATEGORY = "Raylight"
+
+    def load_ray_unet(
+        self,
+        ray_actors_init,
+        unet_name,
+        weight_dtype,
+        dequant_dtype,
+        patch_dtype,
+        lora=None,
+    ):
+        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+
+        model_options = {}
+        if weight_dtype == "fp8_e4m3fn":
+            model_options["dtype"] = torch.float8_e4m3fn
+        elif weight_dtype == "fp8_e4m3fn_fast":
+            model_options["dtype"] = torch.float8_e4m3fn
+            model_options["fp8_optimizations"] = True
+        elif weight_dtype == "fp8_e5m2":
+            model_options["dtype"] = torch.float8_e5m2
 
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
@@ -184,15 +261,20 @@ class RayUNETLoader:
         patched_futures = []
 
         for actor in gpu_actors:
-            loaded_futures.append(
-                actor.set_lora_list.remote(lora)
-            )
+            loaded_futures.append(actor.set_lora_list.remote(lora))
         ray.get(loaded_futures)
         loaded_futures = []
 
         if parallel_dict["is_fsdp"] is True:
             worker0 = ray.get_actor("RayWorker:0")
-            ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
+            ray.get(
+                worker0.load_unet.remote(
+                    unet_path,
+                    model_options=model_options,
+                    dequant_dtype=dequant_dtype,
+                    patch_dtype=patch_dtype,
+                )
+            )
             meta_model = ray.get(worker0.get_meta_model.remote())
 
             for actor in gpu_actors:
@@ -244,9 +326,7 @@ class RayLoraLoader:
                     },
                 ),
             },
-            "optional": {
-                "prev_ray_lora": ("RAY_LORA", {"default": None})
-            }
+            "optional": {"prev_ray_lora": ("RAY_LORA", {"default": None})},
         }
 
     RETURN_TYPES = ("RAY_LORA",)
@@ -316,9 +396,7 @@ class XFuserKSamplerAdvanced:
             }
         }
 
-    RETURN_TYPES = (
-        "LATENT",
-    )
+    RETURN_TYPES = ("LATENT",)
     FUNCTION = "ray_sample"
 
     CATEGORY = "Raylight"
@@ -443,10 +521,8 @@ class DPKSamplerAdvanced:
             }
         }
 
-    RETURN_TYPES = (
-        "LATENT",
-    )
-    OUTPUT_IS_LIST = (True, )
+    RETURN_TYPES = ("LATENT",)
+    OUTPUT_IS_LIST = (True,)
     INPUT_IS_LIST = True
     FUNCTION = "ray_sample"
 
@@ -492,11 +568,13 @@ class DPKSamplerAdvanced:
         gpu_actors = ray_actors["workers"]
         parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
         if parallel_dict["is_xdit"] is True:
-            raise ValueError("""
+            raise ValueError(
+                """
             Data Parallel KSampler only supports FSDP or standard Data Parallel (DP).
             Please set both 'ulysses_degree' and 'ring_degree' to 0,
             or use the XFuser KSampler instead. More info on Raylight mode https://github.com/komikndr/raylight
-            """)
+            """
+            )
 
         if len(latent_image) != len(gpu_actors):
             latent_image = [latent_image[0]] * len(gpu_actors)
@@ -553,4 +631,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
 }
-
