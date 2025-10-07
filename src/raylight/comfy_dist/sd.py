@@ -123,35 +123,6 @@ def fsdp_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, mode
     return model, state_dict
 
 
-def fsdp_gguf_load_diffusion_model(unet_path, rank, device_mesh, is_cpu_offload, model_options={}, dequant_dtype=None, patch_dtype=None):
-    from raylight.expansion.comfyui_gguf.ops import GGMLOps
-    from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader
-
-    ops = GGMLOps()
-
-    if dequant_dtype in ("default", None):
-        ops.Linear.dequant_dtype = None
-    elif dequant_dtype in ["target"]:
-        ops.Linear.dequant_dtype = dequant_dtype
-    else:
-        ops.Linear.dequant_dtype = getattr(torch, dequant_dtype)
-
-    if patch_dtype in ("default", None):
-        ops.Linear.patch_dtype = None
-    elif patch_dtype in ["target"]:
-        ops.Linear.patch_dtype = patch_dtype
-    else:
-        ops.Linear.patch_dtype = getattr(torch, patch_dtype)
-
-    # init model
-    sd = gguf_sd_loader(unet_path)
-    model, state_dict = fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={"custom_operations": ops})
-    if model is None:
-        logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
-        raise RuntimeError("ERROR: Could not detect model type of: {}\n{}".format(unet_path, model_detection_error_hint(unet_path, sd)))
-    return model, state_dict
-
-
 def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, patch_dtype=None):
     from raylight.expansion.comfyui_gguf.ops import GGMLOps
     from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader

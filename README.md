@@ -5,6 +5,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
 ## UPDATE
+- GGUF added thanks to [City96](https://github.com/city96/ComfyUI-GGUF), only in USP mode, not in FSDP
 - Reworked the entire FSDP loader. Model loading should now be more stable and faster,
   as Raylight no longer kills active workers to reset the model state.
   Previously, this was necessary because Comfy could not remove FSDP models from VRAM, which caused memory leaks.

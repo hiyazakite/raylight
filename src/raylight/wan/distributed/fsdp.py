@@ -1,17 +1,10 @@
-import torch
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from raylight.distributed_modules.utils import detect_dtype_mismatch, ensure_no_scalar
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 
 
 def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
-    for name, tensor in model_state_dict.items():
-        print(f"{name}: {tensor.dtype} | shape={tuple(tensor.shape)}")
     diffusion_model = model.diffusion_model
-
-    print("AAAAAAAAAAa")
-    for name, param in diffusion_model.named_parameters():
-        print(f"{name}: {param.dtype} K Shape={param.shape}")
     # Shard only the blocks, since other modules have different dtype
     # Collect params we want to ignore (everything except blocks)
     ignored_params = set()
@@ -32,7 +25,6 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
 
     fully_shard(diffusion_model, ignored_params=ignored_params, reshard_after_forward=True)
     model.diffusion_model = diffusion_model
-
 
     # CPU OFFLOAD ONLY FOR LOW END OF THE LOWEND
     set_model_state_dict(

@@ -1,7 +1,5 @@
 import sys
 import os
-from pathlib import Path
-import importlib.util
 
 # Comfy dynamic lib loader cause the module imported as a path instead of normal python path
 # e.g /home/user/ComfyUI/custom_nodes/raylight.src.raylight.etc
@@ -31,6 +29,19 @@ if os.getenv("debug_raylight") == "1":
     from raylight.nodes_debug import NODE_DISPLAY_NAME_MAPPINGS as DEBUG_NODE_DISPLAY_NAME_MAPPINGS
     NODE_CLASS_MAPPINGS.update(DEBUG_NODE_CLASS_NAME_MAPPINGS)
     NODE_DISPLAY_NAME_MAPPINGS.update(DEBUG_NODE_DISPLAY_NAME_MAPPINGS)
+
+gguf_dir = os.path.join(this_dir, "..", "ComfyUI-GGUF")
+print(gguf_dir)
+gguf_dir = os.path.abspath(gguf_dir)
+print(gguf_dir)
+
+if os.path.isdir(gguf_dir):
+    from raylight.expansion.comfyui_gguf.nodes import NODE_CLASS_MAPPINGS as GGUF_NODE_CLASS_MAPPINGS
+    from raylight.expansion.comfyui_gguf.nodes import NODE_DISPLAY_NAME_MAPPINGS as GGUF_NODE_DISPLAY_NAME_MAPPINGS
+    NODE_CLASS_MAPPINGS.update(GGUF_NODE_CLASS_MAPPINGS)
+    NODE_DISPLAY_NAME_MAPPINGS.update(GGUF_NODE_DISPLAY_NAME_MAPPINGS)
+else:
+    print("City96 GGUF not found, GGUF ray loader disable")
 
 
 # CLASS
