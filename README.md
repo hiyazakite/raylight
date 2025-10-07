@@ -11,7 +11,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
   Previously, this was necessary because Comfy could not remove FSDP models from VRAM, which caused memory leaks.
 - No need to install FlashAttn.
 - SageAttn is now supported.
-- Full FSDP support for Qwen, Flux, and Hunyuan Video.
+- Full FSDP support for Wan, Qwen, Flux, and Hunyuan Video.
 - Qwen USP can't do any square dimension, only 1280x1280 that's working, so pick any dim that's is not square
 - Full LoRA support.
 - FSDP CPU offload, analogous to block swap/DisTorch.
@@ -34,7 +34,7 @@ Its job is to split the model weights among GPUs.
 
 **TLDR:** Raylight is multi-GPU nodes for Comfy, USP for splitting the work, and FSDP for splitting the model weights.
 
-### Raylight vs MultiGPU vs ComfyUI Worksplit branch
+### Raylight vs MultiGPU vs ComfyUI Worksplit branch vs ComfyUI-Distributed
 - [MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU)
   Loads models selectively on specified GPUs without sharing workload.
   Includes CPU RAM offloading, which benefits single-GPU users.
@@ -48,7 +48,7 @@ Its job is to split the model weights among GPUs.
   Easily connect to local/remote/cloud worker like RunPod.
 
 - **Raylight**
-  Provides both tensor parallelism (USP) and model weight sharding (FSDP).
+  Provides both tensor split in sequence parallelism (USP) and model weight sharding (FSDP).
   Your GPUs will 100% being used at the same time. In technical sense it _combine your VRAM_.
   This enables efficient multi-GPU utilization and scales beyond single high-memory GPUs (e.g., RTX 4090/5090).
 
