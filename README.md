@@ -39,13 +39,17 @@ Its job is to split the model weights among GPUs.
   Loads models selectively on specified GPUs without sharing workload.
   Includes CPU RAM offloading, which benefits single-GPU users.
 
-- [ComfyUI Worksplit branch](https://github.com/comfyanonymous/ComfyUI/tree/worksplit-multigpu)
+- [ComfyUI Worksplit branch](https://github.com/comfyanonymous/ComfyUI/pull/7063)
   Splits workload at the CFG level, not at the tensor level.
   Since most workflows use `CFG=1.0` like Wan with Lora, this approach provides limited use cases.
 
+- [ComfyUI-Distributed](https://github.com/robertvoy/ComfyUI-Distributed)
+  Distribute jobs among workers. Run your workflow on multiple GPUs simultaneously with varied seeds.
+  Easily connect to local/remote/cloud worker like RunPod.
+
 - **Raylight**
   Provides both tensor parallelism (USP) and model weight sharding (FSDP).
-  Your GPUs will 100% being used at the same time.
+  Your GPUs will 100% being used at the same time. In technical sense it _combine your VRAM_.
   This enables efficient multi-GPU utilization and scales beyond single high-memory GPUs (e.g., RTX 4090/5090).
 
 
@@ -57,9 +61,9 @@ Its job is to split the model weights among GPUs.
   export NCCL_SHM_DISABLE=1
   ```
 - **Windows** is in partial testing, switch to `dev` branch to test it. And scroll down below for more information
-- The tested model is the WanModel variant. The next model to be supported will be determined by usage popularity (Flux, Qwen, Hunyuan).
-- Non-DiT models are not supported.
+- Non-DiT models are not supported (SDXL, SD1.5).
 - Example WF just open from your comfyui menu and browse templates
+- **GPU Topology** is very important, not all PCIe in your motherboard is equal.
 
 ## Operation
 
@@ -269,7 +273,7 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
    ```
 4. Highly experimental — please open an issue if you encounter errors.
 5. Advisable to run in WSL since windows does not have NCCL support from PyTorch, raylight will run using GLOO,
-   which is slower than NCCL
+   which is slower than NCCL. Might not even worth it to run in windows other than WSL.
 
 
 
