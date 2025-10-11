@@ -4,6 +4,18 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
+## Curent WIP Notice: XDiT PipeFusion
+You may notice that my repository won’t receive updates on the main branch for a while, 
+except for requests to implement sequence parallelism for certain models like NVIDIA Cosmos or for critical bug fixes.
+This is because I’m reworking (again...) **Raylight** and, by extension, the **ComfyUI** model loader to 
+support [PipeFusion](https://github.com/xdit-project/xDiT/blob/main/docs/methods/pipefusion.md).
+
+PipeFusion will address many existing issues, such as GPU interconnect speed and compatibility 
+with un-FSDP-ed models like GGUF. Its main advantage is that it eliminates bandwidth strain entirely.
+
+Reason why it will be a long process is because XFuser use Diffuser style `class` from HF, different from ComfyUI.
+So I will have to rewrote a major code from XDiT PipeFusion into Comfy compatible
+
 ## UPDATE
 - Chroma support for FSDP and USP
 - GGUF added thanks to [City96](https://github.com/city96/ComfyUI-GGUF), only in USP mode, not in FSDP
