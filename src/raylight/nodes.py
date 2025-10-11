@@ -110,7 +110,6 @@ class RayInitializer:
                 namespace=ray_cluster_namespace,
                 runtime_env={
                     "py_modules": [raylight],
-                    "working_dir": "/home/pandaemon/ComfyUI/custom_nodes",
                 },
             )
         except Exception as e:
@@ -118,7 +117,6 @@ class RayInitializer:
             ray.init(
                 runtime_env={
                     "py_modules": [raylight],
-                    "working_dir": "/home/pandaemon/ComfyUI/custom_nodes",
                 }
             )
             raise RuntimeError(f"Ray connection failed: {e}")
