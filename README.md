@@ -5,6 +5,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
 ## UPDATE
+- Chroma support for FSDP and USP
 - GGUF added thanks to [City96](https://github.com/city96/ComfyUI-GGUF), only in USP mode, not in FSDP
 - Reworked the entire FSDP loader. Model loading should now be more stable and faster,
   as Raylight no longer kills active workers to reset the model state.
@@ -147,6 +148,14 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Flux Konteks      | ✅  | ✅   |
 | Flux Krea         | ✅  | ✅   |
 | Flux ControlNet   | ❌  | ❌   |
+
+
+**Chroma**
+| Model             | USP | FSDP |
+|-------------------|-----|------|
+| Chroma            | ✅  | ✅   |
+| Chroma Radiance   | ❌  | ❌   |
+| Chroma ControlNet | ❌  | ❌   |
 
 
 **Qwen**

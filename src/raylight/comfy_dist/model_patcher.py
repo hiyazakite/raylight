@@ -230,6 +230,10 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                 from ..flux.distributed.fsdp import shard_model_fsdp2
                 self.model = shard_model_fsdp2(self.model, self.fsdp_state_dict, self.is_cpu_offload)
 
+            elif isinstance(self.model, model_base.Chroma):
+                from ..chroma.distributed.fsdp import shard_model_fsdp2
+                self.model = shard_model_fsdp2(self.model, self.fsdp_state_dict, self.is_cpu_offload)
+
             elif isinstance(self.model, model_base.QwenImage):
                 from ..qwen_image.distributed.fsdp import shard_model_fsdp2
                 self.model = shard_model_fsdp2(self.model, self.fsdp_state_dict, self.is_cpu_offload)

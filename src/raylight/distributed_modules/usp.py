@@ -45,6 +45,21 @@ def usp_inject_callback(
                 block.cross_attn.forward = types.MethodType(usp_i2v_cross_attn_forward, block.cross_attn)
         model.forward_orig = types.MethodType(usp_dit_forward, model)
 
+    elif isinstance(base_model, model_base.Chroma):
+        from ..chroma.distributed.xdit_context_parallel import (
+            usp_dit_forward,
+            usp_single_stream_forward,
+            usp_double_stream_forward
+        )
+
+        model = base_model.diffusion_model
+        print("Initializing USP")
+        for block in model.double_blocks:
+            block.forward = types.MethodType(usp_double_stream_forward, block)
+        for block in model.single_blocks:
+            block.forward = types.MethodType(usp_single_stream_forward, block)
+        model.forward_orig = types.MethodType(usp_dit_forward, model)
+
     elif isinstance(base_model, model_base.Flux):
         from ..flux.distributed.xdit_context_parallel import (
             usp_dit_forward,
