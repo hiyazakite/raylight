@@ -1,0 +1,77 @@
+from torch.distributed.fsdp import FSDPModule
+from comfy import model_base
+
+from ..wan.distributed.fsdp import shard_model_fsdp2 as wan_shard
+from ..flux.distributed.fsdp import shard_model_fsdp2 as flux_shard
+from ..chroma.distributed.fsdp import shard_model_fsdp2 as chroma_shard
+from ..qwen_image.distributed.fsdp import shard_model_fsdp2 as qwen_shard
+from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2 as hunyuan_shard
+
+
+class FSDPShardRegistry:
+    _REGISTRY = {}
+
+    @classmethod
+    def register(cls, model_class):
+        """Register a model class and its FSDP shard handler."""
+        def decorator(shard_func):
+            cls._REGISTRY[model_class] = shard_func
+            return shard_func
+        return decorator
+
+    @classmethod
+    def wrap(cls, model, fsdp_state_dict=None, cpu_offload=False):
+        """Find the right shard function based on model type."""
+        for registered_cls, shard_func in cls._REGISTRY.items():
+            if isinstance(model, registered_cls):
+                print(f"[FSDPRegistry] Wrapping {registered_cls.__name__}")
+                return shard_func(model, fsdp_state_dict, cpu_offload)
+        raise ValueError(f"{type(model).__name__} is not supported for FSDP")
+
+
+# Register per-model handlers
+
+@FSDPShardRegistry.register(model_base.WAN21)
+@FSDPShardRegistry.register(model_base.WAN22)
+def _wrap_wan(model, sd, cpu_offload):
+    return wan_shard(model, sd, cpu_offload)
+
+
+@FSDPShardRegistry.register(model_base.Flux)
+def _wrap_flux(model, sd, cpu_offload):
+    return flux_shard(model, sd, cpu_offload)
+
+
+@FSDPShardRegistry.register(model_base.Chroma)
+def _wrap_chroma(model, sd, cpu_offload):
+    return chroma_shard(model, sd, cpu_offload)
+
+
+@FSDPShardRegistry.register(model_base.QwenImage)
+def _wrap_qwen(model, sd, cpu_offload):
+    return qwen_shard(model, sd, cpu_offload)
+
+
+@FSDPShardRegistry.register(model_base.HunyuanVideo)
+def _wrap_hunyuan(model, sd, cpu_offload):
+    return hunyuan_shard(model, sd, cpu_offload)
+
+
+def patch_fsdp(self):
+    print(f"[Rank {self.rank}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
+
+    if isinstance(self.model.diffusion_model, FSDPModule):
+        print("FSDP already registered, skip wrapping...")
+        return self.model
+
+    try:
+        self.model = FSDPShardRegistry.wrap(
+            self.model,
+            fsdp_state_dict=self.fsdp_state_dict,
+            cpu_offload=self.is_cpu_offload,
+        )
+        print("FSDP registered successfully.")
+    except ValueError as e:
+        raise ValueError(f"{type(self.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP") from e
+
+    return self.model

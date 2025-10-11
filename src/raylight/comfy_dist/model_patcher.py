@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 import collections
+import logging
 
 import torch
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.utils import _free_storage
+from torch.distributed.tensor import DTensor
 
 import comfy
+from comfy.patcher_extension import CallbacksMP
 from comfy.model_patcher import (get_key_weight,
                                  string_to_seed,
                                  move_weight_functions)
 
-from torch.distributed.fsdp import FSDPModule
 from raylight import comfy_dist
-from comfy.patcher_extension import CallbacksMP
-from comfy import model_base
-import logging
-from torch.distributed.utils import _free_storage
-from torch.distributed.tensor import DTensor
+from .fsdp_registry import patch_fsdp
 
 
 class LowVramPatch:
@@ -68,6 +68,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         self.fsdp_state_dict = fsdp_state_dict
         self.device_mesh = device_mesh
         self.is_cpu_offload = is_cpu_offload
+        self.patch_fsdp = patch_fsdp.__get__(self, FSDPModelPatcher)
 
     def config_fsdp(self, rank, device_mesh):
         self.rank = rank
@@ -218,35 +219,6 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                 callback(self, device_to, lowvram_model_memory, force_patch_weights, full_load)
 
             self.apply_hooks(self.forced_hooks, force_apply=True)
-
-    def patch_fsdp(self,):
-        print(f"[Rank {self.rank}] Applying FSDP to {type(self.model.diffusion_model).__name__}")
-        if not isinstance(self.model.diffusion_model, FSDPModule):
-            if isinstance(self.model, model_base.WAN21) or isinstance(self.model, model_base.WAN22):
-                from ..wan.distributed.fsdp import shard_model_fsdp2
-                self.model = shard_model_fsdp2(self.model, self.fsdp_state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model, model_base.Flux):
-                from ..flux.distributed.fsdp import shard_model_fsdp2
-                self.model = shard_model_fsdp2(self.model, self.fsdp_state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model, model_base.Chroma):
-                from ..chroma.distributed.fsdp import shard_model_fsdp2
-                self.model = shard_model_fsdp2(self.model, self.fsdp_state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model, model_base.QwenImage):
-                from ..qwen_image.distributed.fsdp import shard_model_fsdp2
-                self.model = shard_model_fsdp2(self.model, self.fsdp_state_dict, self.is_cpu_offload)
-
-            elif isinstance(self.model, model_base.HunyuanVideo):
-                from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2
-                self.model = shard_model_fsdp2(self.model, self.fsdp_state_dict, self.is_cpu_offload)
-
-            else:
-                raise ValueError(f"{type(self.model.diffusion_model).__name__} IS CURRENTLY NOT SUPPORTED FOR FSDP")
-            print("FSDP registered")
-        else:
-            print("FSDP already registered, skip wrapping...")
 
     def cleanup(self):
         self.clean_hooks()
