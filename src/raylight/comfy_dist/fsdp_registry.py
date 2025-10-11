@@ -13,7 +13,22 @@ class FSDPShardRegistry:
 
     @classmethod
     def register(cls, model_class):
-        """Register a model class and its FSDP shard handler."""
+        """Register a model class and its FSDP shard handler.
+
+        IMPORTANT:
+        Always register the **most specific (child)** model classes FIRST,
+        followed by their **parent/base** classes.
+
+        Example:
+            @FSDPShardRegistry.register(model_base.Chroma)  # subclass of Flux
+            def _wrap_chroma(...): ...
+
+            @FSDPShardRegistry.register(model_base.Flux)
+            def _wrap_flux(...): ...
+
+        This ensures isinstance() checks correctly dispatch to the subclass handler
+        before falling back to the base handler.
+        """
         def decorator(shard_func):
             cls._REGISTRY[model_class] = shard_func
             return shard_func
@@ -37,14 +52,14 @@ def _wrap_wan(model, sd, cpu_offload):
     return wan_shard(model, sd, cpu_offload)
 
 
-@FSDPShardRegistry.register(model_base.Flux)
-def _wrap_flux(model, sd, cpu_offload):
-    return flux_shard(model, sd, cpu_offload)
-
-
 @FSDPShardRegistry.register(model_base.Chroma)
 def _wrap_chroma(model, sd, cpu_offload):
     return chroma_shard(model, sd, cpu_offload)
+
+
+@FSDPShardRegistry.register(model_base.Flux)
+def _wrap_flux(model, sd, cpu_offload):
+    return flux_shard(model, sd, cpu_offload)
 
 
 @FSDPShardRegistry.register(model_base.QwenImage)
