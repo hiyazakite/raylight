@@ -81,7 +81,7 @@ def attention(q, k, v, pe, mask=None) -> Tensor:
     return x
 
 
-def usp_single_stream_forward(self, x: Tensor, pe: Tensor, vec: Tensor, attn_mask=None) -> Tensor:
+def usp_single_stream_forward(self, x: Tensor, pe: Tensor, vec: Tensor, attn_mask=None, **kwargs) -> Tensor:
     mod = vec
     x_mod = torch.addcmul(mod.shift, 1 + mod.scale, self.pre_norm(x))
     qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
@@ -99,7 +99,7 @@ def usp_single_stream_forward(self, x: Tensor, pe: Tensor, vec: Tensor, attn_mas
         return x
 
 
-def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: Tensor, attn_mask=None):
+def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: Tensor, attn_mask=None, **kwargs):
     (img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec
 
     # prepare image for attention

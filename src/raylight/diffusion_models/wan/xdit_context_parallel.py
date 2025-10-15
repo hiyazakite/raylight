@@ -320,7 +320,7 @@ def usp_t2v_cross_attn_forward(self, x, context, **kwargs):
     return x
 
 
-def usp_i2v_cross_attn_forward(self, x, context, context_img_len):
+def usp_i2v_cross_attn_forward(self, x, context, context_img_len, **kwargs):
     r"""
     Args:
         x(Tensor): Shape [B, L1, C]
@@ -343,7 +343,7 @@ def usp_i2v_cross_attn_forward(self, x, context, context_img_len):
     return x
 
 
-def usp_audio_injector(self, x, block_id, audio_emb, audio_emb_global, seq_len):
+def usp_audio_injector(self, x, block_id, audio_emb, audio_emb_global, seq_len, **kwargs):
     audio_attn_id = self.injected_block_id.get(block_id, None)
     x = get_sp_group().all_gather(x, dim=1)
     if audio_attn_id is None:

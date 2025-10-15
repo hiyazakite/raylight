@@ -208,7 +208,7 @@ def usp_dit_forward(
     return img
 
 
-def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims=None) -> Tensor:
+def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims=None, **kwargs) -> Tensor:
     mod, _ = self.modulation(vec)
     qkv, mlp = torch.split(self.linear1(apply_mod(self.pre_norm(x), (1 + mod.scale), mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
@@ -223,7 +223,7 @@ def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mas
     return x
 
 
-def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims_img=None, modulation_dims_txt=None):
+def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims_img=None, modulation_dims_txt=None, **kwargs):
     img_mod1, img_mod2 = self.img_mod(vec)
     txt_mod1, txt_mod2 = self.txt_mod(vec)
 
