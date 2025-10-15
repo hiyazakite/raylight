@@ -17,7 +17,7 @@ import comfy.patcher_extension as pe
 
 import raylight.distributed_worker.context_parallel as cp
 import raylight.distributed_modules.attention as xfuser_attn
-from raylight.distributed_modules.usp import usp_inject_callback
+from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from ray.exceptions import RayActorError
 
@@ -149,9 +149,8 @@ class RayWorker:
     def patch_usp(self):
         self.model.add_callback(
             pe.CallbacksMP.ON_LOAD,
-            usp_inject_callback,
+            USPInjectRegistry.inject,
         )
-        print("USP registered")
 
     def load_unet(self, unet_path, model_options):
         if self.parallel_dict["is_fsdp"] is True:

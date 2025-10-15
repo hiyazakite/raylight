@@ -1,11 +1,11 @@
 from torch.distributed.fsdp import FSDPModule
 from comfy import model_base
 
-from ..wan.distributed.fsdp import shard_model_fsdp2 as wan_shard
-from ..flux.distributed.fsdp import shard_model_fsdp2 as flux_shard
-from ..chroma.distributed.fsdp import shard_model_fsdp2 as chroma_shard
-from ..qwen_image.distributed.fsdp import shard_model_fsdp2 as qwen_shard
-from ..hunyuan_video.distributed.fsdp import shard_model_fsdp2 as hunyuan_shard
+from ..diffusion_models.wan.distributed.fsdp import shard_model_fsdp2 as wan_shard
+from ..diffusion_models.flux.distributed.fsdp import shard_model_fsdp2 as flux_shard
+from ..diffusion_models.chroma.distributed.fsdp import shard_model_fsdp2 as chroma_shard
+from ..diffusion_models.qwen_image.distributed.fsdp import shard_model_fsdp2 as qwen_shard
+from ..diffusion_models.hunyuan_video.distributed.fsdp import shard_model_fsdp2 as hunyuan_shard
 
 
 class FSDPShardRegistry:
