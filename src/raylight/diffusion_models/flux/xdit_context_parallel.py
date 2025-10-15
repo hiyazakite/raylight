@@ -95,6 +95,7 @@ def usp_dit_forward(
     attn_mask: Tensor = None,
 ) -> Tensor:
 
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     # Seq is odd (idk how) if the w == h, so just pad 0 to the end
     img = pad_if_odd(img, dim=1)
     img_ids = pad_if_odd(img_ids, dim=1)
@@ -102,6 +103,7 @@ def usp_dit_forward(
     txt_ids = pad_if_odd(txt_ids, dim=1)
     if y is None:
         y = torch.zeros((img.shape[0], self.params.vec_in_dim), device=img.device, dtype=img.dtype)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
     if img.ndim != 3 or txt.ndim != 3:
@@ -117,6 +119,7 @@ def usp_dit_forward(
     vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
     txt = self.txt_in(txt)
 
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     if img_ids is not None:
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe_combine = self.pe_embedder(ids)
@@ -128,9 +131,9 @@ def usp_dit_forward(
         pe_combine = None
         pe_image = None
 
-    # seq parallel
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.double_blocks):
@@ -169,11 +172,14 @@ def usp_dit_forward(
     if img.dtype == torch.float16:
         img = torch.nan_to_num(img, nan=0.0, posinf=65504, neginf=-65504)
 
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img, dim=1)
     txt = get_sp_group().all_gather(txt, dim=1)
 
     img = torch.cat((txt, img), 1)
+
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     for i, block in enumerate(self.single_blocks):
         if ("single_block", i) in blocks_replace:
             def block_wrap(args):
@@ -200,9 +206,10 @@ def usp_dit_forward(
                 if add is not None:
                     img[:, txt.shape[1]:, ...] += add
 
-    # seq parallel
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img, dim=1)
     img = img[:, txt.shape[1]:, ...]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
     return img

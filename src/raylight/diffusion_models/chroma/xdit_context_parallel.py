@@ -81,6 +81,153 @@ def attention(q, k, v, pe, mask=None) -> Tensor:
     return x
 
 
+def usp_dit_forward(
+    self,
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    timesteps: Tensor,
+    guidance: Tensor = None,
+    control=None,
+    transformer_options={},
+    attn_mask: Tensor = None,
+) -> Tensor:
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    # Seq is odd (idk how) if the w == h, so just pad 0 to the end
+    img = pad_if_odd(img, dim=1)
+    img_ids = pad_if_odd(img_ids, dim=1)
+    txt = pad_if_odd(txt, dim=1)
+    txt_ids = pad_if_odd(txt_ids, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+
+    patches_replace = transformer_options.get("patches_replace", {})
+
+    # running on sequences img
+    img = self.img_in(img)
+
+    # distilled vector guidance
+    mod_index_length = 344
+    distill_timestep = timestep_embedding(timesteps.detach().clone(), 16).to(img.device, img.dtype)
+    # guidance = guidance *
+    distil_guidance = timestep_embedding(guidance.detach().clone(), 16).to(img.device, img.dtype)
+
+    # get all modulation index
+    modulation_index = timestep_embedding(torch.arange(mod_index_length, device=img.device), 32).to(img.device, img.dtype)
+    # we need to broadcast the modulation index here so each batch has all of the index
+    modulation_index = modulation_index.unsqueeze(0).repeat(img.shape[0], 1, 1).to(img.device, img.dtype)
+    # and we need to broadcast timestep and guidance along too
+    timestep_guidance = torch.cat([distill_timestep, distil_guidance], dim=1).unsqueeze(1).repeat(1, mod_index_length, 1).to(img.dtype).to(img.device, img.dtype)
+    # then and only then we could concatenate it together
+    input_vec = torch.cat([timestep_guidance, modulation_index], dim=-1).to(img.device, img.dtype)
+
+    mod_vectors = self.distilled_guidance_layer(input_vec)
+
+    txt = self.txt_in(txt)
+
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    pe_combine = self.pe_embedder(ids)
+    pe_image = self.pe_embedder(img_ids)
+    # seq parallel
+    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+
+    blocks_replace = patches_replace.get("dit", {})
+    for i, block in enumerate(self.double_blocks):
+        if i not in self.skip_mmdit:
+            double_mod = (
+                self.get_modulations(mod_vectors, "double_img", idx=i),
+                self.get_modulations(mod_vectors, "double_txt", idx=i),
+            )
+            if ("double_block", i) in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["img"], out["txt"] = block(img=args["img"],
+                                                   txt=args["txt"],
+                                                   vec=args["vec"],
+                                                   pe=args["pe"],
+                                                   attn_mask=args.get("attn_mask"),
+                                                   transformer_options=args.get("transformer_options"))
+                    return out
+
+                out = blocks_replace[("double_block", i)]({"img": img,
+                                                           "txt": txt,
+                                                           "vec": double_mod,
+                                                           "pe": pe_image,
+                                                           "attn_mask": attn_mask,
+                                                           "transformer_options": transformer_options},
+                                                          {"original_block": block_wrap})
+                txt = out["txt"]
+                img = out["img"]
+            else:
+                img, txt = block(img=img,
+                                 txt=txt,
+                                 vec=double_mod,
+                                 pe=pe_image,
+                                 attn_mask=attn_mask,
+                                 transformer_options=transformer_options)
+
+            if control is not None: # Controlnet
+                control_i = control.get("input")
+                if i < len(control_i):
+                    add = control_i[i]
+                    if add is not None:
+                        img += add
+
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img = get_sp_group().all_gather(img, dim=1)
+    txt = get_sp_group().all_gather(txt, dim=1)
+
+    img = torch.cat((txt, img), 1)
+
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+
+    for i, block in enumerate(self.single_blocks):
+        if i not in self.skip_dit:
+            single_mod = self.get_modulations(mod_vectors, "single", idx=i)
+            if ("single_block", i) in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["img"] = block(args["img"],
+                                       vec=args["vec"],
+                                       pe=args["pe"],
+                                       attn_mask=args.get("attn_mask"),
+                                       transformer_options=args.get("transformer_options"))
+                    return out
+
+                out = blocks_replace[("single_block", i)]({"img": img,
+                                                           "vec": single_mod,
+                                                           "pe": pe_combine,
+                                                           "attn_mask": attn_mask,
+                                                           "transformer_options": transformer_options},
+                                                          {"original_block": block_wrap})
+                img = out["img"]
+            else:
+                img = block(img, vec=single_mod, pe=pe_combine, attn_mask=attn_mask, transformer_options=transformer_options)
+
+            if control is not None:  # Controlnet
+                control_o = control.get("output")
+                if i < len(control_o):
+                    add = control_o[i]
+                    if add is not None:
+                        img[:, txt.shape[1]:, ...] += add
+
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img = get_sp_group().all_gather(img, dim=1)
+    img = img[:, txt.shape[1]:, ...]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    if hasattr(self, "final_layer"):
+        final_mod = self.get_modulations(mod_vectors, "final")
+        img = self.final_layer(img, vec=final_mod)  # (N, T, patch_size ** 2 * out_channels)
+    return img
+
+
 def usp_single_stream_forward(self, x: Tensor, pe: Tensor, vec: Tensor, attn_mask=None, **kwargs) -> Tensor:
     mod = vec
     x_mod = torch.addcmul(mod.shift, 1 + mod.scale, self.pre_norm(x))
@@ -121,7 +268,7 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: T
                      torch.cat((txt_v, img_v), dim=2),
                      pe=None, mask=attn_mask)
 
-    txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
+    txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
     # calculate the img bloks
     img.addcmul_(img_mod1.gate, self.img_attn.proj(img_attn))
@@ -135,4 +282,3 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: T
         txt = torch.nan_to_num(txt, nan=0.0, posinf=65504, neginf=-65504)
 
     return img, txt
-
