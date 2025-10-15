@@ -33,7 +33,7 @@ class USPInjectRegistry:
 
 @USPInjectRegistry.register(model_base.WAN22_S2V)
 def _inject_wan22(model_patcher, base_model, *args):
-    from ..diffusion_models.wan.distributed.xdit_context_parallel import (
+    from ..diffusion_models.wan.xdit_context_parallel import (
         usp_audio_dit_forward,
         usp_self_attn_forward,
         usp_t2v_cross_attn_forward,
@@ -51,7 +51,7 @@ def _inject_wan22(model_patcher, base_model, *args):
 
 @USPInjectRegistry.register(model_base.WAN21)
 def _inject_wan21(model_patcher, base_model, *args):
-    from ..diffusion_models.wan.distributed.xdit_context_parallel import (
+    from ..diffusion_models.wan.xdit_context_parallel import (
         usp_self_attn_forward,
         usp_dit_forward,
         usp_i2v_cross_attn_forward,
@@ -71,7 +71,7 @@ def _inject_wan21(model_patcher, base_model, *args):
 
 @USPInjectRegistry.register(model_base.Chroma)
 def _inject_chroma(model_patcher, base_model, *args):
-    from ..diffusion_models.chroma.distributed.xdit_context_parallel import (
+    from ..diffusion_models.chroma.xdit_context_parallel import (
         usp_dit_forward,
         usp_single_stream_forward,
         usp_double_stream_forward
@@ -86,7 +86,7 @@ def _inject_chroma(model_patcher, base_model, *args):
 
 @USPInjectRegistry.register(model_base.Flux)
 def _inject_flux(model_patcher, base_model, *args):
-    from ..diffusion_models.flux.distributed.xdit_context_parallel import (
+    from ..diffusion_models.flux.xdit_context_parallel import (
         usp_dit_forward,
         usp_single_stream_forward,
         usp_double_stream_forward
@@ -101,11 +101,11 @@ def _inject_flux(model_patcher, base_model, *args):
 
 @USPInjectRegistry.register(model_base.HunyuanVideo)
 def _inject_hunyuan(model_patcher, base_model, *args):
-    from ..diffusion_models.flux.distributed.xdit_context_parallel import (
+    from ..diffusion_models.flux.xdit_context_parallel import (
         usp_single_stream_forward,
         usp_double_stream_forward
     )
-    from ..diffusion_models.hunyuan_video.distributed.xdit_context_paralllel import usp_dit_forward
+    from ..diffusion_models.hunyuan_video.xdit_context_paralllel import usp_dit_forward
     model = base_model.diffusion_model
     for block in model.double_blocks:
         block.forward = types.MethodType(usp_double_stream_forward, block)
@@ -116,7 +116,7 @@ def _inject_hunyuan(model_patcher, base_model, *args):
 
 @USPInjectRegistry.register(model_base.QwenImage)
 def _inject_qwen(model_patcher, base_model, *args):
-    from ..diffusion_models.qwen_image.distributed.xdit_context_parallel import (
+    from ..diffusion_models.qwen_image.xdit_context_parallel import (
         usp_dit_forward,
         usp_attn_forward,
     )
