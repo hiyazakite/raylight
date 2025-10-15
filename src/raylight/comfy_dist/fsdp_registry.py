@@ -4,6 +4,7 @@ from comfy import model_base
 from ..diffusion_models.wan.fsdp import shard_model_fsdp2 as wan_shard
 from ..diffusion_models.flux.fsdp import shard_model_fsdp2 as flux_shard
 from ..diffusion_models.chroma.fsdp import shard_model_fsdp2 as chroma_shard
+from ..diffusion_models.chroma_radiance.fsdp import shard_model_fsdp2 as chroma_radiance_shard
 from ..diffusion_models.qwen_image.fsdp import shard_model_fsdp2 as qwen_shard
 from ..diffusion_models.hunyuan_video.fsdp import shard_model_fsdp2 as hunyuan_shard
 
@@ -50,6 +51,11 @@ class FSDPShardRegistry:
 @FSDPShardRegistry.register(model_base.WAN22)
 def _wrap_wan(model, sd, cpu_offload):
     return wan_shard(model, sd, cpu_offload)
+
+
+@FSDPShardRegistry.register(model_base.ChromaRadiance)
+def _wrap_chroma_radiance(model, sd, cpu_offload):
+    return chroma_radiance_shard(model, sd, cpu_offload)
 
 
 @FSDPShardRegistry.register(model_base.Chroma)

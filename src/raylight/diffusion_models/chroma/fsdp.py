@@ -9,9 +9,13 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     # Collect params we want to ignore (everything except single_blocks + double_blocks)
     ignored_params = set()
     for name, param in diffusion_model.named_parameters():
-        if (not name.startswith("single_blocks.")) and (not name.startswith("double_blocks.")):
+        # noqa: W503
+        if (
+            not name.startswith("single_blocks.")
+            and not name.startswith("double_blocks.")
+            and not name.startswith("distilled_guidance_layer.")
+        ):
             ignored_params.add(param)
-
     # Shard distilled_guidance_layer
     diffusion_model.distilled_guidance_layer = fully_shard(
         module=diffusion_model.distilled_guidance_layer,

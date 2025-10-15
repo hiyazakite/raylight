@@ -69,6 +69,8 @@ def _inject_wan21(model_patcher, base_model, *args):
     model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 
+# Chroma Radiance should be using this since the forward_orig MRO in Chroma Radiance is from Chroma itself
+@USPInjectRegistry.register(model_base.ChromaRadiance)
 @USPInjectRegistry.register(model_base.Chroma)
 def _inject_chroma(model_patcher, base_model, *args):
     from ..diffusion_models.chroma.xdit_context_parallel import (
