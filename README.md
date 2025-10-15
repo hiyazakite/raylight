@@ -5,12 +5,12 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
 ## Curent WIP Notice: XDiT PipeFusion
-You may notice that my repository won’t receive updates on the main branch for a while, 
+You may notice that my repository won’t receive updates on the main branch for a while,
 except for requests to implement sequence parallelism for certain models like NVIDIA Cosmos or for critical bug fixes.
-This is because I’m reworking (again...) **Raylight** and, by extension, the **ComfyUI** model loader to 
+This is because I’m reworking (again...) **Raylight** and, by extension, the **ComfyUI** model loader to
 support [PipeFusion](https://github.com/xdit-project/xDiT/blob/main/docs/methods/pipefusion.md).
 
-PipeFusion will address many existing issues, such as GPU interconnect speed and compatibility 
+PipeFusion will address many existing issues, such as GPU interconnect speed and compatibility
 with un-FSDP-ed models like GGUF. Its main advantage is that it eliminates bandwidth strain entirely.
 
 Reason why it will be a long process is because XFuser use Diffuser style `class` from HF, different from ComfyUI.
@@ -77,6 +77,8 @@ Its job is to split the model weights among GPUs.
 - Non-DiT models are not supported (SDXL, SD1.5).
 - Example WF just open from your comfyui menu and browse templates
 - **GPU Topology** is very important, not all PCIe in your motherboard is equal.
+- VRAM leakage, when using [Ring > 1 instead of Ulysses](https://github.com/feifeibear/long-context-attention/issues/112).
+  Solution : just increase Ulysses degree for now.
 
 ## Operation
 
