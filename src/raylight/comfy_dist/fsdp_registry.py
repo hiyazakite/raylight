@@ -73,6 +73,11 @@ def _wrap_qwen(model, sd, cpu_offload):
     return qwen_shard(model, sd, cpu_offload)
 
 
+@FSDPShardRegistry.register(model_base.Hunyuan3Dv2)
+def _wrap_hunyuan_3dv2(model, sd, cpu_offload):
+    return flux_shard(model, sd, cpu_offload)
+
+
 @FSDPShardRegistry.register(model_base.HunyuanVideo)
 def _wrap_hunyuan(model, sd, cpu_offload):
     return hunyuan_shard(model, sd, cpu_offload)

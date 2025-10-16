@@ -103,6 +103,23 @@ def _inject_flux(model_patcher, base_model, *args):
     model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 
+@USPInjectRegistry.register(model_base.Hunyuan3Dv2)
+def _inject_hunyuan_3dv2(model_patcher, base_model, *args):
+    from ..diffusion_models.hunyuan3d.xdit_context_parallel import (
+        usp_dit_forward,
+    )
+    from ..diffusion_models.flux.xdit_context_parallel import (
+        usp_single_stream_forward,
+        usp_double_stream_forward
+    )
+    model = base_model.diffusion_model
+    for block in model.double_blocks:
+        block.forward = types.MethodType(usp_double_stream_forward, block)
+    for block in model.single_blocks:
+        block.forward = types.MethodType(usp_single_stream_forward, block)
+    model.forward_orig = types.MethodType(usp_dit_forward, model)
+
+
 @USPInjectRegistry.register(model_base.HunyuanVideo)
 def _inject_hunyuan(model_patcher, base_model, *args):
     from ..diffusion_models.hunyuan_video.xdit_context_parallel import (
