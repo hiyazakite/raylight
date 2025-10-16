@@ -75,8 +75,6 @@ def _inject_wan21(model_patcher, base_model, *args):
 def _inject_chroma(model_patcher, base_model, *args):
     from ..diffusion_models.chroma.xdit_context_parallel import (
         usp_dit_forward,
-    )
-    from ..diffusion_models.flux.xdit_context_parallel import (
         usp_single_stream_forward,
         usp_double_stream_forward
     )
