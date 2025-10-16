@@ -75,6 +75,8 @@ def _inject_wan21(model_patcher, base_model, *args):
 def _inject_chroma(model_patcher, base_model, *args):
     from ..diffusion_models.chroma.xdit_context_parallel import (
         usp_dit_forward,
+    )
+    from ..diffusion_models.flux.xdit_context_parallel import (
         usp_single_stream_forward,
         usp_double_stream_forward
     )
@@ -103,11 +105,13 @@ def _inject_flux(model_patcher, base_model, *args):
 
 @USPInjectRegistry.register(model_base.HunyuanVideo)
 def _inject_hunyuan(model_patcher, base_model, *args):
+    from ..diffusion_models.hunyuan_video.xdit_context_parallel import (
+        usp_dit_forward,
+    )
     from ..diffusion_models.flux.xdit_context_parallel import (
         usp_single_stream_forward,
         usp_double_stream_forward
     )
-    from ..diffusion_models.hunyuan_video.xdit_context_paralllel import usp_dit_forward
     model = base_model.diffusion_model
     for block in model.double_blocks:
         block.forward = types.MethodType(usp_double_stream_forward, block)
