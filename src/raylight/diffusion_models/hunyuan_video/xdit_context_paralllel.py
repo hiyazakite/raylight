@@ -67,6 +67,14 @@ def usp_dit_forward(
     control=None,
     transformer_options={},
 ) -> Tensor:
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    # Seq is odd (idk how) if the w == h, so just pad 0 to the end
+    img = pad_if_odd(img, dim=1)
+    img_ids = pad_if_odd(img_ids, dim=1)
+    txt = pad_if_odd(txt, dim=1)
+    txt_ids = pad_if_odd(txt_ids, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+
     patches_replace = transformer_options.get("patches_replace", {})
 
     initial_shape = list(img.shape)
@@ -146,8 +154,14 @@ def usp_dit_forward(
         txt = torch.cat((txt, txt_byt5), dim=1)
         txt_ids = torch.cat((txt_ids, txt_byt5_ids), dim=1)
 
-    ids = torch.cat((img_ids, txt_ids), dim=1)
-    pe = self.pe_embedder(ids)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    pe_combine = self.pe_embedder(ids)
+    pe_image = self.pe_embedder(img_ids)
+    # seq parallel
+    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     img_len = img.shape[1]
     if txt_mask is not None:
@@ -158,6 +172,11 @@ def usp_dit_forward(
         attn_mask[:, 0, img_len:] = txt_mask
     else:
         attn_mask = None
+
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     blocks_replace = patches_replace.get("dit", {})
     for i, block in enumerate(self.double_blocks):
@@ -182,7 +201,7 @@ def usp_dit_forward(
                     "img": img,
                     "txt": txt,
                     "vec": vec,
-                    "pe": pe,
+                    "pe": pe_image,
                     "attention_mask": attn_mask,
                     "modulation_dims_img": modulation_dims,
                     "modulation_dims_txt": modulation_dims_txt,
@@ -197,7 +216,7 @@ def usp_dit_forward(
                 img=img,
                 txt=txt,
                 vec=vec,
-                pe=pe,
+                pe=pe_image,
                 attn_mask=attn_mask,
                 modulation_dims_img=modulation_dims,
                 modulation_dims_txt=modulation_dims_txt,
@@ -211,7 +230,14 @@ def usp_dit_forward(
                 if add is not None:
                     img += add
 
-    img = torch.cat((img, txt), 1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img = get_sp_group().all_gather(img, dim=1)
+    txt = get_sp_group().all_gather(txt, dim=1)
+
+    img = torch.cat((txt, img), 1)
+
+    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     for i, block in enumerate(self.single_blocks):
         if ("single_block", i) in blocks_replace:
@@ -232,7 +258,7 @@ def usp_dit_forward(
                 {
                     "img": img,
                     "vec": vec,
-                    "pe": pe,
+                    "pe": pe_combine,
                     "attention_mask": attn_mask,
                     "modulation_dims": modulation_dims,
                     "transformer_options": transformer_options,
@@ -244,7 +270,7 @@ def usp_dit_forward(
             img = block(
                 img,
                 vec=vec,
-                pe=pe,
+                pe=pe_combine,
                 attn_mask=attn_mask,
                 modulation_dims=modulation_dims,
                 transformer_options=transformer_options,
@@ -257,15 +283,18 @@ def usp_dit_forward(
                 if add is not None:
                     img[:, :img_len] += add
 
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img = get_sp_group().all_gather(img, dim=1)
+    # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = img[:, :img_len]
     if ref_latent is not None:
-        img = img[:, ref_latent.shape[1] :]
+        img = img[:, ref_latent.shape[1]:]
 
     img = self.final_layer(
         img, vec, modulation_dims=modulation_dims
     )  # (N, T, patch_size ** 2 * out_channels)
 
-    shape = initial_shape[-len(self.patch_size) :]
+    shape = initial_shape[-len(self.patch_size):]
     for i in range(len(shape)):
         shape[i] = shape[i] // self.patch_size[i]
     img = img.reshape([img.shape[0]] + shape + [self.out_channels] + self.patch_size)
