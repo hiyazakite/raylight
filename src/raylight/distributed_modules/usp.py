@@ -124,6 +124,7 @@ def _inject_hunyuan_3dv2(model_patcher, base_model, *args):
 def _inject_hunyuan(model_patcher, base_model, *args):
     from ..diffusion_models.hunyuan_video.xdit_context_parallel import (
         usp_dit_forward,
+        usp_token_refiner_forward
     )
     from ..diffusion_models.flux.xdit_context_parallel import (
         usp_single_stream_forward,
@@ -134,6 +135,7 @@ def _inject_hunyuan(model_patcher, base_model, *args):
         block.forward = types.MethodType(usp_double_stream_forward, block)
     for block in model.single_blocks:
         block.forward = types.MethodType(usp_single_stream_forward, block)
+    model.txt_in.forward = types.MethodType(usp_token_refiner_forward, model.txt_in)
     model.forward_orig = types.MethodType(usp_dit_forward, model)
 
 
