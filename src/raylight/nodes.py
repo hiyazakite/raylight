@@ -9,7 +9,6 @@ import folder_paths
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
 from comfy import sd, sample, utils
-from raylight.comfy_extra_dist.ray_patch_decorator import ray_patch
 
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
@@ -213,7 +212,6 @@ class RayUNETLoader:
         return (ray_actors,)
 
 
-
 class RayLoraLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -367,7 +365,6 @@ class DPKSamplerAdvanced:
         return {
             "required": {
                 "add_noise": (["enable", "disable"],),
-                "noise": ("NOISE_LIST", ),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                 "cfg": (
                     "FLOAT",
@@ -385,6 +382,7 @@ class DPKSamplerAdvanced:
                     "RAY_ACTORS",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
+                "noise_list": ("NOISE",),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
@@ -405,10 +403,7 @@ class DPKSamplerAdvanced:
         self,
         ray_actors,
         add_noise,
-        noise_seed_1,  # Yep for now i do this
-        noise_seed_2,
-        noise_seed_3,
-        noise_seed_4,
+        noise_list,
         steps,
         cfg,
         sampler_name,
@@ -424,10 +419,6 @@ class DPKSamplerAdvanced:
 
         ray_actors = ray_actors[0]
         add_noise = add_noise[0]
-        noise_seed_1 = noise_seed_1[0]
-        noise_seed_2 = noise_seed_2[0]
-        noise_seed_3 = noise_seed_3[0]
-        noise_seed_4 = noise_seed_4[0]
         steps = steps[0]
         cfg = cfg[0]
         sampler_name = sampler_name[0]
@@ -463,11 +454,9 @@ class DPKSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
 
-        noise_seeds = [noise_seed_1, noise_seed_2, noise_seed_3, noise_seed_4]
-
         futures = [
             actor.common_ksampler.remote(
-                noise_seeds[i],
+                noise_list[i],
                 steps,
                 cfg,
                 sampler_name,
@@ -489,56 +478,49 @@ class DPKSamplerAdvanced:
         return (results,)
 
 
-class Noise_EmptyNoise:
-    def __init__(self):
-        self.seed = 0
-
-    def generate_noise(self, input_latent):
-        latent_image = input_latent["samples"]
-        return torch.zeros(latent_image.shape, dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
-
-
 class Noise_RandomNoise:
     def __init__(self, seed):
         self.seed = seed
 
     def generate_noise(self, input_latent):
         latent_image = input_latent["samples"]
-        batch_inds = input_latent["batch_index"] if "batch_index" in input_latent else None
+        batch_inds = (
+            input_latent["batch_index"] if "batch_index" in input_latent else None
+        )
         return comfy.sample.prepare_noise(latent_image, self.seed, batch_inds)
 
 
-class DisableNoise:
+class DPNoiseList:
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required":{
-                     }
-                }
-
-    RETURN_TYPES = ("NOISE",)
-    FUNCTION = "get_noise"
-    CATEGORY = "sampling/custom_sampling/noise"
-
-    def get_noise(self):
-        return (Noise_EmptyNoise(),)
-
-
-class RandomNoise(DisableNoise):
-    @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
-                "noise_seed": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 0xffffffffffffffff,
-                    "control_after_generate": True,
-                }),
+                **{
+                    f"noise_seed_{i}": (
+                        "INT",
+                        {
+                            "default": 0,
+                            "min": 0,
+                            "max": 0xFFFFFFFFFFFFFFFF,
+                            "control_after_generate": True,
+                        },
+                    )
+                    for i in range(8)
+                }
             }
         }
 
-    def get_noise(self, noise_seed):
-        return (Noise_RandomNoise(noise_seed),)
+    RETURN_TYPES = ("NOISE",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "get_noise"
+    CATEGORY = "Raylight"
+
+    def get_noise(self, **kwargs):
+        noise_list = []
+        for key, seed in kwargs.items():
+            if key.startswith("noise_seed_"):
+                noise_list.append(seed)
+        return (noise_list,)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -547,6 +529,7 @@ NODE_CLASS_MAPPINGS = {
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
+    "DPNoiseList": DPNoiseList,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -555,4 +538,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
+    "DPNoiseList": "Data Parallel Noise List"
 }
