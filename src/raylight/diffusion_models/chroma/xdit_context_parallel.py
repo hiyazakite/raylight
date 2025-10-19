@@ -93,6 +93,7 @@ def usp_dit_forward(
     transformer_options={},
     attn_mask: Tensor = None,
 ) -> Tensor:
+
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     # Seq is odd (idk how) if the w == h, so just pad 0 to the end
     img = pad_if_odd(img, dim=1)
@@ -172,7 +173,7 @@ def usp_dit_forward(
                                  attn_mask=attn_mask,
                                  transformer_options=transformer_options)
 
-            if control is not None: # Controlnet
+            if control is not None:  # Controlnet
                 control_i = control.get("input")
                 if i < len(control_i):
                     add = control_i[i]
@@ -184,7 +185,6 @@ def usp_dit_forward(
     txt = get_sp_group().all_gather(txt, dim=1)
 
     img = torch.cat((txt, img), 1)
-
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
@@ -197,15 +197,13 @@ def usp_dit_forward(
                     out["img"] = block(args["img"],
                                        vec=args["vec"],
                                        pe=args["pe"],
-                                       attn_mask=args.get("attn_mask"),
-                                       transformer_options=args.get("transformer_options"))
+                                       attn_mask=args.get("attn_mask"))
                     return out
 
                 out = blocks_replace[("single_block", i)]({"img": img,
                                                            "vec": single_mod,
                                                            "pe": pe_combine,
-                                                           "attn_mask": attn_mask,
-                                                           "transformer_options": transformer_options},
+                                                           "attn_mask": attn_mask},
                                                           {"original_block": block_wrap})
                 img = out["img"]
             else:
@@ -243,7 +241,7 @@ def usp_single_stream_forward(self, x: Tensor, pe: Tensor, vec: Tensor, attn_mas
     x.addcmul_(mod.gate, output)
     if x.dtype == torch.float16:
         x = torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
-        return x
+    return x
 
 
 def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: Tensor, attn_mask=None, **kwargs):

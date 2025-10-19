@@ -168,7 +168,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Model             | USP | FSDP |
 |-------------------|-----|------|
 | Chroma            | ✅  | ✅   |
-| Chroma Radiance   | ❌  | ❌   |
+| Chroma Radiance   | ✅  | ✅   |
 | Chroma ControlNet | ❌  | ❌   |
 
 
