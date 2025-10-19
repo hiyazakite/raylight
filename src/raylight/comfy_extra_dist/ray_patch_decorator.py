@@ -30,8 +30,6 @@ def ray_patch_with_return(patch_func):
 
         # Just need rank 0
         actor = ray_actors["workers"][0]
-        futures = actor.model_function_runner.remote(_patch, *args, **kwargs)
-
-        value = ray.get(futures)[0]
+        value = ray.get(actor.model_function_runner_get_values.remote(_patch, *args, **kwargs))
         return (value,)
     return wrapper

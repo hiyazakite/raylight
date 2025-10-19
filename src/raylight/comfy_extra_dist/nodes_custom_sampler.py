@@ -1,4 +1,3 @@
-import math
 import comfy.samplers
 import comfy.sample
 from comfy.k_diffusion import sa_solver
@@ -9,7 +8,7 @@ import comfy.utils
 from .ray_patch_decorator import ray_patch_with_return
 
 
-class BasicScheduler:
+class RayBasicScheduler:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -40,11 +39,11 @@ class BasicScheduler:
         sigmas = comfy.samplers.calculate_sigmas(
             model.get_model_object("model_sampling"), scheduler, total_steps
         ).cpu()
-        sigmas = sigmas[-(steps + 1):]
+        sigmas = sigmas[-(steps + 1) :]
         return (sigmas,)
 
 
-class BetaSamplingScheduler:
+class RayBetaSamplingScheduler:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -87,7 +86,7 @@ class BetaSamplingScheduler:
         return (sigmas,)
 
 
-class SamplingPercentToSigma:
+class RaySamplingPercentToSigma:
     @classmethod
     def INPUT_TYPES(cls) -> InputTypeDict:
         return {
@@ -125,7 +124,7 @@ class SamplingPercentToSigma:
         return (sigma_val,)
 
 
-class SamplerSASolver(ComfyNodeABC):
+class RaySamplerSASolver(ComfyNodeABC):
     @classmethod
     def INPUT_TYPES(cls) -> InputTypeDict:
         return {
@@ -167,7 +166,7 @@ class SamplerSASolver(ComfyNodeABC):
         }
 
     RETURN_TYPES = (IO.SAMPLER,)
-    CATEGORY = "Raylight/extra/custom_sampling/schedulers"
+    CATEGORY = "Raylight/extra/custom_sampling/samplers"
 
     FUNCTION = "get_sampler"
 
@@ -269,7 +268,7 @@ class XFuserSamplerCustom:
 
     FUNCTION = "sample"
 
-    CATEGORY = "sampling/custom_sampling"
+    CATEGORY = "Raylight/extra/custom_sampling/samplers"
 
     def sample(
         self,
@@ -370,7 +369,7 @@ class DPSamplerCustom:
 
     FUNCTION = "sample"
 
-    CATEGORY = "sampling/custom_sampling"
+    CATEGORY = "Raylight/extra/custom_sampling/samplers"
 
     def sample(
         self,
@@ -432,13 +431,19 @@ class DPSamplerCustom:
         return (out, out_denoised)
 
 
-class AddNoise:
+class RayAddNoise:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
+                "noise_seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "control_after_generate": True,
+                }),
+                "force_empty_noise": ("BOOLEAN", ),
                 "ray_actors": ("RAY_ACTORS",),
-                "noise": ("NOISE",),
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),
             }
@@ -448,18 +453,22 @@ class AddNoise:
 
     FUNCTION = "add_noise"
 
-    CATEGORY = "_for_testing/custom_sampling/noise"
+    CATEGORY = "Raylight/extra/custom_sampling/samplers"
 
     @ray_patch_with_return
-    def add_noise(self, model, noise, sigmas, latent_image):
+    def add_noise(self, model, noise_seed, force_empty_noise, sigmas, latent_image):
         if len(sigmas) == 0:
             return latent_image
 
         latent = latent_image
         latent_image = latent["samples"]
 
-        noisy = noise.generate_noise(latent)
+        if force_empty_noise is False:
+            noise = Noise_RandomNoise(noise_seed)
+        else:
+            noise = Noise_EmptyNoise()
 
+        noisy = noise.generate_noise(latent)
         model_sampling = model.get_model_object("model_sampling")
         process_latent_out = model.get_model_object("process_latent_out")
         process_latent_in = model.get_model_object("process_latent_in")
@@ -483,19 +492,14 @@ class AddNoise:
 NODE_CLASS_MAPPINGS = {
     "XFuserSamplerCustom": XFuserSamplerCustom,
     "DPSamplerCustom": DPSamplerCustom,
-    "BasicScheduler": BasicScheduler,
-    "BetaSamplingScheduler": BetaSamplingScheduler,
-    "SamplerSASolver": SamplerSASolver,
-    "SamplingPercentToSigma": SamplingPercentToSigma,
-    "AddNoise": AddNoise,
+    "RayBasicScheduler": RayBasicScheduler,
+    "RayBetaSamplingScheduler": RayBetaSamplingScheduler,
+    "RaySamplerSASolver": RaySamplerSASolver,
+    "RaySamplingPercentToSigma": RaySamplingPercentToSigma,
+    "RayAddNoise": RayAddNoise,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XFuserSamplerCustom": "XFuser SamplerCustom",
     "DPSamplerCustom": "Data Parallel SamplerCustom",
-    "BasicScheduler": "RayBasicScheduler",
-    "BetaSamplingScheduler": "RayBetaSamplingScheduler",
-    "SamplerSASolver": "RaySamplerSASolver",
-    "SamplingPercentToSigma": "RaySamplingPercentToSigma",
-    "AddNoise": "RayAddNoise",
 }

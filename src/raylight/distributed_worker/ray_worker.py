@@ -140,6 +140,9 @@ class RayWorker:
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)
 
+    def model_function_runner_get_values(self, fn, *args, **kwargs):
+        return fn(self.model, *args, **kwargs)
+
     def get_local_rank(self):
         return self.local_rank
 
