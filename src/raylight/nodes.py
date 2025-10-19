@@ -367,42 +367,7 @@ class DPKSamplerAdvanced:
         return {
             "required": {
                 "add_noise": (["enable", "disable"],),
-                "noise_seed_1": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 0xFFFFFFFFFFFFFFFF,
-                        "control_after_generate": True,
-                    },
-                ),
-                "noise_seed_2": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 0xFFFFFFFFFFFFFFFF,
-                        "control_after_generate": True,
-                    },
-                ),
-                "noise_seed_3": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 0xFFFFFFFFFFFFFFFF,
-                        "control_after_generate": True,
-                    },
-                ),
-                "noise_seed_4": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 0xFFFFFFFFFFFFFFFF,
-                        "control_after_generate": True,
-                    },
-                ),
+                "noise": ("NOISE_LIST", ),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                 "cfg": (
                     "FLOAT",
@@ -522,6 +487,58 @@ class DPKSamplerAdvanced:
         results = ray.get(futures)
         results = [result[0] for result in results]
         return (results,)
+
+
+class Noise_EmptyNoise:
+    def __init__(self):
+        self.seed = 0
+
+    def generate_noise(self, input_latent):
+        latent_image = input_latent["samples"]
+        return torch.zeros(latent_image.shape, dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
+
+
+class Noise_RandomNoise:
+    def __init__(self, seed):
+        self.seed = seed
+
+    def generate_noise(self, input_latent):
+        latent_image = input_latent["samples"]
+        batch_inds = input_latent["batch_index"] if "batch_index" in input_latent else None
+        return comfy.sample.prepare_noise(latent_image, self.seed, batch_inds)
+
+
+class DisableNoise:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":{
+                     }
+                }
+
+    RETURN_TYPES = ("NOISE",)
+    FUNCTION = "get_noise"
+    CATEGORY = "sampling/custom_sampling/noise"
+
+    def get_noise(self):
+        return (Noise_EmptyNoise(),)
+
+
+class RandomNoise(DisableNoise):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "noise_seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "control_after_generate": True,
+                }),
+            }
+        }
+
+    def get_noise(self, noise_seed):
+        return (Noise_RandomNoise(noise_seed),)
 
 
 NODE_CLASS_MAPPINGS = {
