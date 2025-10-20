@@ -149,11 +149,25 @@ def _inject_qwen(model_patcher, base_model, *args):
     model._forward = types.MethodType(usp_dit_forward, model)
 
 
-# @USPInjectRegistry.register(model_base.CosmosVideo)
-# def _inject_cosmos_video(model_patcher, base_model, *args):
-#     pass
-#
-#
-# @USPInjectRegistry.register(model_base.CosmosVideo)
-# def _inject_cosmos_predict2(model_patcher, base_model, *args):
-#     pass
+@USPInjectRegistry.register(model_base.CosmosPredict2)
+def _inject_cosmos_predict2(model_patcher, base_model, *args):
+    from ..diffusion_models.cosmos.xdit_context_parallel import (
+        usp_xfuser_attention_op,
+        usp_mini_train_dit_forward
+    )
+    model = base_model.diffusion_model
+    for block in model.blocks:
+        block.cross_attn.attn_op = types.MethodType(usp_xfuser_attention_op, block.cross_attn)
+        block.self_attn.attn_op = types.MethodType(usp_xfuser_attention_op, block.self_attn)
+    model._forward = types.MethodType(usp_mini_train_dit_forward, model)
+
+
+@USPInjectRegistry.register(model_base.CosmosVideo)
+def _inject_cosmos_video(model_patcher, base_model, *args):
+    pass
+    from ..diffusion_models.cosmos.xdit_context_parallel import (
+        usp_general_dit_forward,
+        usp_general_attention_forward
+    )
+    model = base_model.diffusion_model
+    model._forward = types.MethodType(usp_general_dit_forward, model)

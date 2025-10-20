@@ -1,13 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Optional
 from enum import Enum
 
 from einops import rearrange
 import torch
 
+from xfuser.core.distributed import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group,
+)
+import raylight.distributed_modules.attention as xfuser_attn
+attn_type = xfuser_attn.get_attn_type()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
+
 
 class DataType(Enum):
     IMAGE = "image"
     VIDEO = "video"
+
+
+# ============================ GENERAL MODEL ======================== #
+def usp_general_attention_forward(
+    self,
+    x,
+    context=None,
+    mask=None,
+    rope_emb=None,
+    transformer_options={},
+    **kwargs,
+):
+    q, k, v = self.cal_qkv(x, context, mask, rope_emb=rope_emb, **kwargs)
+    out = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True, mask=mask, skip_output_reshape=True)
+    del q, k, v
+    out = rearrange(out, " b n s c -> s b (n c)")
+    return self.to_out(out)
 
 
 def usp_general_dit_forward(
@@ -26,17 +67,6 @@ def usp_general_dit_forward(
     condition_video_augment_sigma: Optional[torch.Tensor] = None,
     **kwargs,
 ):
-    """
-    Args:
-        x: (B, C, T, H, W) tensor of spatial-temp inputs
-        timesteps: (B, ) tensor of timesteps
-        crossattn_emb: (B, N, D) tensor of cross-attention embeddings
-        crossattn_mask: (B, N) tensor of cross-attention masks
-        condition_video_augment_sigma: (B,) used in lvg(long video generation), we add noise with this sigma to
-            augment condition input, the lvg model will condition on the condition_video_augment_sigma value;
-            we need forward_before_blocks pass to the forward_before_blocks function.
-    """
-
     crossattn_emb = context
     crossattn_mask = attention_mask
 
@@ -72,6 +102,7 @@ def usp_general_dit_forward(
             x.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
         ), f"{x.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape} {original_shape}"
 
+    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     transformer_options = kwargs.get("transformer_options", {})
     for _, block in self.blocks.items():
         assert (
@@ -90,6 +121,7 @@ def usp_general_dit_forward(
             transformer_options=transformer_options,
         )
 
+    x = get_sp_group().all_gather(x, dim=1)
     x_B_T_H_W_D = rearrange(x, "T H W B D -> B T H W D")
 
     x_B_D_T_H_W = self.decoder_head(
@@ -102,6 +134,17 @@ def usp_general_dit_forward(
     )
 
     return x_B_D_T_H_W
+
+
+# ============================ PREDICT2 ======================== #
+# original code from: https://github.com/nvidia-cosmos/cosmos-predict2
+def usp_xfuser_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H_D: torch.Tensor, transformer_options: Optional[dict] = {}) -> torch.Tensor:
+    in_q_shape = q_B_S_H_D.shape
+    in_k_shape = k_B_S_H_D.shape
+    q_B_H_S_D = rearrange(q_B_S_H_D, "b ... h k -> b h ... k").view(in_q_shape[0], in_q_shape[-2], -1, in_q_shape[-1])
+    k_B_H_S_D = rearrange(k_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
+    v_B_H_S_D = rearrange(v_B_S_H_D, "b ... h v -> b h ... v").view(in_k_shape[0], in_k_shape[-2], -1, in_k_shape[-1])
+    return xfuser_optimized_attention(q_B_H_S_D, k_B_H_S_D, v_B_H_S_D, in_q_shape[-2], skip_reshape=True)
 
 
 def usp_mini_train_dit_forward(
@@ -145,6 +188,7 @@ def usp_mini_train_dit_forward(
             x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
         ), f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
 
+    x_B_T_H_W_D = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     block_kwargs = {
         "rope_emb_L_1_1_D": rope_emb_L_1_1_D.unsqueeze(1).unsqueeze(0),
         "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
@@ -158,6 +202,8 @@ def usp_mini_train_dit_forward(
             crossattn_emb,
             **block_kwargs,
         )
+
+    x_B_T_H_W_O = get_sp_group().all_gather(x, dim=1)
 
     x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
     x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
