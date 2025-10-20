@@ -19,6 +19,7 @@ import raylight.distributed_worker.context_parallel as cp
 import raylight.distributed_modules.attention as xfuser_attn
 from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
+from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 from ray.exceptions import RayActorError
 
 
@@ -267,9 +268,8 @@ class RayWorker:
 
     def custom_sampler(
         self,
-        noise,
+        add_noise,
         noise_seed,
-        noise_mask,
         cfg,
         positive,
         negative,
@@ -277,6 +277,21 @@ class RayWorker:
         sigmas,
         latent_image,
     ):
+        latent = latent_image
+        latent_image = latent["samples"]
+        latent = latent.copy()
+        latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
+        latent["samples"] = latent_image
+
+        if not add_noise:
+            noise = Noise_EmptyNoise().generate_noise(latent)
+        else:
+            noise = Noise_RandomNoise(noise_seed).generate_noise(latent)
+
+        noise_mask = None
+        if "noise_mask" in latent:
+            noise_mask = latent["noise_mask"]
+
         if self.parallel_dict["is_fsdp"] is True:
             self.model.patch_fsdp()
 
@@ -295,6 +310,8 @@ class RayWorker:
                 disable_pbar=disable_pbar,
                 seed=noise_seed,
             )
+            out = latent.copy()
+            out["samples"] = samples
 
         if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
             self.model.detach()
@@ -302,7 +319,7 @@ class RayWorker:
             self.model.detach()
         comfy.model_management.soft_empty_cache()
         gc.collect()
-        return samples
+        return out
 
     def common_ksampler(
         self,
