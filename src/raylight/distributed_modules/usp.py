@@ -147,3 +147,13 @@ def _inject_qwen(model_patcher, base_model, *args):
     for block in model.transformer_blocks:
         block.attn.forward = types.MethodType(usp_attn_forward, block.attn)
     model._forward = types.MethodType(usp_dit_forward, model)
+
+
+# @USPInjectRegistry.register(model_base.CosmosVideo)
+# def _inject_cosmos_video(model_patcher, base_model, *args):
+#     pass
+#
+#
+# @USPInjectRegistry.register(model_base.CosmosVideo)
+# def _inject_cosmos_predict2(model_patcher, base_model, *args):
+#     pass
