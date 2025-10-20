@@ -96,10 +96,11 @@ def usp_dit_forward(
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     # Seq is odd (idk how) if the w == h, so just pad 0 to the end
-    img = pad_if_odd(img, dim=1)
-    img_ids = pad_if_odd(img_ids, dim=1)
-    txt = pad_if_odd(txt, dim=1)
-    txt_ids = pad_if_odd(txt_ids, dim=1)
+    if img.shape[1] != 3:
+        img = pad_if_odd(img, dim=1)
+        img_ids = pad_if_odd(img_ids, dim=1)
+        txt = pad_if_odd(txt, dim=1)
+        txt_ids = pad_if_odd(txt_ids, dim=1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     patches_replace = transformer_options.get("patches_replace", {})
