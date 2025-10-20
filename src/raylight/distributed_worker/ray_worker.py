@@ -265,6 +265,45 @@ class RayWorker:
         dist.destroy_process_group()
         ray.actor.exit_actor()
 
+    def custom_sampler(
+        self,
+        noise,
+        noise_seed,
+        noise_mask,
+        cfg,
+        positive,
+        negative,
+        sampler,
+        sigmas,
+        latent_image,
+    ):
+        if self.parallel_dict["is_fsdp"] is True:
+            self.model.patch_fsdp()
+
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        with torch.no_grad():
+            samples = comfy.sample.sample_custom(
+                self.model,
+                noise,
+                cfg,
+                sampler,
+                sigmas,
+                positive,
+                negative,
+                latent_image,
+                noise_mask=noise_mask,
+                disable_pbar=disable_pbar,
+                seed=noise_seed,
+            )
+
+        if ray.get_runtime_context().get_accelerator_ids()["GPU"][0] and self.parallel_dict["is_fsdp"] == "0":
+            self.model.detach()
+        else:
+            self.model.detach()
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
+        return samples
+
     def common_ksampler(
         self,
         seed,

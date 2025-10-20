@@ -1,9 +1,13 @@
+import gc
+import ray
+
+import torch
+
 import comfy.samplers
 import comfy.sample
 from comfy.k_diffusion import sa_solver
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import latent_preview
-import torch
 import comfy.utils
 from .ray_patch_decorator import ray_patch_with_return
 
@@ -263,16 +267,16 @@ class XFuserSamplerCustom:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT")
-    RETURN_NAMES = ("output", "denoised_output")
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("output",)
 
-    FUNCTION = "sample"
+    FUNCTION = "ray_sample"
 
     CATEGORY = "Raylight/extra/custom_sampling/samplers"
 
-    def sample(
+    def ray_sample(
         self,
-        model,
+        ray_actors,
         add_noise,
         noise_seed,
         cfg,
@@ -285,7 +289,7 @@ class XFuserSamplerCustom:
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
-        latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image)
+        latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
         latent["samples"] = latent_image
 
         if not add_noise:
@@ -297,37 +301,32 @@ class XFuserSamplerCustom:
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
 
-        x0_output = {}
-        callback = latent_preview.prepare_callback(
-            model, sigmas.shape[-1] - 1, x0_output
-        )
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        gpu_actors = ray_actors["workers"]
 
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-        samples = comfy.sample.sample_custom(
-            model,
-            noise,
-            cfg,
-            sampler,
-            sigmas,
-            positive,
-            negative,
-            latent_image,
-            noise_mask=noise_mask,
-            callback=callback,
-            disable_pbar=disable_pbar,
-            seed=noise_seed,
-        )
+        futures = [
+            actor.custom_sampler.remote(
+                noise,
+                noise_seed,
+                noise_mask,
+                cfg,
+                positive,
+                negative,
+                sampler,
+                sigmas,
+                latent_image,
 
+            )
+            for actor in gpu_actors
+        ]
+        samples_list = ray.get(futures)
+        samples = samples_list[0]
         out = latent.copy()
         out["samples"] = samples
-        if "x0" in x0_output:
-            out_denoised = latent.copy()
-            out_denoised["samples"] = model.model.process_latent_out(
-                x0_output["x0"].cpu()
-            )
-        else:
-            out_denoised = out
-        return (out, out_denoised)
+
+        return (out,)
 
 
 class DPSamplerCustom:
@@ -337,15 +336,7 @@ class DPSamplerCustom:
             "required": {
                 "ray_actors": ("RAY_ACTORS",),
                 "add_noise": ("BOOLEAN", {"default": True}),
-                "noise_seed": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 0xFFFFFFFFFFFFFFFF,
-                        "control_after_generate": True,
-                    },
-                ),
+                "noise_list": ("NOISE",),
                 "cfg": (
                     "FLOAT",
                     {
@@ -364,18 +355,18 @@ class DPSamplerCustom:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT")
+    RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("output", "denoised_output")
-
-    FUNCTION = "sample"
-
+    OUTPUT_IS_LIST = (True,)
+    INPUT_IS_LIST = True
+    FUNCTION = "ray_sample"
     CATEGORY = "Raylight/extra/custom_sampling/samplers"
 
-    def sample(
+    def ray_sample(
         self,
-        model,
+        ray_actors,
         add_noise,
-        noise_seed,
+        noise_list,
         cfg,
         positive,
         negative,
@@ -383,52 +374,57 @@ class DPSamplerCustom:
         sigmas,
         latent_image,
     ):
+        ray_actors = ray_actors[0]
+        add_noise = add_noise[0]
+        cfg = cfg[0]
+        positive = positive[0]
+        negative = negative[0]
+        sampler = sampler[0]
+        sigmas = sigmas[0]
+        latent_image = latent_image[0]
+        noise_seed_list = noise_list
+
         latent = latent_image
         latent_image = latent["samples"]
         latent = latent.copy()
-        latent_image = comfy.sample.fix_empty_latent_channels(model, latent_image)
+        latent_image = comfy.sample.fix_empty_latent_channels(self.model, latent_image)
         latent["samples"] = latent_image
 
         if not add_noise:
-            noise = Noise_EmptyNoise().generate_noise(latent)
+            noise_list = [Noise_EmptyNoise().generate_noise(latent) for noise_seed in noise_seed_list]
         else:
-            noise = Noise_RandomNoise(noise_seed).generate_noise(latent)
+            noise_list = [Noise_RandomNoise(noise_seed).generate_noise(latent) for noise_seed in noise_seed_list]
 
         noise_mask = None
         if "noise_mask" in latent:
             noise_mask = latent["noise_mask"]
 
-        x0_output = {}
-        callback = latent_preview.prepare_callback(
-            model, sigmas.shape[-1] - 1, x0_output
-        )
+        gc.collect()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        gpu_actors = ray_actors["workers"]
 
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-        samples = comfy.sample.sample_custom(
-            model,
-            noise,
-            cfg,
-            sampler,
-            sigmas,
-            positive,
-            negative,
-            latent_image,
-            noise_mask=noise_mask,
-            callback=callback,
-            disable_pbar=disable_pbar,
-            seed=noise_seed,
-        )
+        futures = [
+            actor.custom_sampler.remote(
+                noise_list[i],
+                noise_seed_list[i],
+                noise_mask,
+                cfg,
+                positive,
+                negative,
+                sampler,
+                sigmas,
+                latent_image,
 
+            )
+            for i, actor in enumerate(gpu_actors)
+        ]
+        samples_list = ray.get(futures)
+        samples = samples_list[0]
         out = latent.copy()
         out["samples"] = samples
-        if "x0" in x0_output:
-            out_denoised = latent.copy()
-            out_denoised["samples"] = model.model.process_latent_out(
-                x0_output["x0"].cpu()
-            )
-        else:
-            out_denoised = out
-        return (out, out_denoised)
+
+        return (out,)
 
 
 class RayAddNoise:
