@@ -93,16 +93,6 @@ def usp_dit_forward(
     transformer_options={},
     attn_mask: Tensor = None,
 ) -> Tensor:
-
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-    # Seq is odd (idk how) if the w == h, so just pad 0 to the end
-    if img.shape[1] != 3:
-        img = pad_if_odd(img, dim=1)
-        img_ids = pad_if_odd(img_ids, dim=1)
-        txt = pad_if_odd(txt, dim=1)
-        txt_ids = pad_if_odd(txt_ids, dim=1)
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-
     patches_replace = transformer_options.get("patches_replace", {})
 
     # running on sequences img
@@ -128,10 +118,15 @@ def usp_dit_forward(
     txt = self.txt_in(txt)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+    # Seq is odd (idk how) if the w == h, so just pad 0 to the end
+    img = pad_if_odd(img, dim=1)
+    img_ids = pad_if_odd(img_ids, dim=1)
+    txt = pad_if_odd(txt, dim=1)
+    txt_ids = pad_if_odd(txt_ids, dim=1)
     ids = torch.cat((txt_ids, img_ids), dim=1)
     pe_combine = self.pe_embedder(ids)
     pe_image = self.pe_embedder(img_ids)
-    # seq parallel
+
     pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
     pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
 
@@ -182,8 +177,8 @@ def usp_dit_forward(
                         img += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = get_sp_group().all_gather(img, dim=1)
-    txt = get_sp_group().all_gather(txt, dim=1)
+    img = get_sp_group().all_gather(img.contiguous(), dim=1)
+    txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
 
     img = torch.cat((txt, img), 1)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]

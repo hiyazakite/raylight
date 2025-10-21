@@ -295,7 +295,10 @@ class RayWorker:
         if self.parallel_dict["is_fsdp"] is True:
             self.model.patch_fsdp()
 
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
+        if self.local_rank == 0:
+            disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+
         with torch.no_grad():
             samples = comfy.sample.sample_custom(
                 self.model,
