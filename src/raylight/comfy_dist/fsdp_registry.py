@@ -42,8 +42,6 @@ class FSDPShardRegistry:
             if isinstance(model, registered_cls):
                 print(f"[FSDPRegistry] Wrapping {registered_cls.__name__}")
                 return shard_func(model, fsdp_state_dict, cpu_offload)
-            else:
-                raise ValueError(f"{type(model).__name__} is not supported for FSDP")
 
 
 # Register per-model handlers
