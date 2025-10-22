@@ -29,6 +29,16 @@ attn_type = xfuser_attn.get_attn_type()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
 
 
+def pad_if_odd(t: torch.Tensor, dim: int = 1):
+    if t.size(dim) % 2 != 0:
+        pad_shape = list(t.shape)
+        pad_shape[dim] = 1  # add one element along target dim
+        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+        t = torch.cat([t, pad_tensor], dim=dim)
+        return t, True
+    return t, False
+
+
 class DataType(Enum):
     IMAGE = "image"
     VIDEO = "video"
@@ -188,7 +198,15 @@ def usp_mini_train_dit_forward(
             x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
         ), f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
 
-    x_B_T_H_W_D = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ================ SEQUENCE PARALLEL ================== #
+    x_B_T_H_W_D, is_padded = pad_if_odd(x_B_T_H_W_D, 2)
+    B, T, H, W, D = x_B_T_H_W_D.shape
+    x_B_T_H_W_D = torch.chunk(x_B_T_H_W_D, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "(t h w) s c d -> t h w s c d", t=T, h=H, w=W)
+    rope_emb_L_1_1_D = torch.chunk(rope_emb_L_1_1_D, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "t h w s c d -> (t h w) s c d")
+    # ================ SEQUENCE PARALLEL ================== #
+
     block_kwargs = {
         "rope_emb_L_1_1_D": rope_emb_L_1_1_D.unsqueeze(1).unsqueeze(0),
         "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
@@ -203,7 +221,9 @@ def usp_mini_train_dit_forward(
             **block_kwargs,
         )
 
-    x_B_T_H_W_O = get_sp_group().all_gather(x, dim=1)
+    x_B_T_H_W_D = get_sp_group().all_gather(x_B_T_H_W_D, dim=2)
+    if is_padded is True:
+        x_B_T_H_W_D = x_B_T_H_W_D[:, :, :-1, :]
 
     x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
     x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)

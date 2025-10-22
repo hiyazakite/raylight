@@ -120,7 +120,7 @@ def _inject_hunyuan_3dv2(model_patcher, base_model, *args):
 
 @USPInjectRegistry.register(model_base.HunyuanVideo)
 def _inject_hunyuan(model_patcher, base_model, *args):
-    from ..diffusion_models.hunyuan_video.xdit_context_parallel import (
+    from ..diffusion_models.hunyuan_video.xdit_context_paralllel import (
         usp_dit_forward,
         usp_token_refiner_forward
     )
@@ -158,8 +158,8 @@ def _inject_cosmos_predict2(model_patcher, base_model, *args):
     )
     model = base_model.diffusion_model
     for block in model.blocks:
-        block.cross_attn.attn_op = types.MethodType(usp_xfuser_attention_op, block.cross_attn)
-        block.self_attn.attn_op = types.MethodType(usp_xfuser_attention_op, block.self_attn)
+        block.cross_attn.attn_op = usp_xfuser_attention_op
+        block.self_attn.attn_op = usp_xfuser_attention_op
     model._forward = types.MethodType(usp_mini_train_dit_forward, model)
 
 
@@ -172,3 +172,4 @@ def _inject_cosmos_video(model_patcher, base_model, *args):
     )
     model = base_model.diffusion_model
     model._forward = types.MethodType(usp_general_dit_forward, model)
+
