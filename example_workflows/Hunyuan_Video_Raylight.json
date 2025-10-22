@@ -249,71 +249,6 @@
       ]
     },
     {
-      "id": 84,
-      "type": "XFuserSamplerCustom",
-      "pos": [
-        1114.3648158427277,
-        17.660497546642695
-      ],
-      "size": [
-        270,
-        230
-      ],
-      "flags": {},
-      "order": 10,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "link": 231
-        },
-        {
-          "name": "positive",
-          "type": "CONDITIONING",
-          "link": 232
-        },
-        {
-          "name": "negative",
-          "type": "CONDITIONING",
-          "link": 233
-        },
-        {
-          "name": "sampler",
-          "type": "SAMPLER",
-          "link": 234
-        },
-        {
-          "name": "sigmas",
-          "type": "SIGMAS",
-          "link": 239
-        },
-        {
-          "name": "latent_image",
-          "type": "LATENT",
-          "link": 236
-        }
-      ],
-      "outputs": [
-        {
-          "name": "output",
-          "type": "LATENT",
-          "links": [
-            237
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "XFuserSamplerCustom"
-      },
-      "widgets_values": [
-        true,
-        897762960200913,
-        "randomize",
-        1
-      ]
-    },
-    {
       "id": 16,
       "type": "KSamplerSelect",
       "pos": [
@@ -384,45 +319,6 @@
       ],
       "color": "#232",
       "bgcolor": "#353"
-    },
-    {
-      "id": 87,
-      "type": "RayBasicScheduler",
-      "pos": [
-        817.0548357454236,
-        237.46523988378755
-      ],
-      "size": [
-        270,
-        106
-      ],
-      "flags": {},
-      "order": 9,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "link": 242
-        }
-      ],
-      "outputs": [
-        {
-          "name": "SIGMAS",
-          "type": "SIGMAS",
-          "links": [
-            239
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayBasicScheduler"
-      },
-      "widgets_values": [
-        "simple",
-        4,
-        1
-      ]
     },
     {
       "id": 86,
@@ -507,47 +403,6 @@
       ]
     },
     {
-      "id": 44,
-      "type": "CLIPTextEncode",
-      "pos": [
-        360,
-        0
-      ],
-      "size": [
-        422.8500061035156,
-        164.30999755859375
-      ],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 205
-        }
-      ],
-      "outputs": [
-        {
-          "name": "CONDITIONING",
-          "type": "CONDITIONING",
-          "slot_index": 0,
-          "links": [
-            232
-          ]
-        }
-      ],
-      "title": "CLIP Text Encode (Positive Prompt)",
-      "properties": {
-        "Node name for S&R": "CLIPTextEncode"
-      },
-      "widgets_values": [
-        "A video scene where 2 robots holding a spear start thowing into horizon, where the sky is beautiful night sky fill with nebulae and stars"
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
-    },
-    {
       "id": 88,
       "type": "RayInitializer",
       "pos": [
@@ -583,6 +438,151 @@
         false,
         false,
         "TORCH"
+      ]
+    },
+    {
+      "id": 44,
+      "type": "CLIPTextEncode",
+      "pos": [
+        360,
+        0
+      ],
+      "size": [
+        422.8500061035156,
+        164.30999755859375
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 205
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
+          "links": [
+            232
+          ]
+        }
+      ],
+      "title": "CLIP Text Encode (Positive Prompt)",
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "anime style anime girl with massive fennec ears and one big fluffy tail, she has blonde hair long hair blue eyes wearing a pink sweater and a long blue skirt walking in a beautiful outdoor scenery with snow mountains in the background"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 84,
+      "type": "XFuserSamplerCustom",
+      "pos": [
+        1114.3648158427277,
+        17.660497546642695
+      ],
+      "size": [
+        270,
+        230
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 231
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 232
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 233
+        },
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 234
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 239
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 236
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "LATENT",
+          "links": [
+            237
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "XFuserSamplerCustom"
+      },
+      "widgets_values": [
+        true,
+        897762960200913,
+        "randomize",
+        6
+      ]
+    },
+    {
+      "id": 87,
+      "type": "RayBasicScheduler",
+      "pos": [
+        817.0548357454236,
+        237.46523988378755
+      ],
+      "size": [
+        270,
+        106
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 242
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            239
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayBasicScheduler"
+      },
+      "widgets_values": [
+        "simple",
+        20,
+        1
       ]
     }
   ],
@@ -765,10 +765,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.8600000000000024,
+      "scale": 0.8571921853447139,
       "offset": [
-        438.0187176558996,
-        20.14431150344332
+        444.32576466630854,
+        -79.88498573041149
       ]
     },
     "frontendVersion": "1.28.7",

@@ -168,7 +168,7 @@ def usp_dit_forward(
         txt_ids = torch.cat((txt_ids, txt_byt5_ids), dim=1)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    ids = torch.cat((txt_ids, img_ids), dim=1)
+    ids = torch.cat((img_ids, txt_ids), dim=1)
     pe_combine = self.pe_embedder(ids)
     pe_image = self.pe_embedder(img_ids)
     # seq parallel
@@ -244,10 +244,10 @@ def usp_dit_forward(
                     img += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = get_sp_group().all_gather(img, dim=1)
-    txt = get_sp_group().all_gather(txt, dim=1)
+    img = get_sp_group().all_gather(img.contiguous(), dim=1)
+    txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
 
-    img = torch.cat((txt, img), 1)
+    img = torch.cat((img, txt), 1)
 
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
