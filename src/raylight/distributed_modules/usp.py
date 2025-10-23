@@ -120,7 +120,7 @@ def _inject_hunyuan_3dv2(model_patcher, base_model, *args):
 
 @USPInjectRegistry.register(model_base.HunyuanVideo)
 def _inject_hunyuan(model_patcher, base_model, *args):
-    from ..diffusion_models.hunyuan_video.xdit_context_paralllel import (
+    from ..diffusion_models.hunyuan_video.xdit_context_parallel import (
         usp_dit_forward,
         usp_token_refiner_forward
     )
