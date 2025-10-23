@@ -3,6 +3,8 @@ from xfuser.core.long_ctx_attention import (
 )
 
 from yunchang.kernels import AttnType
+from .sageattention_hf_patch import ensure_hf_sm90_kernel
+
 _ATTN_TYPE = None
 
 
@@ -33,6 +35,7 @@ def make_xfuser_attention(attn_type):
     elif attn_type.upper() == "SAGE_FP8_CUDA":
         attn = AttnType.SAGE_FP8
     elif attn_type.upper() == "SAGE_FP8_SM90":
+        ensure_hf_sm90_kernel()
         attn = AttnType.SAGE_FP8_SM90
     else:
         attn = AttnType.TORCH
