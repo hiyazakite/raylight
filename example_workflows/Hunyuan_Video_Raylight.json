@@ -1,8 +1,8 @@
 {
   "id": "b07dba9f-f409-47a6-84bb-a6639b2a70da",
   "revision": 0,
-  "last_node_id": 89,
-  "last_link_id": 243,
+  "last_node_id": 90,
+  "last_link_id": 246,
   "nodes": [
     {
       "id": 45,
@@ -131,34 +131,110 @@
       ]
     },
     {
-      "id": 80,
-      "type": "SaveVideo",
+      "id": 16,
+      "type": "KSamplerSelect",
       "pos": [
-        1420,
-        290
+        814.595096483231,
+        124.3772931671364
       ],
       "size": [
-        690,
-        488.5660377358491
+        250,
+        58
       ],
       "flags": {},
-      "order": 13,
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "links": [
+            234
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSamplerSelect"
+      },
+      "widgets_values": [
+        "euler"
+      ]
+    },
+    {
+      "id": 86,
+      "type": "RayModelSamplingSD3",
+      "pos": [
+        808.2137825069078,
+        23.550190873601014
+      ],
+      "size": [
+        270,
+        58
+      ],
+      "flags": {},
+      "order": 9,
       "mode": 0,
       "inputs": [
         {
-          "name": "video",
-          "type": "VIDEO",
-          "link": 217
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 245
         }
       ],
-      "outputs": [],
+      "outputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "links": [
+            231
+          ]
+        }
+      ],
       "properties": {
-        "Node name for S&R": "SaveVideo"
+        "Node name for S&R": "RayModelSamplingSD3"
       },
       "widgets_values": [
-        "video/ComfyUI",
-        "auto",
-        "auto"
+        7
+      ]
+    },
+    {
+      "id": 87,
+      "type": "RayBasicScheduler",
+      "pos": [
+        817.0548357454236,
+        237.46523988378755
+      ],
+      "size": [
+        270,
+        106
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "ray_actors",
+          "type": "RAY_ACTORS",
+          "link": 244
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            239
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RayBasicScheduler"
+      },
+      "widgets_values": [
+        "simple",
+        20,
+        1
       ]
     },
     {
@@ -173,7 +249,7 @@
         130
       ],
       "flags": {},
-      "order": 1,
+      "order": 2,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -204,7 +280,7 @@
       },
       "widgets_values": [
         "clip_l.safetensors",
-        "llava_llama.safetensors",
+        "llava_llama3_fp8_scaled.safetensors",
         "hunyuan_video",
         "default"
       ]
@@ -221,7 +297,7 @@
         60
       ],
       "flags": {},
-      "order": 2,
+      "order": 3,
       "mode": 0,
       "inputs": [],
       "outputs": [
@@ -249,42 +325,11 @@
       ]
     },
     {
-      "id": 16,
-      "type": "KSamplerSelect",
-      "pos": [
-        814.595096483231,
-        124.3772931671364
-      ],
-      "size": [
-        250,
-        58
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "SAMPLER",
-          "type": "SAMPLER",
-          "links": [
-            234
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "KSamplerSelect"
-      },
-      "widgets_values": [
-        "euler"
-      ]
-    },
-    {
       "id": 83,
       "type": "CLIPTextEncode",
       "pos": [
-        367.5209527186271,
-        234.56136846821806
+        358.1881564836931,
+        206.56297976341605
       ],
       "size": [
         422.8500061035156,
@@ -321,52 +366,15 @@
       "bgcolor": "#353"
     },
     {
-      "id": 86,
-      "type": "RayModelSamplingSD3",
+      "id": 90,
+      "type": "RayGGUFLoader",
       "pos": [
-        808.2137825069078,
-        23.550190873601014
+        -24.49455387064594,
+        313.3880766538275
       ],
       "size": [
-        270,
-        58
-      ],
-      "flags": {},
-      "order": 8,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "link": 241
-        }
-      ],
-      "outputs": [
-        {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "links": [
-            231
-          ]
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "RayModelSamplingSD3"
-      },
-      "widgets_values": [
-        7
-      ]
-    },
-    {
-      "id": 89,
-      "type": "RayUNETLoader",
-      "pos": [
-        -25.529085958993253,
-        334.2873736495896
-      ],
-      "size": [
-        303.6344416682682,
-        102
+        313.6119140625,
+        126
       ],
       "flags": {},
       "order": 7,
@@ -375,7 +383,7 @@
         {
           "name": "ray_actors_init",
           "type": "RAY_ACTORS_INIT",
-          "link": 243
+          "link": 246
         },
         {
           "name": "lora",
@@ -389,16 +397,17 @@
           "name": "ray_actors",
           "type": "RAY_ACTORS",
           "links": [
-            241,
-            242
+            244,
+            245
           ]
         }
       ],
       "properties": {
-        "Node name for S&R": "RayUNETLoader"
+        "Node name for S&R": "RayGGUFLoader"
       },
       "widgets_values": [
-        "hunyuan_video.safetensors",
+        "hunyuan-video-t2v-720p-Q4_0.gguf",
+        "default",
         "default"
       ]
     },
@@ -406,8 +415,8 @@
       "id": 88,
       "type": "RayInitializer",
       "pos": [
-        -25.06973558421064,
-        54.570863943651524
+        -8.73734217307612,
+        -3.7591125246860013
       ],
       "size": [
         291.400390625,
@@ -422,7 +431,7 @@
           "name": "ray_actors_init",
           "type": "RAY_ACTORS_INIT",
           "links": [
-            243
+            246
           ]
         }
       ],
@@ -439,47 +448,6 @@
         false,
         "TORCH"
       ]
-    },
-    {
-      "id": 44,
-      "type": "CLIPTextEncode",
-      "pos": [
-        360,
-        0
-      ],
-      "size": [
-        422.8500061035156,
-        164.30999755859375
-      ],
-      "flags": {},
-      "order": 5,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "clip",
-          "type": "CLIP",
-          "link": 205
-        }
-      ],
-      "outputs": [
-        {
-          "name": "CONDITIONING",
-          "type": "CONDITIONING",
-          "slot_index": 0,
-          "links": [
-            232
-          ]
-        }
-      ],
-      "title": "CLIP Text Encode (Positive Prompt)",
-      "properties": {
-        "Node name for S&R": "CLIPTextEncode"
-      },
-      "widgets_values": [
-        "anime style anime girl with massive fennec ears and one big fluffy tail, she has blonde hair long hair blue eyes wearing a pink sweater and a long blue skirt walking in a beautiful outdoor scenery with snow mountains in the background"
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
     },
     {
       "id": 84,
@@ -541,48 +509,81 @@
       },
       "widgets_values": [
         true,
-        897762960200913,
+        261358104112080,
         "randomize",
-        6
+        1
       ]
     },
     {
-      "id": 87,
-      "type": "RayBasicScheduler",
+      "id": 44,
+      "type": "CLIPTextEncode",
       "pos": [
-        817.0548357454236,
-        237.46523988378755
+        360,
+        0
       ],
       "size": [
-        270,
-        106
+        422.8500061035156,
+        164.30999755859375
       ],
       "flags": {},
-      "order": 9,
+      "order": 5,
       "mode": 0,
       "inputs": [
         {
-          "name": "ray_actors",
-          "type": "RAY_ACTORS",
-          "link": 242
+          "name": "clip",
+          "type": "CLIP",
+          "link": 205
         }
       ],
       "outputs": [
         {
-          "name": "SIGMAS",
-          "type": "SIGMAS",
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "slot_index": 0,
           "links": [
-            239
+            232
           ]
         }
       ],
+      "title": "CLIP Text Encode (Positive Prompt)",
       "properties": {
-        "Node name for S&R": "RayBasicScheduler"
+        "Node name for S&R": "CLIPTextEncode"
       },
       "widgets_values": [
-        "simple",
-        20,
-        1
+        "Close up scene of Crow in a night on top of skyscaper full of star and moonlight, the eyes of the crow is shining with the reflection of the nightsky, suddenly the crow fly away to horizon"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 80,
+      "type": "SaveVideo",
+      "pos": [
+        1420,
+        290
+      ],
+      "size": [
+        690,
+        488.5660377358491
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 217
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/ComfyUI",
+        "auto",
+        "auto"
       ]
     }
   ],
@@ -684,26 +685,26 @@
       "SIGMAS"
     ],
     [
-      241,
-      89,
-      0,
-      86,
-      0,
-      "RAY_ACTORS"
-    ],
-    [
-      242,
-      89,
+      244,
+      90,
       0,
       87,
       0,
       "RAY_ACTORS"
     ],
     [
-      243,
+      245,
+      90,
+      0,
+      86,
+      0,
+      "RAY_ACTORS"
+    ],
+    [
+      246,
       88,
       0,
-      89,
+      90,
       0,
       "RAY_ACTORS_INIT"
     ]
@@ -765,10 +766,10 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.8571921853447139,
+      "scale": 1.1409227986938153,
       "offset": [
-        444.32576466630854,
-        -79.88498573041149
+        -1019.728535875613,
+        -181.62412833080197
       ]
     },
     "frontendVersion": "1.28.7",
