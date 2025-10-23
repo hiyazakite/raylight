@@ -172,4 +172,3 @@ def _inject_cosmos_video(model_patcher, base_model, *args):
     )
     model = base_model.diffusion_model
     model._forward = types.MethodType(usp_general_dit_forward, model)
-

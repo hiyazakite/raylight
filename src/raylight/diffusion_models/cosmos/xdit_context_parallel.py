@@ -112,7 +112,14 @@ def usp_general_dit_forward(
             x.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
         ), f"{x.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape} {original_shape}"
 
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    # ================ SEQUENCE PARALLEL ================== #
+    x, is_padded = pad_if_odd(x, 2)
+    B, T, H, W, D = x.shape
+    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "(t h w) s c d -> t h w s c d", t=T, h=H, w=W)
+    rope_emb_L_1_1_D = torch.chunk(rope_emb_L_1_1_D, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    rope_emb_L_1_1_D = rearrange(rope_emb_L_1_1_D, "t h w s c d -> (t h w) s c d")
+    # ================ SEQUENCE PARALLEL ================== #
     transformer_options = kwargs.get("transformer_options", {})
     for _, block in self.blocks.items():
         assert (
@@ -132,6 +139,8 @@ def usp_general_dit_forward(
         )
 
     x = get_sp_group().all_gather(x, dim=1)
+    if is_padded is True:
+        x = x[:, :, :-1, :]
     x_B_T_H_W_D = rearrange(x, "T H W B D -> B T H W D")
 
     x_B_D_T_H_W = self.decoder_head(
