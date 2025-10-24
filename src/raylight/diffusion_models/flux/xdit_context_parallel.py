@@ -96,7 +96,6 @@ def usp_dit_forward(
 ) -> Tensor:
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    # Seq is odd (idk how) if the w == h, so just pad 0 to the end
     img = pad_if_odd(img, dim=1)
     img_ids = pad_if_odd(img_ids, dim=1)
     txt = pad_if_odd(txt, dim=1)
@@ -173,8 +172,8 @@ def usp_dit_forward(
         img = torch.nan_to_num(img, nan=0.0, posinf=65504, neginf=-65504)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = get_sp_group().all_gather(img, dim=1)
-    txt = get_sp_group().all_gather(txt, dim=1)
+    img = get_sp_group().all_gather(img.contiguous(), dim=1)
+    txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
 
     img = torch.cat((txt, img), 1)
 

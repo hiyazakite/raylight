@@ -1,5 +1,4 @@
 import torch
-from einops import rearrange
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -174,7 +173,202 @@ def usp_dit_forward(
     return x
 
 
-def usp_audio_dit_forward(
+def usp_vace_dit_forward(
+    self,
+    x,
+    t,
+    context,
+    vace_context,
+    vace_strength,
+    clip_fea=None,
+    freqs=None,
+    transformer_options={},
+    **kwargs,
+):
+    # embeddings
+    x = self.patch_embedding(x.float()).to(x.dtype)
+    grid_sizes = x.shape[2:]
+    x = x.flatten(2).transpose(1, 2)
+
+    # time embeddings
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype))
+    e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+
+    # context
+    context = self.text_embedding(context)
+
+    context_img_len = None
+    if clip_fea is not None:
+        if self.img_emb is not None:
+            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context = torch.concat([context_clip, context], dim=1)
+        context_img_len = clip_fea.shape[-2]
+
+    orig_shape = list(vace_context.shape)
+    vace_context = vace_context.movedim(0, 1).reshape([-1] + orig_shape[2:])
+    c = self.vace_patch_embedding(vace_context.float()).to(vace_context.dtype)
+    c = c.flatten(2).transpose(1, 2)
+    c = list(c.split(orig_shape[0], dim=0))
+
+    # arguments
+    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    x_orig = x
+
+    patches_replace = transformer_options.get("patches_replace", {})
+    blocks_replace = patches_replace.get("dit", {})
+    for i, block in enumerate(self.blocks):
+        if ("double_block", i) in blocks_replace:
+            def block_wrap(args):
+                out = {}
+                out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, transformer_options=args["transformer_options"])
+                return out
+            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+            x = out["img"]
+        else:
+            x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+
+        ii = self.vace_layers_mapping.get(i, None)
+        if ii is not None:
+            for iii in range(len(c)):
+                c_skip, c[iii] = self.vace_blocks[ii](c[iii], x=x_orig, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+                x += c_skip * vace_strength[iii]
+            del c_skip
+    # head
+    x = get_sp_group().all_gather(x, dim=1)
+    x = self.head(x, e)
+
+    # unpatchify
+    x = self.unpatchify(x, grid_sizes)
+    return x
+
+
+def usp_camera_dit_forward(
+    self,
+    x,
+    t,
+    context,
+    clip_fea=None,
+    freqs=None,
+    camera_conditions = None,
+    transformer_options={},
+    **kwargs,
+):
+    # embeddings
+    x = self.patch_embedding(x.float()).to(x.dtype)
+    if self.control_adapter is not None and camera_conditions is not None:
+        x = x + self.control_adapter(camera_conditions).to(x.dtype)
+    grid_sizes = x.shape[2:]
+    x = x.flatten(2).transpose(1, 2)
+
+    # time embeddings
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype))
+    e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+
+    # context
+    context = self.text_embedding(context)
+
+    context_img_len = None
+    if clip_fea is not None:
+        if self.img_emb is not None:
+            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context = torch.concat([context_clip, context], dim=1)
+        context_img_len = clip_fea.shape[-2]
+
+    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+
+    patches_replace = transformer_options.get("patches_replace", {})
+    blocks_replace = patches_replace.get("dit", {})
+    for i, block in enumerate(self.blocks):
+        if ("double_block", i) in blocks_replace:
+            def block_wrap(args):
+                out = {}
+                out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, transformer_options=args["transformer_options"])
+                return out
+            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+            x = out["img"]
+        else:
+            x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+
+    # head
+    x = get_sp_group().all_gather(x, dim=1)
+    x = self.head(x, e)
+
+    # unpatchify
+    x = self.unpatchify(x, grid_sizes)
+    return x
+
+
+def usp_humo_dit_forward(
+    self,
+    x,
+    t,
+    context,
+    freqs=None,
+    audio_embed=None,
+    reference_latent=None,
+    transformer_options={},
+    **kwargs,
+):
+    bs, _, time, height, width = x.shape
+
+    # embeddings
+    x = self.patch_embedding(x.float()).to(x.dtype)
+    grid_sizes = x.shape[2:]
+    x = x.flatten(2).transpose(1, 2)
+
+    # time embeddings
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
+    e = e.reshape(t.shape[0], -1, e.shape[-1])
+    e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+
+    if reference_latent is not None:
+        ref = self.patch_embedding(reference_latent.float()).to(x.dtype)
+        ref = ref.flatten(2).transpose(1, 2)
+        freqs_ref = self.rope_encode(reference_latent.shape[-3], reference_latent.shape[-2], reference_latent.shape[-1], t_start=time, device=x.device, dtype=x.dtype)
+        x = torch.cat([x, ref], dim=1)
+        freqs = torch.cat([freqs, freqs_ref], dim=1)
+        del ref, freqs_ref
+
+    # context
+    context = self.text_embedding(context)
+    context_img_len = None
+
+    if audio_embed is not None:
+        if reference_latent is not None:
+            zero_audio_pad = torch.zeros(audio_embed.shape[0], reference_latent.shape[-3], *audio_embed.shape[2:], device=audio_embed.device, dtype=audio_embed.dtype)
+            audio_embed = torch.cat([audio_embed, zero_audio_pad], dim=1)
+        audio = self.audio_proj(audio_embed).permute(0, 3, 1, 2).flatten(2).transpose(1, 2)
+    else:
+        audio = None
+
+    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+
+    patches_replace = transformer_options.get("patches_replace", {})
+    blocks_replace = patches_replace.get("dit", {})
+    for i, block in enumerate(self.blocks):
+        if ("double_block", i) in blocks_replace:
+            def block_wrap(args):
+                out = {}
+                out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, audio=audio, transformer_options=args["transformer_options"])
+                return out
+            out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
+            x = out["img"]
+        else:
+            x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, audio=audio, transformer_options=transformer_options)
+
+    # head
+    x = get_sp_group().all_gather(x, dim=1)
+    x = self.head(x, e)
+
+    # unpatchify
+    x = self.unpatchify(x, grid_sizes)
+    return x
+
+
+def usp_s2v_dit_forward(
     self,
     x,
     t,
@@ -239,16 +433,7 @@ def usp_audio_dit_forward(
     # context
     context = self.text_embedding(context)
 
-    # context_parallel
-    sp_rank = get_sequence_parallel_rank()
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)
-    sq_size = [u.shape[1] for u in x]
-    sp_rank = get_sequence_parallel_rank()
-    sq_start_size = sum(sq_size[:sp_rank])
-    x = x[sp_rank]
-    seg_idx = e0[0, 1] - sq_start_size
-    e0[0, 1] = seg_idx
-    freqs = torch.chunk(freqs, get_sequence_parallel_world_size(), dim=1)[sp_rank]
+    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
@@ -264,10 +449,9 @@ def usp_audio_dit_forward(
             x = block(x, e=e0, freqs=freqs, context=context)
         if audio_emb is not None:
             x = self.audio_injector(x, i, audio_emb, audio_emb_global, seq_len)
-
     # head
-    x = get_sp_group().all_gather(x, dim=1)
     x = self.head(x, e)
+    x = get_sp_group().all_gather(x, dim=1)
 
     # unpatchify
     x = self.unpatchify(x, grid_sizes)
@@ -343,25 +527,27 @@ def usp_i2v_cross_attn_forward(self, x, context, context_img_len, **kwargs):
     return x
 
 
-def usp_audio_injector(self, x, block_id, audio_emb, audio_emb_global, seq_len, **kwargs):
-    audio_attn_id = self.injected_block_id.get(block_id, None)
-    x = get_sp_group().all_gather(x, dim=1)
-    if audio_attn_id is None:
-        return x
+def usp_t2v_cross_attn_gather_forward(self, x, context, transformer_options={}, **kwargs):
+    r"""
+    Args:
+        x(Tensor): Shape [B, L1, C] - video tokens
+        context(Tensor): Shape [B, L2, C] - audio tokens with shape [B, frames*16, 1536]
+    """
+    b, n, d = x.size(0), self.num_heads, self.head_dim
 
-    num_frames = audio_emb.shape[1]
-    input_hidden_states = rearrange(x[:, :seq_len], "b (t n) c -> (b t) n c", t=num_frames)
-    if self.enable_adain and self.adain_mode == "attn_norm":
-        audio_emb_global = rearrange(audio_emb_global, "b t n c -> (b t) n c")
-        adain_hidden_states = self.injector_adain_layers[audio_attn_id](input_hidden_states, temb=audio_emb_global[:, 0])
-        attn_hidden_states = adain_hidden_states
-    else:
-        attn_hidden_states = self.injector_pre_norm_feat[audio_attn_id](input_hidden_states)
-    audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c", t=num_frames)
-    attn_audio_emb = audio_emb
-    residual_out = self.injector[audio_attn_id](x=attn_hidden_states, context=attn_audio_emb)
-    residual_out = rearrange(
-        residual_out, "(b t) n c -> b (t n) c", t=num_frames)
-    x[:, :seq_len] = x[:, :seq_len] + residual_out
-    x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    q = self.norm_q(self.q(x))
+    k = self.norm_k(self.k(context))
+    v = self.v(context)
+
+    # Handle audio temporal structure (16 tokens per frame)
+    k = k.reshape(-1, 16, n, d).transpose(1, 2)
+    v = v.reshape(-1, 16, n, d).transpose(1, 2)
+
+    # Handle video spatial structure
+    q = q.reshape(k.shape[0], -1, n, d).transpose(1, 2)
+
+    x = xfuser_optimized_attention(q, k, v, heads=self.num_heads, skip_reshape=True, skip_output_reshape=True, transformer_options=transformer_options)
+
+    x = x.transpose(1, 2).reshape(b, -1, n * d)
+    x = self.o(x)
     return x
