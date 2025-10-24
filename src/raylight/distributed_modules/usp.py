@@ -31,22 +31,72 @@ class USPInjectRegistry:
         raise ValueError(f"Model: {type(base_model).__name__} is not yet supported for USP Parallelism")
 
 
-@USPInjectRegistry.register(model_base.WAN22_S2V)
-def _inject_wan22(model_patcher, base_model, *args):
+@USPInjectRegistry.register(model_base.WAN21_Vace)
+def _inject_wan21_vace(model_patcher, base_model, *args):
+    pass
+
+
+@USPInjectRegistry.register(model_base.WAN21_Camera)
+def _inject_wan21_camera(model_patcher, base_model, *args):
     from ..diffusion_models.wan.xdit_context_parallel import (
-        usp_audio_dit_forward,
+        usp_camera_dit_forward,
         usp_self_attn_forward,
         usp_t2v_cross_attn_forward,
-        usp_audio_injector
     )
     model = base_model.diffusion_model
     for block in model.blocks:
         block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
         block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
-    model.audio_injector.forward = types.MethodType(usp_audio_injector, model.audio_injector)
-    for inject in model.audio_injector.injector:
-        inject.forward = types.MethodType(usp_t2v_cross_attn_forward, inject)
-    model.forward_orig = types.MethodType(usp_audio_dit_forward, model)
+    model.forward_orig = types.MethodType(usp_camera_dit_forward, model)
+
+
+@USPInjectRegistry.register(model_base.WAN21_HuMo)
+def _inject_wan21_humo(model_patcher, base_model, *args):
+    from ..diffusion_models.wan.xdit_context_parallel import (
+        usp_humo_dit_forward,
+        usp_self_attn_forward,
+        usp_t2v_cross_attn_forward,
+        usp_t2v_cross_attn_gather_forward
+    )
+    model = base_model.diffusion_model
+    model.wan_attn_block_class.audio_cross_attn.forward = type.MethodType(usp_t2v_cross_attn_gather_forward, model.wan_attn_block_class.audio_cross_attn)
+    for block in model.blocks:
+        block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
+        block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+    model.forward_orig = types.MethodType(usp_humo_dit_forward, model)
+
+
+@USPInjectRegistry.register(model_base.WAN22_Animate)
+def _inject_wan22_animate(model_patcher, base_model, *args):
+    from ..diffusion_models.wan.xdit_context_parallel_animate import (
+        usp_animate_dit_forward,
+        usp_face_block_forward,
+    )
+    from ..diffusion_models.wan.xdit_context_parallel import (
+        usp_self_attn_forward,
+        usp_t2v_cross_attn_forward,
+    )
+    model = base_model.diffusion_model
+    for block in model.blocks:
+        block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
+        block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+    for face_block in model.face_adapter.fuser_blocks:
+        face_block.forward = types.MethodType(usp_face_block_forward, face_block)
+    model.forward_orig = types.MethodType(usp_animate_dit_forward, model)
+
+
+@USPInjectRegistry.register(model_base.WAN22_S2V)
+def _inject_wan22_s2v(model_patcher, base_model, *args):
+    from ..diffusion_models.wan.xdit_context_parallel import (
+        usp_s2v_dit_forward,
+        usp_self_attn_forward,
+        usp_t2v_cross_attn_forward,
+    )
+    model = base_model.diffusion_model
+    for block in model.blocks:
+        block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
+        block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
+    model.forward_orig = types.MethodType(usp_s2v_dit_forward, model)
 
 
 @USPInjectRegistry.register(model_base.WAN21)
