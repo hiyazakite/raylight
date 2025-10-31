@@ -40,7 +40,6 @@ def usp_dit_forward(
     control=None,
     **kwargs
 ):
-    x = pad_if_odd(x, dim=1)
     context = pad_if_odd(context, dim=1)
 
     timestep = timesteps
@@ -75,6 +74,8 @@ def usp_dit_forward(
             hidden_states = torch.cat([hidden_states, kontext], dim=1)
             img_ids = torch.cat([img_ids, kontext_ids], dim=1)
 
+    hidden_states = pad_if_odd(hidden_states, dim=1)
+    img_ids = pad_if_odd(img_ids, dim=1)
     image_rotary_emb = self.pe_embedder(img_ids).squeeze(1).unsqueeze(2).to(x.dtype)
     del img_ids
 
@@ -92,6 +93,7 @@ def usp_dit_forward(
     )
 
     # Context parallel
+
     sp_rank = get_sequence_parallel_rank()
     sp_world_size = get_sequence_parallel_world_size()
     hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
