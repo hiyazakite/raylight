@@ -7,7 +7,7 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
-from .xdit_context_parallel import sinusoidal_embedding_1d
+from .xdit_context_parallel import sinusoidal_embedding_1d, pad_if_odd
 
 attn_type = xfuser_attn.get_attn_type()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
@@ -96,6 +96,7 @@ def usp_animate_dit_forward(
         context_img_len = clip_fea.shape[-2]
 
     # Context Parallel
+    x = pad_if_odd(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     patches_replace = transformer_options.get("patches_replace", {})

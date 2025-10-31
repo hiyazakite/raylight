@@ -10,6 +10,15 @@ attn_type = xfuser_attn.get_attn_type()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
 
 
+def pad_if_odd(t: torch.Tensor, dim: int = 1):
+    if t.size(dim) % 2 != 0:
+        pad_shape = list(t.shape)
+        pad_shape[dim] = 1  # add one element along target dim
+        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+        t = torch.cat([t, pad_tensor], dim=dim)
+    return t
+
+
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
@@ -134,6 +143,7 @@ def usp_dit_forward(
         context_img_len = clip_fea.shape[-2]
 
     # Context Parallel
+    x = pad_if_odd(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     patches_replace = transformer_options.get("patches_replace", {})
@@ -212,6 +222,7 @@ def usp_vace_dit_forward(
     c = list(c.split(orig_shape[0], dim=0))
 
     # arguments
+    x = pad_if_odd(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     x_orig = x
 
@@ -276,6 +287,7 @@ def usp_camera_dit_forward(
             context = torch.concat([context_clip, context], dim=1)
         context_img_len = clip_fea.shape[-2]
 
+    x = pad_if_odd(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     patches_replace = transformer_options.get("patches_replace", {})
@@ -344,6 +356,7 @@ def usp_humo_dit_forward(
     else:
         audio = None
 
+    x = pad_if_odd(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     patches_replace = transformer_options.get("patches_replace", {})
@@ -433,6 +446,7 @@ def usp_s2v_dit_forward(
     # context
     context = self.text_embedding(context)
 
+    x = pad_if_odd(x, dim=1)
     x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
 
     patches_replace = transformer_options.get("patches_replace", {})
