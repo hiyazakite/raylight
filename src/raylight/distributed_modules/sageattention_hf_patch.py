@@ -1,10 +1,12 @@
 import logging
 import inspect
-from typing import Any
+import sys
+import types
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-_PATCHED = False
+_PATCHED: set[str] = set()
 
 
 def _supports_argument(fn, name: str) -> bool:
@@ -18,18 +20,27 @@ def _supports_argument(fn, name: str) -> bool:
         return bool(code and name in code.co_varnames)
 
 
-def ensure_hf_sm90_kernel() -> bool:
-    global _PATCHED
-    if _PATCHED:
-        return True
+def _ensure_sageattention_core():
+    module = sys.modules.get("sageattention")
+    if module is None:
+        try:
+            import sageattention as module  # type: ignore
+        except ImportError:
+            module = types.ModuleType("sageattention")
+            sys.modules["sageattention"] = module
 
-    try:
-        import sageattention
-        from sageattention import core as official_core
-    except ImportError:
-        logger.warning("Unable to patch SageAttention SM90 kernel: package 'sageattention' not found.")
-        return False
+    core = getattr(module, "core", None)
+    if core is None:
+        try:
+            from sageattention import core as core_module  # type: ignore
+        except ImportError:
+            core_module = types.SimpleNamespace()
+        module.core = core = core_module
 
+    return module, core
+
+
+def _load_hf_kernel(attr_name: str, log_label: str) -> Optional[Callable[..., Any]]:
     hf_kernel = None
 
     try:
@@ -47,13 +58,19 @@ def ensure_hf_sm90_kernel() -> bool:
 
     if hf_kernel is None:
         try:
-            from sage_attention import sageattn_qk_int8_pv_fp8_cuda_sm90 as hf_kernel  # type: ignore
-        except ImportError:
+            import sage_attention  # type: ignore
+            hf_kernel = getattr(sage_attention, attr_name)
+        except (ImportError, AttributeError):
             logger.warning(
-                "HuggingFace SageAttention SM90 kernel not available; continuing with original implementation."
+                "HuggingFace SageAttention %s kernel not available; continuing with original implementation.",
+                log_label,
             )
-            return False
+            return None
 
+    return hf_kernel
+
+
+def _make_hf_wrapper(hf_kernel: Callable[..., Any]):
     def _hf_wrapper(
         q,
         k,
@@ -86,8 +103,37 @@ def ensure_hf_sm90_kernel() -> bool:
 
         return result
 
-    official_core.sageattn_qk_int8_pv_fp8_cuda_sm90 = _hf_wrapper
-    setattr(sageattention, "sageattn_qk_int8_pv_fp8_cuda_sm90", _hf_wrapper)
-    _PATCHED = True
-    logger.info("Patched SageAttention SM90 kernel to use HuggingFace implementation.")
+    return _hf_wrapper
+
+
+def _ensure_kernel(attr_name: str, log_label: str) -> bool:
+    if attr_name in _PATCHED:
+        return True
+
+    hf_kernel = _load_hf_kernel(attr_name, log_label)
+    if hf_kernel is None:
+        return False
+
+    sageattention, official_core = _ensure_sageattention_core()
+    _hf_wrapper = _make_hf_wrapper(hf_kernel)
+
+    setattr(official_core, attr_name, _hf_wrapper)
+    setattr(sageattention, attr_name, _hf_wrapper)
+    _PATCHED.add(attr_name)
+
+    logger.info("Patched SageAttention %s kernel to use HuggingFace implementation.", log_label)
     return True
+
+
+def ensure_hf_sm90_kernel() -> bool:
+    # try:
+    #     import sageattention
+    #     from sageattention import core as official_core
+    # except ImportError:
+    #     logger.warning("Unable to patch SageAttention SM90 kernel: package 'sageattention' not found.")
+    #     return False
+    return _ensure_kernel("sageattn_qk_int8_pv_fp8_cuda_sm90", "SM90")
+
+
+def ensure_hf_fp8_cuda_kernel() -> bool:
+    return _ensure_kernel("sageattn_qk_int8_pv_fp8_cuda", "FP8 CUDA")
