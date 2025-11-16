@@ -27,6 +27,7 @@ class RayInitializer:
                 "GPU": ("INT", {"default": 2}),
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
+                "cfg_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
                 "XFuser_attention": (
@@ -58,6 +59,7 @@ class RayInitializer:
         GPU,
         ulysses_degree,
         ring_degree,
+        cfg_degree,
         FSDP,
         FSDP_CPU_OFFLOAD,
         XFuser_attention,
@@ -72,30 +74,31 @@ class RayInitializer:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         self.parallel_dict = dict()
 
-        # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = GPU
-        # TODO, in asymmetric GPU setup where the user select main GPU, this could raise error
         max_world_size = torch.cuda.device_count()
         if world_size > max_world_size:
             raise ValueError("Too many gpus")
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
-        if world_size < ulysses_degree * ring_degree:
+        if world_size < ulysses_degree * ring_degree * cfg_degree:
             raise ValueError(
                 f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}"
             )
-        if FSDP is True and (world_size == 1):
-            raise ValueError("ERROR, FSDP cannot be use in single cuda/cudalike device")
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
-        self.parallel_dict["is_dumb_parallel"] = True
+        self.parallel_dict["global_world_size"] = world_size
 
-        if ulysses_degree > 1 or ring_degree > 1:
+        if (
+            ulysses_degree > 1
+            or ring_degree > 1
+            or cfg_degree > 1
+        ):
             self.parallel_dict["attention"] = XFuser_attention
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
             self.parallel_dict["ring_degree"] = ring_degree
+            self.parallel_dict["cfg_degree"] = cfg_degree
 
         if FSDP:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD

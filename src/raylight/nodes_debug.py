@@ -23,6 +23,7 @@ class RayInitializerDebug:
                 "GPU": ("INT", {"default": 2}),
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
+                "cfg_degree": ("INT", {"default": 1}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
                 "XFuser_attention": ([
@@ -51,6 +52,7 @@ class RayInitializerDebug:
         GPU,
         ulysses_degree,
         ring_degree,
+        cfg_degree,
         FSDP,
         FSDP_CPU_OFFLOAD,
         XFuser_attention
@@ -71,16 +73,22 @@ class RayInitializerDebug:
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
+        self.parallel_dict["global_world_size"] = world_size
         self.parallel_dict["is_dumb_parallel"] = True
 
         self.parallel_dict["ulysses_degree"] = ulysses_degree
         self.parallel_dict["ring_degree"] = 1
 
-        if ulysses_degree > 0 or ring_degree > 0:
+        if (
+            ulysses_degree > 0
+            or ring_degree > 0
+            or cfg_degree > 0
+        ):
             self.parallel_dict["attention"] = XFuser_attention
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
             self.parallel_dict["ring_degree"] = ring_degree
+            self.parallel_dict["cfg_degree"] = cfg_degree
 
         if FSDP:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD

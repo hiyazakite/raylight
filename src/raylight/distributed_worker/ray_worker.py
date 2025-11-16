@@ -32,13 +32,16 @@ from ray.exceptions import RayActorError
 
 # Comfy cli args, does not get pass through into ray actor
 class RayWorker:
-    def __init__(self, local_rank, world_size, device_id, parallel_dict):
+    def __init__(self, local_rank, device_id, parallel_dict):
         self.model = None
         self.model_type = None
         self.state_dict = None
 
         self.local_rank = local_rank
-        self.world_size = world_size
+        self.global_world_size = parallel_dict["global_world_size"]
+        self.cp_world_size = parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
+        self.cfg_world_size = parallel_dict["cfg_degree"]
+
         self.device_id = device_id
         self.parallel_dict = parallel_dict
         self.device = torch.device(f"cuda:{self.device_id}")
@@ -57,7 +60,7 @@ class RayWorker:
                 dist.init_process_group(
                     "nccl",
                     rank=local_rank,
-                    world_size=self.world_size,
+                    world_size=self.global_world_size,
                     timeout=timedelta(minutes=1),
                     # device_id=self.device
                 )
@@ -66,13 +69,16 @@ class RayWorker:
                 dist.init_process_group(
                     "gloo",
                     rank=local_rank,
-                    world_size=self.world_size,
+                    world_size=self.global_world_size,
                     timeout=timedelta(minutes=1),
                     # device_id=self.device
                 )
-            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
+
+            # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
+            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
             pg = dist.group.WORLD
-            pm.set_cp_group(pg, list(range(self.world_size)), local_rank)
+            pm.set_cp_group(pg, list(range(self.cp_world_size)), self.local_rank)
+            pm.set_cfg_group(pg, list(range(self.cfg_world_size)), self.local_rank)
         else:
             print(
                 f"Running Ray in normal seperate sampler with: {self.world_size} number of workers"
@@ -85,31 +91,25 @@ class RayWorker:
                 initialize_model_parallel,
             )
             xfuser_attn.set_attn_type(self.parallel_dict["attention"])
+
             cp_rank, cp_size = pm.get_cp_rank_size()
             ulysses_degree = self.parallel_dict["ulysses_degree"]
             ring_degree = self.parallel_dict["ring_degree"]
 
+            cfg_rank, cfg_size = pm.get_cfg_rank_size()
+
             print("XDiT is enable")
             init_distributed_environment(rank=cp_rank, world_size=cp_size)
 
-            if ulysses_degree is None and ring_degree is None:
-                print(
-                    f"No usp config, use default config: ulysses_degree={cp_size}, ring_degree=1"
-                )
-                initialize_model_parallel(
-                    sequence_parallel_degree=self.world_size,
-                    ring_degree=1,
-                    ulysses_degree=cp_size
-                )
-            else:
-                print(
-                    f"Use usp config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}"
-                )
-                initialize_model_parallel(
-                    sequence_parallel_degree=self.world_size,
-                    ring_degree=ring_degree,
-                    ulysses_degree=ulysses_degree,
-                )
+            print(
+                f"Paralllel config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, cfg_degree={cfg_size}"
+            )
+            initialize_model_parallel(
+                sequence_parallel_degree=cp_size,
+                classifier_free_guidance_degree=cfg_size,
+                ring_degree=ring_degree,
+                ulysses_degree=ulysses_degree,
+            )
 
     def get_meta_model(self):
         first_param_device = next(self.model.model.parameters()).device
@@ -426,7 +426,7 @@ class RayCOMMTester:
                 # device_id=self.device
             )
         pg = dist.group.WORLD
-        cp.set_cp_group(pg, list(range(world_size)), local_rank)
+        pm.set_cp_group(pg, list(range(world_size)), local_rank)
 
         print("Running COMM pre-run")
 
@@ -471,7 +471,6 @@ def ray_nccl_tester(world_size):
         actor.kill.remote()
 
 
-# Just kill the damn actor when lora change, so no dangling memory leak BS when FSDP.
 def make_ray_actor_fn(
     world_size,
     parallel_dict
@@ -488,7 +487,6 @@ def make_ray_actor_fn(
             gpu_actors.append(
                 gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
                     local_rank=local_rank,
-                    world_size=world_size,
                     device_id=0,
                     parallel_dict=parallel_dict,
                 )
@@ -502,6 +500,7 @@ def make_ray_actor_fn(
     return _init_ray_actor
 
 
+# (TODO-Komikndr) Should be removed since FSDP can be unloaded properly
 def ensure_fresh_actors(ray_actors_init):
     ray_actors, ray_actor_fn = ray_actors_init
     gpu_actors = ray_actors["workers"]
