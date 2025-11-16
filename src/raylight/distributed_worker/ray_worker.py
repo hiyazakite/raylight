@@ -15,7 +15,7 @@ from comfy import (
 )  # Must manually insert comfy package or ray cannot import raylight to cluster
 import comfy.patcher_extension as pe
 
-import raylight.distributed_worker.context_parallel as cp
+import raylight.distributed_worker.parallel_manager as pm
 import raylight.distributed_modules.attention as xfuser_attn
 from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
@@ -72,7 +72,7 @@ class RayWorker:
                 )
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.world_size,))
             pg = dist.group.WORLD
-            cp.set_cp_group(pg, list(range(self.world_size)), local_rank)
+            pm.set_cp_group(pg, list(range(self.world_size)), local_rank)
         else:
             print(
                 f"Running Ray in normal seperate sampler with: {self.world_size} number of workers"
@@ -85,7 +85,7 @@ class RayWorker:
                 initialize_model_parallel,
             )
             xfuser_attn.set_attn_type(self.parallel_dict["attention"])
-            cp_rank, cp_size = cp.get_cp_rank_size()
+            cp_rank, cp_size = pm.get_cp_rank_size()
             ulysses_degree = self.parallel_dict["ulysses_degree"]
             ring_degree = self.parallel_dict["ring_degree"]
 
