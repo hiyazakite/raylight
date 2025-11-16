@@ -209,6 +209,7 @@ class RayUNETLoader:
         for actor in gpu_actors:
             if parallel_dict["is_xdit"]:
                 patched_futures.append(actor.patch_usp.remote())
+                patched_futures.append(actor.patch_cfg.remote())
 
         ray.get(patched_futures)
 
