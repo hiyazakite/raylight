@@ -33,18 +33,26 @@ from raylight.diffusion_models.wan.xdit_cfg_parallel import cfg_parallel_forward
 # If called from ray actor within. dist.barrier() become the sync.
 
 def init_parallel_groups(cp_ranks, cfg_ranks, global_rank):
+    """
+    Create subgroups and call set_cp_group / set_cfg_group only on members.
+    cp_ranks and cfg_ranks are lists of global ranks (integers).
+    """
+    # Create subgroups only if non-empty
     cp_pg = None
     cfg_pg = None
 
+    # Create cp group if there are ranks
     if cp_ranks:
         cp_pg = dist.new_group(ranks=cp_ranks)
         if global_rank in cp_ranks:
+            # this process is a member — initialize CP context
             pm.set_cp_group(cp_pg, cp_ranks, global_rank)
 
     # Create cfg group if there are ranks
     if cfg_ranks:
         cfg_pg = dist.new_group(ranks=cfg_ranks)
         if global_rank in cfg_ranks:
+            # this process is a member — initialize CFG context
             pm.set_cfg_group(cfg_pg, cfg_ranks, global_rank)
 
     return cp_pg, cfg_pg
@@ -97,27 +105,6 @@ class RayWorker:
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
             world_size = dist.get_world_size()
 
-            cp_ranks = list(range(0, self.cp_world_size))
-            cfg_ranks = list(range(self.cp_world_size,  + self.cfg_world_size))
-
-            print(f"{cp_ranks=}=====================")
-            print(f"{cfg_ranks=}=====================")
-            print(f"{self.global_world_size=}=====================")
-            print(f"{self.cp_world_size=}=====================")
-            print(f"{self.cfg_world_size=}=====================")
-
-
-            # create groups and initialize only for members
-            if cp_ranks:
-                cp_pg = dist.new_group(ranks=cp_ranks)
-                if self.local_rank in cp_ranks:
-                    pm.set_cp_group(cp_pg, cp_ranks, self.local_rank)
-
-            if cfg_ranks:
-                cfg_pg = dist.new_group(ranks=cfg_ranks)
-                if self.local_rank in cfg_ranks:
-                    pm.set_cfg_group(cfg_pg, cfg_ranks, self.local_rank)
-
         else:
             print(
                 f"Running Ray in normal seperate sampler with: {self.world_size} number of workers"
@@ -134,21 +121,21 @@ class RayWorker:
             cp_rank, cp_size = pm.get_cp_rank_size()
             ulysses_degree = self.parallel_dict["ulysses_degree"]
             ring_degree = self.parallel_dict["ring_degree"]
-
-            cfg_rank, cfg_size = pm.get_cfg_rank_size()
+            cfg_degree = self.parallel_dict["cfg_degree"]
 
             print("XDiT is enable")
-            init_distributed_environment(rank=cp_rank, world_size=cp_size)
+            init_distributed_environment(rank=self.local_rank, world_size=self.global_world_size)
 
             print(
-                f"Paralllel config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, cfg_degree={cfg_size}"
+                f"Paralllel config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, cfg_degree={cfg_degree}"
             )
             initialize_model_parallel(
                 sequence_parallel_degree=cp_size,
-                classifier_free_guidance_degree=cfg_size,
+                classifier_free_guidance_degree=cfg_degree,
                 ring_degree=ring_degree,
                 ulysses_degree=ulysses_degree,
             )
+
 
     def get_meta_model(self):
         first_param_device = next(self.model.model.parameters()).device
