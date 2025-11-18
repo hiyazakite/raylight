@@ -1,13 +1,12 @@
 import torch
 from xfuser.core.distributed import (
-    get_classifier_free_guidance_world_size,
     get_classifier_free_guidance_rank,
     get_cfg_group,
 )
 
 # def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
 #     cfg_rank = get_classifier_free_guidance_rank()
-#     cfg_world_size = get_classifier_free_guidance_world_size
+#     cfg_world_size = get_classifier_free_guidance_world_size()
 #
 #     x = torch.chunk(x, cfg_world_size,dim=0)[cfg_rank]
 #     timestep = torch.chunk(timestep, cfg_world_size,dim=0)[cfg_rank]
@@ -39,8 +38,11 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
     print(f"shape of context ===================== {context.shape=}")
     return executor(*args, **kwargs)
 
+def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
+    cfg_rank = get_classifier_free_guidance_rank()
 
+    model, conds, x_in, timestep, model_options = args
+    conds = [conds[cfg_rank]]
 
-
-
-
+    new_args = (model, conds, x_in, timestep, model_options)
+    return executor(*new_args, **kwargs)

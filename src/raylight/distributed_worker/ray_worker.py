@@ -153,7 +153,7 @@ class RayWorker:
 
     def patch_cfg(self):
         self.model.add_wrapper(
-            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+            pe.WrappersMP.CALC_COND_BATCH,
             cfg_parallel_forward_wrapper
         )
 
