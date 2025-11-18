@@ -18,10 +18,11 @@ import comfy.patcher_extension as pe
 import raylight.distributed_worker.parallel_manager as pm
 import raylight.distributed_modules.attention as xfuser_attn
 from raylight.distributed_modules.usp import USPInjectRegistry
-from raylight.diffusion_models.xdit_cfg_parallel import cfg_parallel_forward_wrapper
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 from ray.exceptions import RayActorError
+
+from raylight.diffusion_models.wan.xdit_cfg_parallel import cfg_parallel_forward_wrapper
 
 
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
@@ -153,7 +154,7 @@ class RayWorker:
 
     def patch_cfg(self):
         self.model.add_wrapper(
-            pe.WrappersMP.CALC_COND_BATCH,
+            pe.WrappersMP.DIFFUSION_MODEL,
             cfg_parallel_forward_wrapper
         )
 
