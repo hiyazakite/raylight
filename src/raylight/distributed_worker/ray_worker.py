@@ -32,6 +32,23 @@ from raylight.diffusion_models.wan.xdit_cfg_parallel import cfg_parallel_forward
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
 
+def init_parallel_groups(cp_ranks, cfg_ranks, global_rank):
+    cp_pg = None
+    cfg_pg = None
+
+    if cp_ranks:
+        cp_pg = dist.new_group(ranks=cp_ranks)
+        if global_rank in cp_ranks:
+            pm.set_cp_group(cp_pg, cp_ranks, global_rank)
+
+    # Create cfg group if there are ranks
+    if cfg_ranks:
+        cfg_pg = dist.new_group(ranks=cfg_ranks)
+        if global_rank in cfg_ranks:
+            pm.set_cfg_group(cfg_pg, cfg_ranks, global_rank)
+
+    return cp_pg, cfg_pg
+
 # Comfy cli args, does not get pass through into ray actor
 class RayWorker:
     def __init__(self, local_rank, device_id, parallel_dict):
@@ -78,9 +95,29 @@ class RayWorker:
 
             # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
-            pg = dist.group.WORLD
-            pm.set_cp_group(pg, list(range(self.cp_world_size)), self.local_rank)
-            pm.set_cfg_group(pg, list(range(self.cfg_world_size)), self.local_rank)
+            world_size = dist.get_world_size()
+
+            cp_ranks = list(range(0, self.cp_world_size))
+            cfg_ranks = list(range(self.cp_world_size,  + self.cfg_world_size))
+
+            print(f"{cp_ranks=}=====================")
+            print(f"{cfg_ranks=}=====================")
+            print(f"{self.global_world_size=}=====================")
+            print(f"{self.cp_world_size=}=====================")
+            print(f"{self.cfg_world_size=}=====================")
+
+
+            # create groups and initialize only for members
+            if cp_ranks:
+                cp_pg = dist.new_group(ranks=cp_ranks)
+                if self.local_rank in cp_ranks:
+                    pm.set_cp_group(cp_pg, cp_ranks, self.local_rank)
+
+            if cfg_ranks:
+                cfg_pg = dist.new_group(ranks=cfg_ranks)
+                if self.local_rank in cfg_ranks:
+                    pm.set_cfg_group(cfg_pg, cfg_ranks, self.local_rank)
+
         else:
             print(
                 f"Running Ray in normal seperate sampler with: {self.world_size} number of workers"
@@ -535,3 +572,4 @@ def ensure_fresh_actors(ray_actors_init):
     parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
 
     return ray_actors, gpu_actors, parallel_dict
+
