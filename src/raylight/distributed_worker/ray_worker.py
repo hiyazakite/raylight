@@ -17,12 +17,13 @@ import comfy.patcher_extension as pe
 
 import raylight.distributed_worker.parallel_manager as pm
 import raylight.distributed_modules.attention as xfuser_attn
+
 from raylight.distributed_modules.usp import USPInjectRegistry
+from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
+
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
 from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
 from ray.exceptions import RayActorError
-
-from raylight.diffusion_models.wan.xdit_cfg_parallel import cfg_parallel_forward_wrapper
 
 
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
@@ -31,31 +32,6 @@ from raylight.diffusion_models.wan.xdit_cfg_parallel import cfg_parallel_forward
 
 # If ray actor function being called from outside, ray.get([task in actor task]) will become sync between rank
 # If called from ray actor within. dist.barrier() become the sync.
-
-def init_parallel_groups(cp_ranks, cfg_ranks, global_rank):
-    """
-    Create subgroups and call set_cp_group / set_cfg_group only on members.
-    cp_ranks and cfg_ranks are lists of global ranks (integers).
-    """
-    # Create subgroups only if non-empty
-    cp_pg = None
-    cfg_pg = None
-
-    # Create cp group if there are ranks
-    if cp_ranks:
-        cp_pg = dist.new_group(ranks=cp_ranks)
-        if global_rank in cp_ranks:
-            # this process is a member — initialize CP context
-            pm.set_cp_group(cp_pg, cp_ranks, global_rank)
-
-    # Create cfg group if there are ranks
-    if cfg_ranks:
-        cfg_pg = dist.new_group(ranks=cfg_ranks)
-        if global_rank in cfg_ranks:
-            # this process is a member — initialize CFG context
-            pm.set_cfg_group(cfg_pg, cfg_ranks, global_rank)
-
-    return cp_pg, cfg_pg
 
 # Comfy cli args, does not get pass through into ray actor
 class RayWorker:
@@ -117,8 +93,6 @@ class RayWorker:
                 initialize_model_parallel,
             )
             xfuser_attn.set_attn_type(self.parallel_dict["attention"])
-
-            cp_rank, cp_size = pm.get_cp_rank_size()
             ulysses_degree = self.parallel_dict["ulysses_degree"]
             ring_degree = self.parallel_dict["ring_degree"]
             cfg_degree = self.parallel_dict["cfg_degree"]
@@ -135,7 +109,6 @@ class RayWorker:
                 ring_degree=ring_degree,
                 ulysses_degree=ulysses_degree,
             )
-
 
     def get_meta_model(self):
         first_param_device = next(self.model.model.parameters()).device
@@ -179,7 +152,7 @@ class RayWorker:
     def patch_cfg(self):
         self.model.add_wrapper(
             pe.WrappersMP.DIFFUSION_MODEL,
-            cfg_parallel_forward_wrapper
+            CFGParallelInjectRegistry.inject(self.model)
         )
 
     def patch_usp(self):

@@ -1,0 +1,67 @@
+from comfy import model_base
+
+
+class CFGParallelInjectRegistry:
+    """Registry for registering and applying CFG context parallelism injections."""
+
+    _REGISTRY = {}
+
+    @classmethod
+    def register(cls, model_class):
+        """Register a model class and its CFG injection handler.
+
+        Most specific (child) models must be registered before base classes.
+        Example:
+            @CFGParallelInjectRegistry.register(model_base.Chroma)
+            def _inject_chroma(model): ...
+        """
+        def decorator(inject_func):
+            cls._REGISTRY[model_class] = inject_func
+            return inject_func
+        return decorator
+
+    @classmethod
+    def inject(cls, model_patcher):
+        base_model = model_patcher.model
+        for registered_cls, inject_func in cls._REGISTRY.items():
+            if isinstance(base_model, registered_cls):
+                print(f"[CFG] Initializing CFG for {registered_cls.__name__}")
+                return inject_func()
+        raise ValueError(f"Model: {type(base_model).__name__} is not yet supported for CFG Parallelism")
+
+
+@CFGParallelInjectRegistry.register(model_base.WAN21)
+def _inject_wan21():
+    from ..diffusion_models.wan.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
+@CFGParallelInjectRegistry.register(model_base.QwenImage)
+def _inject_qwen():
+    from ..diffusion_models.qwen.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
+@CFGParallelInjectRegistry.register(model_base.ChromaRadiance)
+@CFGParallelInjectRegistry.register(model_base.Chroma)
+def _inject_chroma():
+    from ..diffusion_models.chroma.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
+@CFGParallelInjectRegistry.register(model_base.Flux)
+def _inject_flux():
+    from ..diffusion_models.flux.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
+@CFGParallelInjectRegistry.register(model_base.Hunyuan3Dv2)
+def _inject_hunyuan_3dv2():
+    from ..diffusion_models.hunyuan3dv2_1.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
+@CFGParallelInjectRegistry.register(model_base.HunyuanVideo)
+def _inject_hunyuan():
+    from ..diffusion_models.hunyuan_video.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
