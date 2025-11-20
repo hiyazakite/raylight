@@ -42,8 +42,11 @@ class RayWorker:
 
         self.local_rank = local_rank
         self.global_world_size = parallel_dict["global_world_size"]
-        self.cp_world_size = parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
-        self.cfg_world_size = parallel_dict["cfg_degree"]
+        self.cp_degree = parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
+        self.cfg_degree = parallel_dict["cfg_degree"]
+        self.ulysses_degree = self.parallel_dict["ulysses_degree"]
+        self.ring_degree = self.parallel_dict["ring_degree"]
+        self.cfg_degree = self.parallel_dict["cfg_degree"]
 
         self.device_id = device_id
         self.parallel_dict = parallel_dict
@@ -79,12 +82,8 @@ class RayWorker:
 
             # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
-            world_size = dist.get_world_size()
-
         else:
-            print(
-                f"Running Ray in normal seperate sampler with: {self.world_size} number of workers"
-            )
+            print(f"Running Ray in normal seperate sampler with: {self.world_size} number of workers")
 
         # From mochi-xdit, xdit, pipelines.py
         if self.parallel_dict["is_xdit"]:
@@ -93,21 +92,22 @@ class RayWorker:
                 initialize_model_parallel,
             )
             xfuser_attn.set_attn_type(self.parallel_dict["attention"])
-            ulysses_degree = self.parallel_dict["ulysses_degree"]
-            ring_degree = self.parallel_dict["ring_degree"]
-            cfg_degree = self.parallel_dict["cfg_degree"]
 
-            print("XDiT is enable")
             init_distributed_environment(rank=self.local_rank, world_size=self.global_world_size)
+            print("XDiT is enable")
 
-            print(
-                f"Paralllel config: ulysses_degree={ulysses_degree}, ring_degree={ring_degree}, cfg_degree={cfg_degree}"
-            )
             initialize_model_parallel(
-                sequence_parallel_degree=cp_size,
-                classifier_free_guidance_degree=cfg_degree,
-                ring_degree=ring_degree,
-                ulysses_degree=ulysses_degree,
+                sequence_parallel_degree=self.cp_degree,
+                classifier_free_guidance_degree=self.cfg_degree,
+                ring_degree=self.ring_degree,
+                ulysses_degree=self.ulysses_degree
+            )
+            print(
+                f"""Paralllel config:
+                    ulysses_degree={self.ulysses_degree},
+                    ring_degree={self.ring_degree},
+                    cfg_degree={self.cfg_degree}
+                """
             )
 
     def get_meta_model(self):
@@ -532,4 +532,3 @@ def ensure_fresh_actors(ray_actors_init):
     parallel_dict = ray.get(gpu_actors[0].get_parallel_dict.remote())
 
     return ray_actors, gpu_actors, parallel_dict
-

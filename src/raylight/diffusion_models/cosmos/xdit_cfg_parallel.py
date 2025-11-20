@@ -20,7 +20,7 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
         clip_fea = torch.chunk(clip_fea, cfg_world_size, dim=0)[cfg_rank]
 
     if time_dim_concat is not None:
-        time_dim_concat = torch.chunk(time_dim_concat, cfg_world_size, dim=0)[cfg_rank]
+        time_dim_concat = torch.chunk(clip_fea, cfg_world_size, dim=0)[cfg_rank]
 
     result = executor(x, timestep, context, clip_fea, time_dim_concat, transformer_options, **kwargs)
     result = get_cfg_group().all_gather(result, dim=0)

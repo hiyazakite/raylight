@@ -65,3 +65,10 @@ def _inject_hunyuan_3dv2():
 def _inject_hunyuan():
     from ..diffusion_models.hunyuan_video.xdit_cfg_parallel import cfg_parallel_forward_wrapper
     return cfg_parallel_forward_wrapper
+
+
+# This will cause error for all non specified models above, since all of that will be funneled into this
+@CFGParallelInjectRegistry.register(model_base.BaseModel)
+def _inject_unet():
+    from ..diffusion_models.modules.diffusionmodules.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
