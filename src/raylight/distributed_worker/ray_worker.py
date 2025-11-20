@@ -39,14 +39,10 @@ class RayWorker:
         self.model = None
         self.model_type = None
         self.state_dict = None
+        self.parallel_dict = parallel_dict
 
         self.local_rank = local_rank
-        self.global_world_size = parallel_dict["global_world_size"]
-        self.cp_degree = parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
-        self.cfg_degree = parallel_dict["cfg_degree"]
-        self.ulysses_degree = self.parallel_dict["ulysses_degree"]
-        self.ring_degree = self.parallel_dict["ring_degree"]
-        self.cfg_degree = self.parallel_dict["cfg_degree"]
+        self.global_world_size = self.parallel_dict["global_world_size"]
 
         self.device_id = device_id
         self.parallel_dict = parallel_dict
@@ -93,6 +89,12 @@ class RayWorker:
             )
             xfuser_attn.set_attn_type(self.parallel_dict["attention"])
 
+            self.cp_degree = self.parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
+            self.cfg_degree = self.parallel_dict["cfg_degree"]
+            self.ulysses_degree = self.parallel_dict["ulysses_degree"]
+            self.ring_degree = self.parallel_dict["ring_degree"]
+            self.cfg_degree = self.parallel_dict["cfg_degree"]
+
             init_distributed_environment(rank=self.local_rank, world_size=self.global_world_size)
             print("XDiT is enable")
 
@@ -103,11 +105,7 @@ class RayWorker:
                 ulysses_degree=self.ulysses_degree
             )
             print(
-                f"""Paralllel config:
-                    ulysses_degree={self.ulysses_degree},
-                    ring_degree={self.ring_degree},
-                    cfg_degree={self.cfg_degree}
-                """
+                f"Parallel Degree: Ulysses={self.ulysses_degree}, Ring={self.ring_degree}, CFG={self.cfg_degree}"
             )
 
     def get_meta_model(self):

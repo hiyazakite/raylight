@@ -12,7 +12,12 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
 
     x, timestep, context, clip_fea, time_dim_concat, transformer_options = args
 
-    x = torch.chunk(x, cfg_world_size, dim=0)[cfg_rank]
+    try:
+        x = torch.chunk(x, cfg_world_size, dim=0)[cfg_rank]
+    except Exception as e:
+        raise ValueError(
+            "You might disable CFG where CFG=1.0. Please enable another method of parallelism or set CFG >1", e
+        )
     timestep = torch.chunk(timestep, cfg_world_size, dim=0)[cfg_rank]
     context = torch.chunk(context, cfg_world_size, dim=0)[cfg_rank]
 

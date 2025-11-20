@@ -81,9 +81,7 @@ class RayInitializer:
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
-            raise ValueError(
-                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}"
-            )
+            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}")
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
@@ -134,7 +132,8 @@ class RayUNETLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "unet_name": (folder_paths.get_filename_list("diffusion_models")
+                              + folder_paths.get_filename_list("checkpoints"),),
                 "weight_dtype": (
                     [
                         "default",
@@ -171,7 +170,10 @@ class RayUNETLoader:
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
 
-        unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+        try:
+            unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+        except:
+            unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
         loaded_futures = []
         patched_futures = []
@@ -208,8 +210,10 @@ class RayUNETLoader:
 
         for actor in gpu_actors:
             if parallel_dict["is_xdit"]:
-                patched_futures.append(actor.patch_usp.remote())
-                patched_futures.append(actor.patch_cfg.remote())
+                if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
+                    patched_futures.append(actor.patch_usp.remote())
+                if parallel_dict["cfg_degree"] > 1:
+                    patched_futures.append(actor.patch_cfg.remote())
 
         ray.get(patched_futures)
 

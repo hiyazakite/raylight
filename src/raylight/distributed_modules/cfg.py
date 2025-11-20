@@ -25,7 +25,7 @@ class CFGParallelInjectRegistry:
         base_model = model_patcher.model
         for registered_cls, inject_func in cls._REGISTRY.items():
             if isinstance(base_model, registered_cls):
-                print(f"[CFG] Initializing CFG for {registered_cls.__name__}")
+                print(f"[CFG] Initializing CFG Parallel for {registered_cls.__name__}")
                 return inject_func()
         raise ValueError(f"Model: {type(base_model).__name__} is not yet supported for CFG Parallelism")
 
