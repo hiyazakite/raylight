@@ -83,7 +83,7 @@ class RayWorker:
             # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
         else:
-            print(f"Running Ray in normal seperate sampler with: {self.world_size} number of workers")
+            print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
         # From mochi-xdit, xdit, pipelines.py
         if self.parallel_dict["is_xdit"]:
