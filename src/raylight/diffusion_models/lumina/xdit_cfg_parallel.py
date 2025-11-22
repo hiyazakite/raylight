@@ -12,7 +12,7 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
 
     x, timesteps, context, num_tokens, attention_mask = args
 
-    if x.size[0] == cfg_world_size:
+    if x.shape[0] == cfg_world_size:
         x = torch.chunk(x, cfg_world_size, dim=0)[cfg_rank]
     else:
         raise ValueError("CFG = 1.0, disables guidance. Increase CFG > 1.0 or switch to another parallelism mode")
