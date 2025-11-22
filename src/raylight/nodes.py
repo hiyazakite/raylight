@@ -82,6 +82,10 @@ class RayInitializer:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
             raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}")
+        if cfg_degree > 2:
+            raise ValueError(
+                "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
+            )
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False

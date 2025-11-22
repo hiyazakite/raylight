@@ -15,7 +15,6 @@ from comfy import (
 )  # Must manually insert comfy package or ray cannot import raylight to cluster
 import comfy.patcher_extension as pe
 
-import raylight.distributed_worker.parallel_manager as pm
 import raylight.distributed_modules.attention as xfuser_attn
 
 from raylight.distributed_modules.usp import USPInjectRegistry
@@ -428,9 +427,6 @@ class RayCOMMTester:
                 timeout=timedelta(minutes=1),
                 # device_id=self.device
             )
-        pg = dist.group.WORLD
-        pm.set_cp_group(pg, list(range(world_size)), local_rank)
-
         print("Running COMM pre-run")
 
         # Each rank contributes rank+1

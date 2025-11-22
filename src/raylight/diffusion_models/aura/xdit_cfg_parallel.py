@@ -11,12 +11,10 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
     cfg_world_size = get_classifier_free_guidance_world_size()
 
     x, timestep, context, transformer_options = args
-    try:
+    if x.size[0] == cfg_world_size:
         x = torch.chunk(x, cfg_world_size, dim=0)[cfg_rank]
-    except Exception as e:
-        raise ValueError(
-            e, "You might disable CFG where CFG=1.0. Please enable another method of parallelism or set CFG >1"
-        )
+    else:
+        raise ValueError("CFG = 1.0, disables guidance. Increase CFG > 1.0 or switch to another parallelism mode")
 
     timestep = torch.chunk(timestep, cfg_world_size, dim=0)[cfg_rank]
     context = torch.chunk(context, cfg_world_size, dim=0)[cfg_rank]
