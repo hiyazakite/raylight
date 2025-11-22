@@ -5,6 +5,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
 ## UPDATE
+- New parallelism, CFG. Check models note below about Flux or Hunyuan
 - Qwen Image fix for square dim
 - Hunyuan Video support for FSDP and USP
 - Chroma/Radiance support for FSDP and USP
@@ -24,7 +25,7 @@ Raylight is a parallelism node for ComfyUI, where the tensor of an image or vide
 is split among GPU ranks. Raylight, as its partial namesake, uses [Ray](https://docs.ray.io/en/latest/ray-core/walkthrough.html)
 to manage its GPU workers.
 
-<img width="830" height="665" alt="image" src="https://github.com/user-attachments/assets/ea78f3d3-41cb-4620-b4b6-65f8229293b2" />
+<img width="834" height="1276" alt="image" src="https://github.com/user-attachments/assets/6a79e980-1111-4e31-b6cb-7b6ff35eb766" />
 
 So how does it split among the ranks? It uses Unified Sequence Parallelism (USP), embedded inside
 [XDiT](https://github.com/xdit-project/xDiT), a core library of Raylight that splits and allgathers tensors among GPU ranks.
@@ -50,7 +51,7 @@ Its job is to split the model weights among GPUs.
   Easily connect to local/remote/cloud worker like RunPod.
 
 - **Raylight**
-  Provides both tensor split in sequence parallelism (USP) and model weight sharding (FSDP).
+  Provides both tensor split in sequence parallelism (USP), CFG parallelism and model weight sharding (FSDP).
   Your GPUs will 100% being used at the same time. In technical sense it _combine your VRAM_.
   This enables efficient multi-GPU utilization and scales beyond single high-memory GPUs (e.g., RTX 4090/5090).
 
