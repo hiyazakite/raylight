@@ -136,8 +136,7 @@ class RayUNETLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models")
-                              + folder_paths.get_filename_list("checkpoints"),),
+                "unet_name": (folder_paths.get_filename_list("diffusion_models")),
                 "weight_dtype": (
                     [
                         "default",
@@ -174,10 +173,7 @@ class RayUNETLoader:
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
 
-        try:
-            unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
-        except:
-            unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
+        unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
         loaded_futures = []
         patched_futures = []

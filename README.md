@@ -39,7 +39,7 @@ Its job is to split the model weights among GPUs.
 ### Raylight vs MultiGPU vs ComfyUI Worksplit branch vs ComfyUI-Distributed
 - [MultiGPU](https://github.com/pollockjj/ComfyUI-MultiGPU)
   Loads models selectively on specified GPUs without sharing workload.
-  Includes CPU RAM offloading, which benefits single-GPU users.
+  Includes CPU RAM offloading, which also benefits single-GPU users.
 
 - [ComfyUI Worksplit branch](https://github.com/comfyanonymous/ComfyUI/pull/7063)
   Splits workload at the CFG level, not at the tensor level.
@@ -62,6 +62,8 @@ Its job is to split the model weights among GPUs.
   export NCCL_P2P_DISABLE=1
   export NCCL_SHM_DISABLE=1
   ```
+  But this will hurt performance, it is like a sanity check if the Raylight can work, but there is so much performance
+  left on the table.
 - **Windows** is in partial testing, switch to `dev` branch to test it. And scroll down below for more information
 - Non-DiT models are not supported (SDXL, SD1.5).
 - Example WF just open from your comfyui menu and browse templates
@@ -127,67 +129,77 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 
 ### AMD
 
-1. **MI3XX** : User confirmed working on 8xMI300X using ROCm compiled PyTorch and Flash Attention
+1. **MI3XX** : User confirmed working on 8xMI300X using ROCm compiled PyTorch and Flash Attention 2.
+2. **MI210** : Personally tested and working on MI210 using ROCm compiled PyTorch and builtin `Torch.Functional.SDPA`
 
 
 ## Supported Models
 
 **Wan**
-| Model             | USP | FSDP |
-|-------------------|-----|------|
-| Wan2.1 14B T2V    | ✅  | ✅   |
-| Wan2.1 14B I2V    | ✅  | ✅   |
-| Wan2.2 14B I2V    | ✅  | ✅   |
-| Wan2.2 14B I2V    | ✅  | ✅   |
-| Wan2.1 1.3B T2V   | ✅  | ✅   |
-| Wan2.2 5B TI2V    | ✅  | ✅   |
-| Wan2.1 Vace       | ✅  | ❌   |
+| Model             | USP | FSDP | CFG |
+|-------------------|-----|------|-----|
+| Wan2.1 14B T2V    | ✅  | ✅   | ✅  |
+| Wan2.1 14B I2V    | ✅  | ✅   | ✅  |
+| Wan2.2 14B I2V    | ✅  | ✅   | ✅  |
+| Wan2.2 14B I2V    | ✅  | ✅   | ✅  |
+| Wan2.1 1.3B T2V   | ✅  | ✅   | ✅  |
+| Wan2.2 5B TI2V    | ✅  | ✅   | ✅  |
+| Wan2.1 Vace       | ✅  | ❌   | ✅  |
 
 
 **Flux**
-| Model             | USP | FSDP |
-|-------------------|-----|------|
-| Flux Dev          | ✅  | ✅   |
-| Flux Konteks      | ✅  | ✅   |
-| Flux Krea         | ✅  | ✅   |
-| Flux ControlNet   | ❌  | ❌   |
+| Model             | USP | FSDP | CFG |
+|-------------------|-----|------|-----|
+| Flux Dev          | ✅  | ✅   | ❌  |
+| Flux Konteks      | ✅  | ✅   | ❌  |
+| Flux Krea         | ✅  | ✅   | ❌  |
+| Flux ControlNet   | ❌  | ❌   | ❌  |
 
 
 **Chroma**
-| Model             | USP | FSDP |
-|-------------------|-----|------|
-| Chroma            | ✅  | ✅   |
-| Chroma Radiance   | ✅  | ✅   |
-| Chroma ControlNet | ❌  | ❌   |
+| Model             | USP | FSDP | CFG |
+|-------------------|-----|------|-----|
+| Chroma            | ✅  | ✅   | ❌  |
+| Chroma Radiance   | ✅  | ✅   | ❌  |
+| Chroma ControlNet | ❌  | ❌   | ❌  |
 
 
 **Qwen**
-| Model             | USP | FSDP |
-|-------------------|-----|------|
-| Qwen Image/Edit   | ✅  | ✅   |
-| ControlNet        | ❌  | ❌   |
+| Model             | USP | FSDP | CFG |
+|-------------------|-----|------|-----|
+| Qwen Image/Edit   | ✅  | ✅   | ❌  |
+| ControlNet        | ❌  | ❌   | ❌  |
 
 
 **Hunyuan Video**
-| Model             | USP | FSDP |
-|-------------------|-----|------|
-| Hunyuan Video     | ✅  | ✅   |
-| ControlNet        | ❌  | ❌   |
+| Model             | USP | FSDP | CFG |
+|-------------------|-----|------|-----|
+| Hunyuan Video     | ✅  | ✅   | ❌  |
+| ControlNet        | ❌  | ❌   | ❌  |
+
+
+**UNet**
+| Model  | USP | FSDP | CFG  |
+|--------|-----|------|------|
+| SD1.5  | ❌  | ❌   | SOON |
+| SDXL   | ❌  | ❌   | SOON |
 
 **Legend:**
 - ✅ = Supported
-- ❌ = Not currently supported
+- ❌ = Not currently supported.
 - ❓ = Maybe work?
 
 **Notes:**
 - Non standard Wan variant (Phantom, S2V, etc...) is not tested
+- CFG parallel for Flux, Hunyuan, and Chroma is technically supported by Raylight,
+  but since these models do not support conditional batches (CFG = 1), enabling it has no effect.
 
 ## Scaled vs Non-Scaled Models
 
 | Model       | USP | FSDP |
 |-------------|-----|------|
 | Non-Scaled  | ✅  | ✅   |
-| Scaled      | ✅  | ⚠️    |
+| Scaled      | ✅  | ⚠️   |
 
 **Notes:**
 - Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.
