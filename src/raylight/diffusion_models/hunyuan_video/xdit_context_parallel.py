@@ -73,6 +73,7 @@ def usp_dit_forward(
     timesteps: Tensor,
     y: Tensor = None,
     txt_byt5=None,
+    clip_fea=None,
     guidance: Tensor = None,
     guiding_frame_index=None,
     ref_latent=None,

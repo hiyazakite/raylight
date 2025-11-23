@@ -11,8 +11,6 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
     cfg_world_size = get_classifier_free_guidance_world_size()
 
     x, timesteps, context, y, control, transformer_options = args
-    print(f"{x.shape=}============")
-
     if x.shape[0] == cfg_world_size:
         x = torch.chunk(x, cfg_world_size, dim=0)[cfg_rank]
     else:

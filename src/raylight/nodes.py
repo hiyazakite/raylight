@@ -176,7 +176,7 @@ class RayUNETLoader:
 
         try:
             unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
-        except :
+        except:
             unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
 

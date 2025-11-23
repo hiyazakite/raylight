@@ -16,6 +16,7 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
         context,
         y,
         txt_byt5,
+        clip_fea,
         guidance,
         attention_mask,
         guiding_frame_index,
@@ -37,6 +38,9 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
 
     if txt_byt5 is not None:
         txt_byt5 = torch.chunk(txt_byt5, cfg_world_size, dim=0)[cfg_rank]
+
+    if clip_fea is not None:
+        clip_fea = torch.chunk(clip_fea, cfg_world_size, dim=0)[cfg_rank]
 
     if guidance is not None:
         guidance = torch.chunk(guidance, cfg_world_size, dim=0)[cfg_rank]
@@ -64,6 +68,7 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
         context,
         y,
         txt_byt5,
+        clip_fea,
         guidance,
         attention_mask,
         guiding_frame_index,

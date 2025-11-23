@@ -65,4 +65,4 @@ __all__ = [
 
 __author__ = """Micko Lesmana"""
 __email__ = "mickolesmana@gmail.com"
-__version__ = "0.10.0"
+__version__ = "0.11.0"

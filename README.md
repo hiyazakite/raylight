@@ -5,6 +5,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
 ## UPDATE
+- SDXL and SD 1.5 supported through CFG
 - New parallelism, CFG. Check models note below about Flux or Hunyuan
 - Qwen Image fix for square dim
 - Hunyuan Video support for FSDP and USP
@@ -66,7 +67,6 @@ Its job is to split the model weights among GPUs.
   But this will hurt performance, it is like a sanity check if the Raylight can work, but there is so much performance
   left on the table.
 - **Windows** is in partial testing, switch to `dev` branch to test it. And scroll down below for more information
-- Non-DiT models are not supported (SDXL, SD1.5).
 - Example WF just open from your comfyui menu and browse templates
 - **GPU Topology** is very important, not all PCIe in your motherboard is equal.
 - VRAM leakage, when using [Ring > 1 instead of Ulysses](https://github.com/feifeibear/long-context-attention/issues/112).
@@ -183,10 +183,10 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 
 
 **UNet**
-| Model  | USP | FSDP | CFG  |
-|--------|-----|------|------|
-| SD1.5  | ❌  | ❌   | SOON |
-| SDXL   | ❌  | ❌   | SOON |
+| Model  | USP | FSDP | CFG |
+|--------|-----|------|-----|
+| SD1.5  | ❌  | ❌   | ✅  |
+| SDXL   | ❌  | ❌   | ✅  |
 
 **Legend:**
 - ✅ = Supported
