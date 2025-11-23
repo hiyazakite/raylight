@@ -133,6 +133,9 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 1. **MI3XX** : User confirmed working on 8xMI300X using ROCm compiled PyTorch and Flash Attention 2.
 2. **MI210** : Personally tested and working on MI210 using ROCm compiled PyTorch and builtin `Torch.Functional.SDPA`
 
+### Intel
+1. **Arc Pro B60** : Using [LLM Scaler](https://github.com/intel/llm-scaler/blob/main/omni/README.md/#wan22).
+
 
 ## Supported Models
 
@@ -160,16 +163,16 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 **Chroma**
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
-| Chroma            | ✅  | ✅   | ❌  |
-| Chroma Radiance   | ✅  | ✅   | ❌  |
-| Chroma ControlNet | ❌  | ❌   | ❌  |
+| Chroma            | ✅  | ✅   | ✅  |
+| Chroma Radiance   | ✅  | ✅   | ✅  |
+| Chroma ControlNet | ❌  | ❌   | ✅  |
 
 
 **Qwen**
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
-| Qwen Image/Edit   | ✅  | ✅   | ❌  |
-| ControlNet        | ❌  | ❌   | ❌  |
+| Qwen Image/Edit   | ✅  | ✅   | ✅  |
+| ControlNet        | ❌  | ❌   | ✅  |
 
 
 **Hunyuan Video**
@@ -192,7 +195,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 
 **Notes:**
 - Non standard Wan variant (Phantom, S2V, etc...) is not tested
-- CFG parallel for Flux, Hunyuan, and Chroma is technically supported by Raylight,
+- CFG parallel for Flux, Hunyuan, is technically supported by Raylight,
   but since these models do not support conditional batches (CFG = 1), enabling it has no effect.
 
 ## Scaled vs Non-Scaled Models
