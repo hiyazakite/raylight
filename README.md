@@ -237,30 +237,31 @@ https://github.com/user-attachments/assets/40deddd2-1a87-44de-98a5-d5fc3defbecd
 https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
 
 
-## DEBUG Notes
+## 5090 vs RTX 2000 ADA
+| Model | Model dtype | Parallelism (when applicable) | CFG | Steps | Resolution (W x H x Frame) | 1× RTX 2000 ADA (s/it) | 2× RTX 2000 ADA (s/it) | 5090 (s/it) |
+|--------|-------------|-----------------------------|-----|--------|-----------------------------|-------------------------|-------------------------|--------------|
+| SD 1.5 | FP32 | CFG Parallel = 2 | 7 | 20 | 512 × 512 | 0.11 | 0.05 | 0.003 |
+| SDXL | FP16 | CFG Parallel = 2 | 8 | 20 | 720 × 1024 | 0.33 | 0.19 | 0.004 |
+| Wan 2.1 1.3B T2V LX2V | BF16 | Ulysses = 2 | 1 | 4 | 480 × 832 × 33 | 2.70 | 1.65 | 0.46 |
+| Wan 2.1 14B T2V LX2V | FP8 E4M3 | Ulysses = 2 | 1 | 4 | 480 × 480 × 33 | 9.23 | 5.18 | 3.05 |
+| Wan 2.1 14B T2V LX2V (FSDP) | FP8 E4M3 | Ulysses = 2 | 1 | 4 | 480 × 640 × 81 | OOM | 22.51 | 3.05 |
+| Flux | FP8 E4M3 | Ulysses = 2 | 1 | 20 | 1024 × 1024 | 2.22 | 1.26 | 0.29 |
+| Chroma | FP8 E4M3 Scaled | Ulysses = 2 | 3.5 | 25 | 1024 × 1024 | 5.14 | 3.24 | 0.35 |
+| Chroma Radiance | FP8 E4M3 Scaled | Ulysses = 2 | 3.5 | 25 | 1024 × 1024 | 8.11 | 4.32 | 0.51 |
+| Hunyuan Video T2V | GGUF Q4 | Ulysses = 2 | 1 | 20 | 480 × 832 × 33 | 13.21 | 7.69 | 2.06 |
+| Qwen Image (FSDP) | FP8 E4M3 | Ulysses = 2 | 2.5 | 20 | 1024 × 1024 | OOM | 5.68 | 0.98 |
 
-### Wan T2V 14B (fp8) — 1×RTX 2000 ADA 16G
-**Resolution:** 480×832 × 33F
-
-| Setup   | VRAM (GB) | Speed            |
-|---------|-----------|------------------|
-| Normal  | OOM       | 22 it/s (before OOM) |
-
----
-
-### Wan T2V 14B (fp8) — 2×RTX 2000 ADA 16G
-
-| Setup           | VRAM (GB) / Device | Speed   |
-|-----------------|--------------------|---------|
-| Ulysses         | 15.8 (Near OOM)    | 11 it/s |
-| FSDP2           | 12.8               | 19 it/s |
-| Ulysses + FSDP2 | 10.25              | 12 it/s |
-
----
-
-### Notes
-- **FSDP2** is now available and can do fp8 calculation, but needs scalar tensors converted into 1D tensors.
-
+**Notes:**
+- **RTX 2000 ADA ≈ RTX 4060 Ti** in performance.
+- All benchmarks were executed using **ComfyUI native workflows**, with **no Kijai wrapper** involved.
+- **Wan 2.1 14B T2V (FSDP)** is only applicable to **dual RTX 2000 ADA**:
+  - **Single RTX 2000 ADA:** OOM
+  - **5090:** does not require FSDP
+- Results represent the **average of 5 runs**, after warm-up.
+- **All speeds are normalized to seconds per iteration (s/it).**  
+  For models reporting **iterations per second**, we compute `1 / (it/s)` to convert.
+- **RTX 2000 ADA topology:** P2P is supported but runs over **SYS** path (NUMA cross-socket),  
+  meaning **no NVLink is present** and peer bandwidth is reduced.
 
 ## Installation
 
