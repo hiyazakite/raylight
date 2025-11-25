@@ -1,6 +1,7 @@
 import os
 import sys
 import gc
+import types
 from datetime import timedelta
 
 import torch
@@ -270,6 +271,7 @@ class RayWorker:
         ray.actor.exit_actor()
 
     def ray_vae_loader(self, vae_path):
+        from ..comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
         state_dict = {}
         if "pixel_space" in vae_path:
             state_dict["pixel_space_vae"] = torch.tensor(1.0)
@@ -278,6 +280,11 @@ class RayWorker:
 
         vae_model = comfy.sd.VAE(sd=state_dict)
         vae_model.throw_exception_if_invalid()
+
+        vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
+        vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
+        vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
+
         if self.local_rank == 0:
             print(f"VAE loaded in {self.global_world_size} GPUs")
         self.vae_model = vae_model
