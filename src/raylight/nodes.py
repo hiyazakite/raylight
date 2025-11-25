@@ -536,6 +536,77 @@ class DPNoiseList:
         return (noise_list,)
 
 
+class RayVAEDecodeDistributed:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray Actor to submit the model into"}),
+                "samples": ("LATENT",),
+                "vae": ("VAE",),
+                "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 32},),
+                "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32}),
+                "temporal_size": (
+                    "INT",
+                    {
+                        "default": 64,
+                        "min": 8,
+                        "max": 4096,
+                        "step": 4,
+                        "tooltip": "Only used for video VAEs: Amount of frames to decode at a time.",
+                    },
+                ),
+                "temporal_overlap": (
+                    "INT",
+                    {
+                        "default": 8,
+                        "min": 4,
+                        "max": 4096,
+                        "step": 4,
+                        "tooltip": "Only used for video VAEs: Amount of frames to overlap.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "ray_decode"
+
+    CATEGORY = "Raylight"
+
+    def ray_decode(self, ray_actors, vae, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
+        if tile_size < overlap * 4:
+            overlap = tile_size // 4
+        if temporal_size < temporal_overlap * 2:
+            temporal_overlap = temporal_overlap // 2
+        temporal_compression = vae.temporal_compression_decode()
+        if temporal_compression is not None:
+            temporal_size = max(2, temporal_size // temporal_compression)
+            temporal_overlap = max(
+                1, min(temporal_size // 2, temporal_overlap // temporal_compression)
+            )
+        else:
+            temporal_size = None
+            temporal_overlap = None
+
+        compression = vae.spacial_compression_decode()
+
+        # Latent will be split inside each worker, so we don't split here
+        images = vae.decode_tiled(
+            samples["samples"],
+            tile_x=tile_size // compression,
+            tile_y=tile_size // compression,
+            overlap=overlap // compression,
+            tile_t=temporal_size,
+            overlap_t=temporal_overlap,
+        )
+        if len(images.shape) == 5:
+            images = images.reshape(
+                -1, images.shape[-3], images.shape[-2], images.shape[-1]
+            )
+        return (images,)
+
+
 NODE_CLASS_MAPPINGS = {
     "XFuserKSamplerAdvanced": XFuserKSamplerAdvanced,
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
@@ -543,6 +614,7 @@ NODE_CLASS_MAPPINGS = {
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
     "DPNoiseList": DPNoiseList,
+    "RayVAEDecodeDistributed": RayVAEDecodeDistributed
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -551,5 +623,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
-    "DPNoiseList": "Data Parallel Noise List"
+    "DPNoiseList": "Data Parallel Noise List",
+    "RayVAEDecodeDistributed": "Distributed VAE (Ray)"
 }
