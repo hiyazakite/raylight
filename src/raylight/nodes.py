@@ -543,7 +543,7 @@ class RayVAEDecodeDistributed:
             "required": {
                 "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray Actor to submit the model into"}),
                 "samples": ("LATENT",),
-                "vae": ("VAE",),
+                "vae_name": (folder_paths.get_filename_list("vae"),),
                 "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 32},),
                 "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32}),
                 "temporal_size": (
@@ -574,37 +574,26 @@ class RayVAEDecodeDistributed:
 
     CATEGORY = "Raylight"
 
-    def ray_decode(self, ray_actors, vae, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
-        if tile_size < overlap * 4:
-            overlap = tile_size // 4
-        if temporal_size < temporal_overlap * 2:
-            temporal_overlap = temporal_overlap // 2
-        temporal_compression = vae.temporal_compression_decode()
-        if temporal_compression is not None:
-            temporal_size = max(2, temporal_size // temporal_compression)
-            temporal_overlap = max(
-                1, min(temporal_size // 2, temporal_overlap // temporal_compression)
-            )
-        else:
-            temporal_size = None
-            temporal_overlap = None
+    def ray_decode(self, ray_actors, vae_name, samples, tile_size, overlap=64, temporal_size=64, temporal_overlap=8):
+        gpu_actors = ray_actors["workers"]
+        vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
 
-        compression = vae.spacial_compression_decode()
+        for actor in gpu_actors:
+            ray.get(actor.ray_vae_loader.remote(vae_path))
 
-        # Latent will be split inside each worker, so we don't split here
-        images = vae.decode_tiled(
-            samples["samples"],
-            tile_x=tile_size // compression,
-            tile_y=tile_size // compression,
-            overlap=overlap // compression,
-            tile_t=temporal_size,
-            overlap_t=temporal_overlap,
-        )
-        if len(images.shape) == 5:
-            images = images.reshape(
-                -1, images.shape[-3], images.shape[-2], images.shape[-1]
+        futures = [
+            actor.ray_vae_decode.remote(
+                samples,
+                tile_size,
+                overlap=64,
+                temporal_size=64,
+                temporal_overlap=8
             )
-        return (images,)
+            for i, actor in enumerate(gpu_actors)
+        ]
+
+        image = ray.get(futures)
+        return (image[0],)
 
 
 NODE_CLASS_MAPPINGS = {

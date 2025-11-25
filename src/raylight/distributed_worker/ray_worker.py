@@ -36,6 +36,7 @@ from ray.exceptions import RayActorError
 class RayWorker:
     def __init__(self, local_rank, device_id, parallel_dict):
         self.model = None
+        self.vae_model = None
         self.model_type = None
         self.state_dict = None
         self.parallel_dict = parallel_dict
@@ -267,6 +268,57 @@ class RayWorker:
         self.model = None
         dist.destroy_process_group()
         ray.actor.exit_actor()
+
+    def ray_vae_loader(self, vae_path):
+        state_dict = {}
+        if "pixel_space" in vae_path:
+            state_dict["pixel_space_vae"] = torch.tensor(1.0)
+        else:
+            state_dict = comfy.utils.load_torch_file(vae_path)
+
+        vae_model = comfy.sd.VAE(sd=state_dict)
+        vae_model.throw_exception_if_invalid()
+        if self.local_rank == 0:
+            print(f"VAE loaded in {self.global_world_size} GPUs")
+        self.vae_model = vae_model
+
+    def ray_vae_decode(
+        self,
+        samples,
+        tile_size,
+        overlap=64,
+        temporal_size=64,
+        temporal_overlap=8
+    ):
+        if tile_size < overlap * 4:
+            overlap = tile_size // 4
+        if temporal_size < temporal_overlap * 2:
+            temporal_overlap = temporal_overlap // 2
+        temporal_compression = self.vae_model.temporal_compression_decode()
+        if temporal_compression is not None:
+            temporal_size = max(2, temporal_size // temporal_compression)
+            temporal_overlap = max(
+                1, min(temporal_size // 2, temporal_overlap // temporal_compression)
+            )
+        else:
+            temporal_size = None
+            temporal_overlap = None
+
+        compression = self.vae_model.spacial_compression_decode()
+
+        images = self.vae_model.decode_tiled(
+            samples["samples"],
+            tile_x=tile_size // compression,
+            tile_y=tile_size // compression,
+            overlap=overlap // compression,
+            tile_t=temporal_size,
+            overlap_t=temporal_overlap,
+        )
+        if len(images.shape) == 5:
+            images = images.reshape(
+                -1, images.shape[-3], images.shape[-2], images.shape[-1]
+            )
+        return images
 
     def custom_sampler(
         self,
