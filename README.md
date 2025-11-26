@@ -4,6 +4,28 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
+## 🚧 Model Status 🚧
+
+Hunyuan and Flux are currently **under repair**.
+Updates for:
+
+- **Hunyuan 1.5** 🔧
+- **Flux 2** 🛠️
+
+## Table of Contents
+- [Raylight](#raylight)
+- [UPDATE](#update)
+- [What exactly is Raylight](#what-exactly-is-raylight)
+- [Raylight vs MultiGPU vs ComfyUI Worksplit vs ComfyUI-Distributed](#raylight-vs-multigpu-vs-comfyui-worksplit-vs-comfyui-distributed)
+- [RTM and Known Issues](#rtm-and-known-issues)
+- [Operation](#operation)
+- [Supported Models](#supported-models)
+- [Scaled vs Non-Scaled Models](#scaled-vs-non-scaled-models)
+- [Tested GPU](#gpu-architectures)
+- [Installation](#installation)
+- [Support Me](#support)
+
+
 ## UPDATE
 - SDXL and SD 1.5 supported through CFG
 - New parallelism, CFG. Check models note below about Flux or Hunyuan
@@ -258,9 +280,9 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
   - **Single RTX 2000 ADA:** OOM
   - **5090:** does not require FSDP
 - Results represent the **average of 5 runs**, after warm-up.
-- **All speeds are normalized to seconds per iteration (s/it).**  
+- **All speeds are normalized to seconds per iteration (s/it).**
   For models reporting **iterations per second**, we compute `1 / (it/s)` to convert.
-- **RTX 2000 ADA topology:** P2P is supported but runs over **SYS** path (NUMA cross-socket),  
+- **RTX 2000 ADA topology:** P2P is supported but runs over **SYS** path (NUMA cross-socket),
   meaning **no NVLink is present** and peer bandwidth is reduced.
 
 ## Installation
