@@ -104,6 +104,7 @@ def usp_dit_forward(
         y = torch.zeros((img.shape[0], self.params.vec_in_dim), device=img.device, dtype=img.dtype)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
+    patches = transformer_options.get("patches", {})
     patches_replace = transformer_options.get("patches_replace", {})
     if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -115,8 +116,23 @@ def usp_dit_forward(
         if guidance is not None:
             vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
 
-    vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
+    if self.vector_in is not None:
+        if y is None:
+            y = torch.zeros((img.shape[0], self.params.vec_in_dim), device=img.device, dtype=img.dtype)
+        vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
+
     txt = self.txt_in(txt)
+    vec_orig = vec
+    if self.params.global_modulation:
+        vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(vec_orig))
+
+    if "post_input" in patches:
+        for p in patches["post_input"]:
+            out = p({"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids})
+            img = out["img"]
+            txt = out["txt"]
+            img_ids = out["img_ids"]
+            txt_ids = out["txt_ids"]
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     if img_ids is not None:
@@ -176,6 +192,8 @@ def usp_dit_forward(
     txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
 
     img = torch.cat((txt, img), 1)
+    if self.params.global_modulation:
+        vec, _ = self.single_stream_modulation(vec_orig)
 
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
@@ -210,68 +228,112 @@ def usp_dit_forward(
     img = img[:, txt.shape[1]:, ...]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
-    img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+    img = self.final_layer(img, vec_orig)  # (N, T, patch_size ** 2 * out_channels)
     return img
 
 
-def usp_single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims=None, **kwargs) -> Tensor:
-    mod, _ = self.modulation(vec)
-    qkv, mlp = torch.split(self.linear1(apply_mod(self.pre_norm(x), (1 + mod.scale), mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
+def usp_single_stream_forward(
+    self,
+    x: Tensor,
+    vec: Tensor,
+    pe: Tensor,
+    attn_mask=None,
+    modulation_dims=None,
+    **kwargs
+) -> Tensor:
+    if self.modulation:
+        mod, _ = self.modulation(vec)
+    else:
+        mod = vec
+
+    qkv, mlp = torch.split(self.linear1(apply_mod(self.pre_norm(x), (1 + mod.scale), mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim_first], dim=-1)
 
     q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    del qkv
     q, k = self.norm(q, k, v)
 
+    # compute attention
     attn = attention(q, k, v, pe=pe, mask=attn_mask)
-    output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+    del q, k, v
+    # compute activation in mlp stream, cat again and run second linear layer
+    mlp = self.mlp_act(mlp)
+    output = self.linear2(torch.cat((attn, mlp), 2))
     x += apply_mod(output, mod.gate, None, modulation_dims)
     if x.dtype == torch.float16:
         x = torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
     return x
 
 
-def usp_double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims_img=None, modulation_dims_txt=None, **kwargs):
-    img_mod1, img_mod2 = self.img_mod(vec)
-    txt_mod1, txt_mod2 = self.txt_mod(vec)
+def usp_double_stream_forward(
+    self,
+    img: Tensor,
+    txt: Tensor,
+    vec: Tensor,
+    pe: Tensor,
+    attn_mask=None,
+    modulation_dims_img=None,
+    modulation_dims_txt=None,
+    **kwargs
+):
+    if self.modulation:
+        img_mod1, img_mod2 = self.img_mod(vec)
+        txt_mod1, txt_mod2 = self.txt_mod(vec)
+    else:
+        (img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec
 
     # prepare image for attention
     img_modulated = self.img_norm1(img)
     img_modulated = apply_mod(img_modulated, (1 + img_mod1.scale), img_mod1.shift, modulation_dims_img)
     img_qkv = self.img_attn.qkv(img_modulated)
+    del img_modulated
     img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    del img_qkv
     img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
     # prepare txt for attention
     txt_modulated = self.txt_norm1(txt)
     txt_modulated = apply_mod(txt_modulated, (1 + txt_mod1.scale), txt_mod1.shift, modulation_dims_txt)
     txt_qkv = self.txt_attn.qkv(txt_modulated)
+    del txt_modulated
     txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    del txt_qkv
     txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
     if self.flipped_img_txt:
-        img_q, img_k = apply_rope(img_q, img_k, pe)
-        attn = attention(torch.cat((img_q, txt_q), dim=2),
-                         torch.cat((img_k, txt_k), dim=2),
-                         torch.cat((img_v, txt_v), dim=2),
-                         pe=None,
-                         mask=attn_mask)
+        q = torch.cat((img_q, txt_q), dim=2)
+        del img_q, txt_q
+        k = torch.cat((img_k, txt_k), dim=2)
+        del img_k, txt_k
+        v = torch.cat((img_v, txt_v), dim=2)
+        del img_v, txt_v
+        # run actual attention
+        attn = attention(q, k, v,
+                         pe=None, mask=attn_mask)
+        del q, k, v
 
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1]:]
     else:
-        img_q, img_k = apply_rope(img_q, img_k, pe)
-        attn = attention(torch.cat((txt_q, img_q), dim=2),
-                         torch.cat((txt_k, img_k), dim=2),
-                         torch.cat((txt_v, img_v), dim=2),
-                         pe=None,
-                         mask=attn_mask)
+        q = torch.cat((txt_q, img_q), dim=2)
+        del txt_q, img_q
+        k = torch.cat((txt_k, img_k), dim=2)
+        del txt_k, img_k
+        v = torch.cat((txt_v, img_v), dim=2)
+        del txt_v, img_v
+        # run actual attention
+        attn = attention(q, k, v,
+                         pe=None, mask=attn_mask)
+        del q, k, v
 
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
     # calculate the img bloks
-    img = img + apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
-    img = img + apply_mod(self.img_mlp(apply_mod(self.img_norm2(img), (1 + img_mod2.scale), img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+    img += apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
+    del img_attn
+    img += apply_mod(self.img_mlp(apply_mod(self.img_norm2(img), (1 + img_mod2.scale), img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
 
     # calculate the txt bloks
     txt += apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)
+    del txt_attn
     txt += apply_mod(self.txt_mlp(apply_mod(self.txt_norm2(txt), (1 + txt_mod2.scale), txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
 
     if txt.dtype == torch.float16:
