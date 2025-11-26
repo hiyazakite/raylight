@@ -94,20 +94,17 @@ def usp_dit_forward(
     transformer_options={},
     attn_mask: Tensor = None,
 ) -> Tensor:
+    patches = transformer_options.get("patches", {})
+    patches_replace = transformer_options.get("patches_replace", {})
+    if img.ndim != 3 or txt.ndim != 3:
+        raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = pad_if_odd(img, dim=1)
     img_ids = pad_if_odd(img_ids, dim=1)
     txt = pad_if_odd(txt, dim=1)
     txt_ids = pad_if_odd(txt_ids, dim=1)
-    if y is None:
-        y = torch.zeros((img.shape[0], self.params.vec_in_dim), device=img.device, dtype=img.dtype)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-
-    patches = transformer_options.get("patches", {})
-    patches_replace = transformer_options.get("patches_replace", {})
-    if img.ndim != 3 or txt.ndim != 3:
-        raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
     # running on sequences img
     img = self.img_in(img)
@@ -225,8 +222,8 @@ def usp_dit_forward(
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img, dim=1)
-    img = img[:, txt.shape[1]:, ...]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img = img[:, txt.shape[1]:, ...]
 
     img = self.final_layer(img, vec_orig)  # (N, T, patch_size ** 2 * out_channels)
     return img
@@ -300,6 +297,7 @@ def usp_double_stream_forward(
     txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
     if self.flipped_img_txt:
+        img_q, img_k = apply_rope(img_q, img_k, pe)
         q = torch.cat((img_q, txt_q), dim=2)
         del img_q, txt_q
         k = torch.cat((img_k, txt_k), dim=2)
@@ -307,12 +305,12 @@ def usp_double_stream_forward(
         v = torch.cat((img_v, txt_v), dim=2)
         del img_v, txt_v
         # run actual attention
-        attn = attention(q, k, v,
-                         pe=None, mask=attn_mask)
+        attn = attention(q, k, v, pe=None, mask=attn_mask)
         del q, k, v
 
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1]:]
     else:
+        img_q, img_k = apply_rope(img_q, img_k, pe)
         q = torch.cat((txt_q, img_q), dim=2)
         del txt_q, img_q
         k = torch.cat((txt_k, img_k), dim=2)
@@ -320,8 +318,7 @@ def usp_double_stream_forward(
         v = torch.cat((txt_v, img_v), dim=2)
         del txt_v, img_v
         # run actual attention
-        attn = attention(q, k, v,
-                         pe=None, mask=attn_mask)
+        attn = attention(q, k, v, pe=None, mask=attn_mask)
         del q, k, v
 
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
