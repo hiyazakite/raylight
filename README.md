@@ -16,17 +16,21 @@ Updates for:
 - [Raylight](#raylight)
 - [UPDATE](#update)
 - [What exactly is Raylight](#what-exactly-is-raylight)
-- [Raylight vs MultiGPU vs ComfyUI Worksplit vs ComfyUI-Distributed](#raylight-vs-multigpu-vs-comfyui-worksplit-vs-comfyui-distributed)
+- [Raylight vs MultiGPU vs ComfyUI Worksplit vs ComfyUI-Distributed](#raylight-vs-multigpu-vs-comfyui-worksplit-branch-vs-comfyui-distributed)
 - [RTM and Known Issues](#rtm-and-known-issues)
 - [Operation](#operation)
+- [Tested GPU](#gpu-architectures)
 - [Supported Models](#supported-models)
 - [Scaled vs Non-Scaled Models](#scaled-vs-non-scaled-models)
-- [Tested GPU](#gpu-architectures)
+- [Attention](#attention)
+- [Example Wan](#wan-t2v-13b)
+- [Benchmark](#5090-vs-rtx-2000-ada)
 - [Installation](#installation)
 - [Support Me](#support)
 
 
 ## UPDATE
+- Z Image, Lumina, Model USP
 - SDXL and SD 1.5 supported through CFG
 - New parallelism, CFG. Check models note below about Flux or Hunyuan
 - Qwen Image fix for square dim
@@ -195,6 +199,12 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 |-------------------|-----|------|-----|
 | Qwen Image/Edit   | ✅  | ✅   | ✅  |
 | ControlNet        | ❌  | ❌   | ✅  |
+
+
+**Z Image**
+| Model             | USP | FSDP | CFG |
+|-------------------|-----|------|-----|
+| Z Image           | ✅  | ❌   | ✅  |
 
 
 **Hunyuan Video**

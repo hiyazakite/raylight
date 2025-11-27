@@ -14,7 +14,7 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     for i, layer in enumerate(diffusion_model.layers):
         # This is for scaled model
         ignored_block_params = detect_dtype_mismatch(layer, ref_dtype)
-        diffusion_model.layer[i] = fully_shard(
+        diffusion_model.layers[i] = fully_shard(
             module=layer,
             mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
