@@ -5,18 +5,17 @@ from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateD
 
 def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     diffusion_model = model.diffusion_model
-
     ignored_params = set()
     for name, param in diffusion_model.named_parameters():
         if not name.startswith("layers."):
             ignored_params.add(param)
 
     ref_dtype = diffusion_model.layers[0].attention.qkv.weight.dtype
-    for i, block in enumerate(diffusion_model.blocks):
+    for i, layer in enumerate(diffusion_model.layers):
         # This is for scaled model
-        ignored_block_params = detect_dtype_mismatch(block, ref_dtype)
-        diffusion_model.blocks[i] = fully_shard(
-            module=block,
+        ignored_block_params = detect_dtype_mismatch(layer, ref_dtype)
+        diffusion_model.layer[i] = fully_shard(
+            module=layer,
             mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
             ignored_params=ignored_block_params
