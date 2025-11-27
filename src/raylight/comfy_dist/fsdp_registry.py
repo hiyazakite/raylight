@@ -85,7 +85,7 @@ def _wrap_hunyuan(model, sd, cpu_offload):
 
 @FSDPShardRegistry.register(model_base.Lumina2)
 def _wrap_lumina(model, sd, cpu_offload):
-    return lumina_shard(model, sd, cpu_offload)
+    return lumina_shard(model, sd, True)
 
 
 def patch_fsdp(self):

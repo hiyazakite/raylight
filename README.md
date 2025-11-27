@@ -4,6 +4,24 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
+## UPDATE
+- Z Image, Lumina, Model USP FSDP
+- SDXL and SD 1.5 supported through CFG
+- New parallelism, CFG. Check models note below about Flux or Hunyuan
+- Qwen Image fix for square dim
+- Hunyuan Video support for FSDP and USP
+- Chroma/Radiance support for FSDP and USP
+- GGUF added thanks to [City96](https://github.com/city96/ComfyUI-GGUF), only in USP mode, not in FSDP
+- Reworked the entire FSDP loader. Model loading should now be more stable and faster,
+  as Raylight no longer kills active workers to reset the model state.
+  Previously, this was necessary because Comfy could not remove FSDP models from VRAM, which caused memory leaks.
+- No need to install FlashAttn.
+- SageAttn is now supported.
+- Full FSDP support for Wan, Qwen, Flux, and Hunyuan Video.
+- Full LoRA support.
+- FSDP CPU offload, analogous to block swap/DisTorch.
+
+
 ## 🚧 Model Status 🚧
 
 Hunyuan and Flux are currently **under repair**.
@@ -11,6 +29,7 @@ Updates for:
 
 - **Hunyuan 1.5** 🔧
 - **Flux 2** 🛠️
+
 
 ## Table of Contents
 - [Raylight](#raylight)
@@ -28,23 +47,6 @@ Updates for:
 - [Installation](#installation)
 - [Support Me](#support)
 
-
-## UPDATE
-- Z Image, Lumina, Model USP
-- SDXL and SD 1.5 supported through CFG
-- New parallelism, CFG. Check models note below about Flux or Hunyuan
-- Qwen Image fix for square dim
-- Hunyuan Video support for FSDP and USP
-- Chroma/Radiance support for FSDP and USP
-- GGUF added thanks to [City96](https://github.com/city96/ComfyUI-GGUF), only in USP mode, not in FSDP
-- Reworked the entire FSDP loader. Model loading should now be more stable and faster,
-  as Raylight no longer kills active workers to reset the model state.
-  Previously, this was necessary because Comfy could not remove FSDP models from VRAM, which caused memory leaks.
-- No need to install FlashAttn.
-- SageAttn is now supported.
-- Full FSDP support for Wan, Qwen, Flux, and Hunyuan Video.
-- Full LoRA support.
-- FSDP CPU offload, analogous to block swap/DisTorch.
 
 ## What exactly is Raylight
 
@@ -201,10 +203,11 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | ControlNet        | ❌  | ❌   | ✅  |
 
 
-**Z Image**
+**Z Image, Lumina 2**
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
-| Z Image           | ✅  | ❌   | ✅  |
+| Z Image           | ✅  | ✅   | ✅  |
+| Lumina 2          | ✅  | ✅   | ✅  |
 
 
 **Hunyuan Video**
