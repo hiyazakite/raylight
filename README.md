@@ -5,6 +5,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
 ## UPDATE
+- Fix broken tqdm progress bar
 - AMD ROCm Aiter attention
 - Z Image, Lumina, Model USP FSDP
 - SDXL and SD 1.5 supported through CFG
