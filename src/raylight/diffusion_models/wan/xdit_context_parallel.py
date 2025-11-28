@@ -8,7 +8,8 @@ import raylight.distributed_modules.attention as xfuser_attn
 import comfy
 from ..utils import pad_to_world_size
 attn_type = xfuser_attn.get_attn_type()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
+sync_ulysses = xfuser_attn.get_sync_ulysses()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -80,6 +81,7 @@ def apply_rope_sp(xq, xk, freqs_cis):
     return xq_out.reshape_as(xq).type_as(xq), xk_out.reshape_as(xk).type_as(xk)
 
 
+@torch.compiler.disable
 def usp_dit_forward(
     self,
     x,
@@ -165,10 +167,12 @@ def usp_dit_forward(
                 x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len
             )
 
+    torch._dynamo.graph_break()
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     x = get_sp_group().all_gather(x, dim=1)
     x = x[:, :orig_size, :]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+    torch._dynamo.graph_break()
 
     x = self.head(x, e)
 

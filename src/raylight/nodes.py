@@ -41,6 +41,7 @@ class RayInitializer:
                         "SAGE_FP16_CUDA",
                         "SAGE_FP8_CUDA",
                         "SAGE_FP8_SM90",
+                        "AITER_ROCM",
                     ],
                     {"default": "TORCH"},
                 ),
@@ -93,6 +94,7 @@ class RayInitializer:
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
+        self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["global_world_size"] = world_size
 
         if (

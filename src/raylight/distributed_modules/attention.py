@@ -32,8 +32,8 @@ def get_sync_ulysses():
 
 
 def make_xfuser_attention(attn_type, sync_ulysses):
-    print(f"Using XFuser {attn_type} attention")
-    if attn_type.upper() == "AITER_AMD":
+    print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
+    if attn_type.upper() == "AITER_ROCM":
         attn = AttnType.AITER
     elif attn_type.upper() == "FLASH_ATTN":
         attn = AttnType.FA

@@ -24,18 +24,22 @@ class RayInitializerDebug:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "cfg_degree": ("INT", {"default": 1}),
+                "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
-                "XFuser_attention": ([
-                    "TORCH",
-                    "FLASH_ATTN",
-                    "FLASH_ATTN_3",
-                    "SAGE_AUTO_DETECT",
-                    "SAGE_FP16_TRITON",
-                    "SAGE_FP16_CUDA",
-                    "SAGE_FP8_CUDA",
-                    "SAGE_FP8_SM90"
-                ], {"default": "TORCH"})
+                "XFuser_attention": (
+                    [
+                        "TORCH",
+                        "FLASH_ATTN",
+                        "FLASH_ATTN_3",
+                        "SAGE_AUTO_DETECT",
+                        "SAGE_FP16_TRITON",
+                        "SAGE_FP16_CUDA",
+                        "SAGE_FP8_CUDA",
+                        "SAGE_FP8_SM90",
+                    ],
+                    {"default": "TORCH"},
+                ),
             }
         }
 
@@ -53,15 +57,19 @@ class RayInitializerDebug:
         ulysses_degree,
         ring_degree,
         cfg_degree,
+        sync_ulysses,
         FSDP,
         FSDP_CPU_OFFLOAD,
-        XFuser_attention
+        XFuser_attention,
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
+        if "MASTER_ADDR" not in os.environ or "MASTER_PORT" not in os.environ:
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29500")
+            print("No env for torch dist MASTER_ADDR and MASTER_PORT, defaulting to 127.0.0.1:29500")
+
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         self.parallel_dict = dict()
 
@@ -75,7 +83,7 @@ class RayInitializerDebug:
         self.parallel_dict["is_fsdp"] = False
         self.parallel_dict["global_world_size"] = world_size
         self.parallel_dict["is_dumb_parallel"] = True
-
+        self.parallel_dict["sync_ulysses"] = False
         self.parallel_dict["ulysses_degree"] = ulysses_degree
         self.parallel_dict["ring_degree"] = 1
 
@@ -89,6 +97,7 @@ class RayInitializerDebug:
             self.parallel_dict["ulysses_degree"] = ulysses_degree
             self.parallel_dict["ring_degree"] = ring_degree
             self.parallel_dict["cfg_degree"] = cfg_degree
+            self.parallel_dict["sync_ulysses"] = sync_ulysses
 
         if FSDP:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
