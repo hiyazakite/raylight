@@ -9,17 +9,10 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
+from ..utils import pad_to_world_size
 attn_type = xfuser_attn.get_attn_type()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type)
-
-
-def pad_if_odd(t: torch.Tensor, dim: int = 1):
-    if t.size(dim) % 2 != 0:
-        pad_shape = list(t.shape)
-        pad_shape[dim] = 1  # add one element along target dim
-        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
-        t = torch.cat([t, pad_tensor], dim=dim)
-    return t
+sync_ulysses = xfuser_attn.get_sync_ulysses()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
 def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
@@ -119,10 +112,10 @@ def usp_dit_forward(
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     # Seq is odd (idk how) if the w == h, so just pad 0 to the end
-    img = pad_if_odd(img, dim=1)
-    img_ids = pad_if_odd(img_ids, dim=1)
-    txt = pad_if_odd(txt, dim=1)
-    txt_ids = pad_if_odd(txt_ids, dim=1)
+    img, img_orig_size = pad_to_world_size(img, dim=1)
+    img_ids, _ = pad_to_world_size(img_ids, dim=1)
+    txt, img_orig_size = pad_to_world_size(txt, dim=1)
+    txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
     ids = torch.cat((txt_ids, img_ids), dim=1)
     pe_combine = self.pe_embedder(ids)
     pe_image = self.pe_embedder(img_ids)
