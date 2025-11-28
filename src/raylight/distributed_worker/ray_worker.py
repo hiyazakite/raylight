@@ -22,7 +22,7 @@ from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 
 from raylight.comfy_dist.sd import load_lora_for_models as ray_load_lora_for_models
-from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise
+from raylight.distributed_worker.utils import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm
 from ray.exceptions import RayActorError
 
 
@@ -290,6 +290,7 @@ class RayWorker:
             print(f"VAE loaded in {self.global_world_size} GPUs")
         self.vae_model = vae_model
 
+    @patch_ray_tqdm
     def ray_vae_decode(
         self,
         samples,
@@ -328,6 +329,7 @@ class RayWorker:
             )
         return images
 
+    @patch_ray_tqdm
     def custom_sampler(
         self,
         add_noise,
@@ -386,6 +388,7 @@ class RayWorker:
         gc.collect()
         return out
 
+    @patch_ray_tqdm
     def common_ksampler(
         self,
         seed,
