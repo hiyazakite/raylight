@@ -34,7 +34,11 @@ def get_sync_ulysses():
 def make_xfuser_attention(attn_type, sync_ulysses):
     print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
     if attn_type.upper() == "AITER_ROCM":
-        attn = AttnType.AITER
+        try:
+            attn = AttnType.AITER
+        except:
+            print("Manual AITER ROCm attention overide failed or not available, please install manually latest Yunchang main repo")
+            attn = AttnType.TORCH
     elif attn_type.upper() == "FLASH_ATTN":
         attn = AttnType.FA
     elif attn_type.upper() == "FLASH_ATTN_3":
@@ -105,3 +109,4 @@ def make_xfuser_attention(attn_type, sync_ulysses):
         return out
 
     return _attention_xfuser_unmask
+
