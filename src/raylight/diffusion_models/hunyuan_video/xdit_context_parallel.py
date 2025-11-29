@@ -8,7 +8,7 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
-
+from ..utils import pad_to_world_size
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
@@ -82,19 +82,12 @@ def usp_dit_forward(
     control=None,
     transformer_options={},
 ) -> Tensor:
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = pad_if_odd(img, dim=1)
-    img_ids = pad_if_odd(img_ids, dim=1)
-    txt = pad_if_odd(txt, dim=1)
-    txt_ids = pad_if_odd(txt_ids, dim=1)
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-
     patches_replace = transformer_options.get("patches_replace", {})
-
     initial_shape = list(img.shape)
     # running on sequences img
     img = self.img_in(img)
     vec = self.time_in(timestep_embedding(timesteps, 256, time_factor=1.0).to(img.dtype))
+
 
     if (self.time_r_in is not None) and (not disable_time_r):
         w = torch.where(transformer_options['sigmas'][0] == transformer_options['sample_sigmas'])[0]  # This most likely could be improved
@@ -162,14 +155,7 @@ def usp_dit_forward(
         extra_txt_ids = torch.zeros((txt_ids.shape[0], txt_vision_states.shape[1], txt_ids.shape[-1]), device=txt_ids.device, dtype=txt_ids.dtype)
         txt_ids = torch.cat((txt_ids, extra_txt_ids), dim=1)
 
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
-    ids = torch.cat((img_ids, txt_ids), dim=1)
-    pe_combine = self.pe_embedder(ids)
-    pe_image = self.pe_embedder(img_ids)
-    # seq parallel
-    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
-    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
-    # ======================== ADD SEQUENCE PARALLEL ========================= #
+
     img_len = img.shape[1]
     if txt_mask is not None:
         attn_mask_len = img_len + txt.shape[1]
@@ -177,8 +163,19 @@ def usp_dit_forward(
         attn_mask[:, 0, img_len:] = txt_mask
     else:
         attn_mask = None
-
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img, img_orig_size = pad_to_world_size(img, dim=1)
+    img_ids, _ = pad_to_world_size(img_ids, dim=1)
+    txt, txt_orig_size = pad_to_world_size(txt, dim=1)
+    txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
+
+    ids = torch.cat((txt_ids, img_ids), dim=1)
+    pe_combine = self.pe_embedder(ids)
+    pe_image = self.pe_embedder(img_ids)
+
+    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
@@ -232,9 +229,11 @@ def usp_dit_forward(
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
     txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
+    img = img[:, :img_orig_size, :]
+    txt = txt[:, :txt_orig_size, :]
 
     img = torch.cat((img, txt), 1)
-
+    img, img_orig_size = pad_to_world_size(img, dim=1)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     transformer_options["total_blocks"] = len(self.single_blocks)
@@ -276,7 +275,8 @@ def usp_dit_forward(
                     img[:, : img_len] += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = get_sp_group().all_gather(img, dim=1)
+    img = get_sp_group().all_gather(img.contiguous(), dim=1)
+    img = img[:, :img_orig_size, :]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = img[:, : img_len]
     if ref_latent is not None:

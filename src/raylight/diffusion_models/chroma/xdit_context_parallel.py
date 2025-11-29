@@ -114,7 +114,7 @@ def usp_dit_forward(
     # Seq is odd (idk how) if the w == h, so just pad 0 to the end
     img, img_orig_size = pad_to_world_size(img, dim=1)
     img_ids, _ = pad_to_world_size(img_ids, dim=1)
-    txt, img_orig_size = pad_to_world_size(txt, dim=1)
+    txt, txt_orig_size= pad_to_world_size(txt, dim=1)
     txt_ids, _ = pad_to_world_size(txt_ids, dim=1)
     ids = torch.cat((txt_ids, img_ids), dim=1)
     pe_combine = self.pe_embedder(ids)
@@ -173,7 +173,11 @@ def usp_dit_forward(
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
     txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
 
+    img = img[:, :img_orig_size, :]
+    txt = txt[:, :txt_orig_size, :]
+
     img = torch.cat((txt, img), 1)
+    img, img_orig_size = pad_to_world_size(img, dim=1)
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
@@ -206,7 +210,8 @@ def usp_dit_forward(
                         img[:, txt.shape[1]:, ...] += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    img = get_sp_group().all_gather(img, dim=1)
+    img = get_sp_group().all_gather(img.contiguous(), dim=1)
+    img = img[:, :img_orig_size, :]
     img = img[:, txt.shape[1]:, ...]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     if hasattr(self, "final_layer"):
