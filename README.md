@@ -5,6 +5,7 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
 ## UPDATE
+- Flux2, Hunyuan 1.5 USP, FSDP
 - Fix broken tqdm progress bar
 - AMD ROCm Aiter attention
 - Z Image, Lumina, Model USP FSDP
@@ -22,15 +23,6 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 - Full FSDP support for Wan, Qwen, Flux, and Hunyuan Video.
 - Full LoRA support.
 - FSDP CPU offload, analogous to block swap/DisTorch.
-
-
-## 🚧 Model Status 🚧
-
-Hunyuan and Flux are currently **under repair**.
-Updates for:
-
-- **Hunyuan 1.5** 🔧
-- **Flux 2** 🛠️
 
 
 ## Table of Contents
@@ -187,6 +179,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Flux Dev          | ✅  | ✅   | ❌  |
 | Flux Konteks      | ✅  | ✅   | ❌  |
 | Flux Krea         | ✅  | ✅   | ❌  |
+| Flux 2            | ✅  | ✅   | ❌  |
 | Flux ControlNet   | ❌  | ❌   | ❌  |
 
 
@@ -216,6 +209,7 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 | Model             | USP | FSDP | CFG |
 |-------------------|-----|------|-----|
 | Hunyuan Video     | ✅  | ✅   | ❌  |
+| Hunyuan 1.5       | ✅  | ✅   | ❌  |
 | ControlNet        | ❌  | ❌   | ❌  |
 
 

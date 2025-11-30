@@ -15,15 +15,6 @@ sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
 
 
-def pad_if_odd(t: torch.Tensor, dim: int = 1):
-    if t.size(dim) % 2 != 0:
-        pad_shape = list(t.shape)
-        pad_shape[dim] = 1  # add one element along target dim
-        pad_tensor = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
-        t = torch.cat([t, pad_tensor], dim=dim)
-    return t
-
-
 def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
     if modulation_dims is None:
         if m_add is not None:

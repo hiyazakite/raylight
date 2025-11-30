@@ -212,8 +212,8 @@ def usp_dit_forward(
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
     img = img[:, :img_orig_size, :]
-    img = img[:, txt.shape[1]:, ...]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+    img = img[:, txt.shape[1]:, ...]
     if hasattr(self, "final_layer"):
         final_mod = self.get_modulations(mod_vectors, "final")
         img = self.final_layer(img, vec=final_mod)  # (N, T, patch_size ** 2 * out_channels)
