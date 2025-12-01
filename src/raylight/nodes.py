@@ -86,7 +86,9 @@ class RayInitializer:
         if world_size == 0:
             raise ValueError("Num of cuda/cudalike device is 0")
         if world_size < ulysses_degree * ring_degree * cfg_degree:
-            raise ValueError(f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=}")
+            raise ValueError(
+                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}"
+            )
         if cfg_degree > 2:
             raise ValueError(
                 "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
@@ -102,6 +104,10 @@ class RayInitializer:
             or ring_degree > 1
             or cfg_degree > 1
         ):
+            if ulysses_degree * ring_degree * cfg_degree == 0:
+                raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
+                 Please make sure to set any parallel degree to be greater than 0,
+                 or switch into DPKSampler and set 0 to all parallel degree""")
             self.parallel_dict["attention"] = XFuser_attention
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree

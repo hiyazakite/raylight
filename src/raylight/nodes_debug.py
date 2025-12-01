@@ -70,28 +70,39 @@ class RayInitializerDebug:
             os.environ.setdefault("MASTER_PORT", "29500")
             print("No env for torch dist MASTER_ADDR and MASTER_PORT, defaulting to 127.0.0.1:29500")
 
+        # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         self.parallel_dict = dict()
 
-        # Currenty not implementing CFG parallel, since LoRa can enable non cfg run
         world_size = GPU
         max_world_size = torch.cuda.device_count()
         if world_size > max_world_size:
-            raise ValueError("To many gpus")
+            raise ValueError("Too many gpus")
+        if world_size == 0:
+            raise ValueError("Num of cuda/cudalike device is 0")
+        if world_size < ulysses_degree * ring_degree * cfg_degree:
+            raise ValueError(
+                f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=}"
+            )
+        if cfg_degree > 2:
+            raise ValueError(
+                "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
+            )
 
         self.parallel_dict["is_xdit"] = False
         self.parallel_dict["is_fsdp"] = False
-        self.parallel_dict["global_world_size"] = world_size
-        self.parallel_dict["is_dumb_parallel"] = True
         self.parallel_dict["sync_ulysses"] = False
-        self.parallel_dict["ulysses_degree"] = ulysses_degree
-        self.parallel_dict["ring_degree"] = 1
+        self.parallel_dict["global_world_size"] = world_size
 
         if (
             ulysses_degree > 0
             or ring_degree > 0
             or cfg_degree > 0
         ):
+            if ulysses_degree * ring_degree * cfg_degree == 0:
+                raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=} is 0.
+                 Please make sure to set any parallel degree to be greater than 0.
+                 Or switch into DPKSampler and set 0 to all parallel degree""")
             self.parallel_dict["attention"] = XFuser_attention
             self.parallel_dict["is_xdit"] = True
             self.parallel_dict["ulysses_degree"] = ulysses_degree
@@ -109,18 +120,23 @@ class RayInitializerDebug:
             ray.init(
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
-                runtime_env={"py_modules": [raylight]},
+                runtime_env={
+                    "py_modules": [raylight],
+                },
             )
         except Exception as e:
             ray.shutdown()
-            ray.init(runtime_env={"py_modules": [raylight]})
+            ray.init(
+                runtime_env={
+                    "py_modules": [raylight],
+                }
+            )
             raise RuntimeError(f"Ray connection failed: {e}")
 
         ray_nccl_tester(world_size)
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
-
 
 class RayLoraLoader2:
     def __init__(self):
