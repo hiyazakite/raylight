@@ -100,9 +100,9 @@ class RayInitializer:
         self.parallel_dict["global_world_size"] = world_size
 
         if (
-            ulysses_degree > 1
-            or ring_degree > 1
-            or cfg_degree > 1
+            ulysses_degree > 0
+            or ring_degree > 0
+            or cfg_degree > 0
         ):
             if ulysses_degree * ring_degree * cfg_degree == 0:
                 raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
