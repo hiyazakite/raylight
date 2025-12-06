@@ -1,6 +1,8 @@
 import raylight
 import os
 import gc
+from pathlib import Path
+from copy import deepcopy
 
 import ray
 import torch
@@ -16,6 +18,84 @@ from .distributed_worker.ray_worker import (
     ray_nccl_tester,
 )
 
+def _resolve_module_dir(module):
+    module_file = getattr(module, '__file__', None)
+    if module_file:
+        path = Path(module_file).resolve()
+        if path.is_file():
+            return path.parent
+
+    module_paths = getattr(module, '__path__', None)
+    if module_paths:
+        for path in module_paths:
+            if path:
+                resolved = Path(path).resolve()
+                if resolved.exists():
+                    return resolved
+
+    raise RuntimeError(f"Unable to determine module path for {getattr(module, '__name__', module)}")
+
+
+def _resolve_repo_root():
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / 'main.py').exists() and (parent / 'execution.py').exists():
+            return parent
+    raise RuntimeError('Unable to locate ComfyUI repository root')
+
+
+def _ensure_runtime_workdir(module_dir: Path) -> Path:
+    runtime_dir = module_dir.parent / '_ray_runtime_env'
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return runtime_dir
+
+
+def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
+    python_path_entries = [str(repo_root)]
+    existing = os.environ.get('PYTHONPATH')
+    if existing:
+        python_path_entries.extend(part for part in existing.split(os.pathsep) if part)
+    python_path = os.pathsep.join(dict.fromkeys(python_path_entries))
+
+    env_vars = {
+        'PYTHONPATH': python_path,
+        'COMFYUI_BASE_DIRECTORY': str(repo_root),
+    }
+
+    return {
+        'py_modules': [str(module_dir)],
+        'working_dir': str(runtime_workdir),
+        'env_vars': env_vars,
+    }
+
+
+def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
+    excludes = [
+        '.git',
+        '.git/**',
+        '__pycache__',
+        '**/__pycache__',
+        '*.pyc',
+    ]
+
+    return {
+        'py_modules': [str(module_dir)],
+        'working_dir': str(repo_root),
+        'env_vars': {
+            'COMFYUI_BASE_DIRECTORY': '.',
+        },
+        'excludes': excludes,
+    }
+
+
+_RAYLIGHT_MODULE_PATH = _resolve_module_dir(raylight)
+_COMFY_ROOT_PATH = _resolve_repo_root()
+_RAYLIGHT_RUNTIME_WORKDIR = _ensure_runtime_workdir(_RAYLIGHT_MODULE_PATH)
+_RAY_RUNTIME_ENV_LOCAL = _build_local_runtime_env(
+    _RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH, _RAYLIGHT_RUNTIME_WORKDIR
+)
+_RAY_RUNTIME_ENV_REMOTE = _build_remote_runtime_env(_RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH)
+_LOCAL_CLUSTER_ADDRESSES = {None, '', 'local', 'LOCAL'}
 
 class RayInitializer:
     @classmethod
@@ -119,22 +199,24 @@ class RayInitializer:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
             self.parallel_dict["is_fsdp"] = True
 
+
+
+        runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
+        if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
+            runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
+
         try:
             # Shut down so if comfy user try another workflow it will not cause error
             ray.shutdown()
             ray.init(
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
-                runtime_env={
-                    "py_modules": [raylight],
-                },
+                runtime_env=deepcopy(runtime_env_base),
             )
         except Exception as e:
             ray.shutdown()
             ray.init(
-                runtime_env={
-                    "py_modules": [raylight],
-                }
+                runtime_env=deepcopy(runtime_env_base)
             )
             raise RuntimeError(f"Ray connection failed: {e}")
 
