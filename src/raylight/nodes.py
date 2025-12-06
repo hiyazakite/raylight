@@ -18,6 +18,7 @@ from .distributed_worker.ray_worker import (
     ray_nccl_tester,
 )
 
+
 def _resolve_module_dir(module):
     module_file = getattr(module, '__file__', None)
     if module_file:
@@ -96,6 +97,7 @@ _RAY_RUNTIME_ENV_LOCAL = _build_local_runtime_env(
 )
 _RAY_RUNTIME_ENV_REMOTE = _build_remote_runtime_env(_RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH)
 _LOCAL_CLUSTER_ADDRESSES = {None, '', 'local', 'LOCAL'}
+
 
 class RayInitializer:
     @classmethod

@@ -12,6 +12,7 @@ from comfy_extras.nodes_easycache import EasyCacheHolder
 
 from .ray_patch_decorator import ray_patch
 
+
 class DistributedCacheMixin:
     def __init__(self, enable_sync: bool = True) -> None:
         self._enable_sync = enable_sync
@@ -92,10 +93,6 @@ class DistributedCacheMixin:
         return bool(int(t.item()) != 0)
 
 
-
-
-
-
 class DistributedEasyCacheHolder(EasyCacheHolder, DistributedCacheMixin):
     def __init__(
         self,
@@ -119,28 +116,23 @@ class DistributedEasyCacheHolder(EasyCacheHolder, DistributedCacheMixin):
         DistributedCacheMixin.__init__(self, enable_sync=distributed_sync)
         self.distributed_sync = distributed_sync
 
-    
     def check_metadata(self, x: torch.Tensor) -> None:
-        
-        
         return
 
-    
     def apply_cache_diff(self, x: torch.Tensor, uuids: List) -> torch.Tensor:
         if self.first_cond_uuid in uuids:
             self.total_steps_skipped += 1
 
-        out = x  
+        out = x
         batch_offset = out.shape[0] // max(len(uuids), 1)
 
         for i, uuid in enumerate(uuids):
             if uuid not in self.uuid_cache_diffs:
                 continue
-            xi = out[i * batch_offset : (i + 1) * batch_offset]
+            xi = out[i * batch_offset: (i + 1) * batch_offset]
             di = self.uuid_cache_diffs[uuid].to(device=xi.device, dtype=xi.dtype)
 
             if xi.shape[1:] != di.shape[1:]:
-                
                 min_shape = tuple(min(a, b) for a, b in zip(xi.shape[1:], di.shape[1:]))
                 crop = (slice(None),) + tuple(slice(0, s) for s in min_shape)
                 xi_c = xi[crop]
@@ -149,15 +141,14 @@ class DistributedEasyCacheHolder(EasyCacheHolder, DistributedCacheMixin):
             else:
                 xi += di
 
-            out[i * batch_offset : (i + 1) * batch_offset] = xi
+            out[i * batch_offset: (i + 1) * batch_offset] = xi
         return out
 
-    
     def update_cache_diff(self, output: torch.Tensor, x: torch.Tensor, uuids: List) -> None:
         batch_offset = output.shape[0] // max(len(uuids), 1)
         for i, uuid in enumerate(uuids):
-            yo = output[i * batch_offset : (i + 1) * batch_offset]
-            xi = x[i * batch_offset : (i + 1) * batch_offset]
+            yo = output[i * batch_offset: (i + 1) * batch_offset]
+            xi = x[i * batch_offset: (i + 1) * batch_offset]
 
             if yo.shape[1:] != xi.shape[1:]:
                 min_shape = tuple(min(a, b) for a, b in zip(yo.shape[1:], xi.shape[1:]))
@@ -179,10 +170,6 @@ class DistributedEasyCacheHolder(EasyCacheHolder, DistributedCacheMixin):
         )
 
 
-
-
-
-
 def _extract_transformer_options(args: Sequence[Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
     transformer_options = args[-1]
     if not isinstance(transformer_options, dict):
@@ -190,10 +177,6 @@ def _extract_transformer_options(args: Sequence[Any], kwargs: Dict[str, Any]) ->
         if transformer_options is None:
             transformer_options = args[-2]
     return transformer_options
-
-
-
-
 
 
 def distributed_easycache_forward_wrapper(executor, *args, **kwargs):
@@ -206,14 +189,12 @@ def distributed_easycache_forward_wrapper(executor, *args, **kwargs):
     if not uuids:
         return executor(*args, **kwargs)
 
-    
     easycache.check_metadata(x)
 
     if easycache.first_cond_uuid is None:
         easycache.first_cond_uuid = uuids[0]
         easycache.initial_step = False
     elif easycache.first_cond_uuid not in uuids:
-        
         easycache.first_cond_uuid = uuids[0]
         easycache.uuid_cache_diffs = {}
         easycache.x_prev_subsampled = None
@@ -231,14 +212,13 @@ def distributed_easycache_forward_wrapper(executor, *args, **kwargs):
     input_change_value: Optional[float] = None
     do_easycache = easycache.should_do_easycache(sigmas)
 
-    
     if do_easycache and easycache.skip_current_step:
-        
+
         x_slice = easycache.subsample(x, uuids, clone=False)
         easycache.x_prev_subsampled = x_slice.clone()
         if has_first_cond_uuid and easycache.first_cond_uuid in easycache.uuid_cache_diffs:
             diff_slice = easycache.uuid_cache_diffs[easycache.first_cond_uuid]
-            
+
             xs = list(x_slice.shape); ds = list(diff_slice.shape)
             if xs[1:] != ds[1:]:
                 min_shape = tuple(min(a, b) for a, b in zip(xs[1:], ds[1:]))
@@ -254,7 +234,6 @@ def distributed_easycache_forward_wrapper(executor, *args, **kwargs):
             logging.info("[EasyCache] SKIP(carry) — updated prev-step refs; returning cached diff.")
         return easycache.apply_cache_diff(x, uuids)
 
-    
     if do_easycache and has_first_cond_uuid:
         if easycache.initial_step:
             easycache.first_cond_uuid = uuids[0]
@@ -278,12 +257,11 @@ def distributed_easycache_forward_wrapper(executor, *args, **kwargs):
             easycache.cumulative_change_rate += approx_output_change_rate
 
             should_skip = (easycache.cumulative_change_rate < easycache.reuse_threshold)
-            should_skip = easycache.sync_bool(should_skip, mode="all")  
+            should_skip = easycache.sync_bool(should_skip, mode="all")
 
             if should_skip:
                 easycache.skip_current_step = True
 
-                
                 x_slice = easycache.subsample(x, uuids, clone=False)
                 easycache.x_prev_subsampled = x_slice.clone()
                 if has_first_cond_uuid and easycache.first_cond_uuid in easycache.uuid_cache_diffs:
@@ -310,7 +288,6 @@ def distributed_easycache_forward_wrapper(executor, *args, **kwargs):
             else:
                 easycache.cumulative_change_rate = 0.0
 
-    
     output: torch.Tensor = executor(*args, **kwargs)
 
     if has_first_cond_uuid:
@@ -331,7 +308,7 @@ def distributed_easycache_forward_wrapper(executor, *args, **kwargs):
     if has_first_cond_uuid:
         easycache.x_prev_subsampled = easycache.subsample(next_x_prev, uuids)
         easycache.output_prev_subsampled = easycache.subsample(output, uuids)
-        
+
         easycache.output_prev_norm = easycache.sync_scalar(
             easycache.output_prev_subsampled.flatten().abs().mean(), op="max"
         )
@@ -382,10 +359,6 @@ def distributed_easycache_sample_wrapper(executor, *args, **kwargs):
                          easycache.total_steps_skipped, total_steps, speedup)
         easycache.reset()
         guider.model_options = orig_model_options
-
-
-
-
 
 
 class DistributedTeaCacheHolder(DistributedEasyCacheHolder):
@@ -470,7 +443,6 @@ class DistributedTeaCacheHolder(DistributedEasyCacheHolder):
         return float(sigmas)
 
     def _modulation_weight(self, sigma_value: float) -> float:
-        
         sigma_sq = sigma_value * sigma_value
         alpha_cumprod = 1.0 / (sigma_sq + 1.0)
         return (1.0 - alpha_cumprod) / (alpha_cumprod + 1e-8)
@@ -535,7 +507,6 @@ def teacache_forward_wrapper(executor, *args, **kwargs):
     cond_slice = teacache.subsample(x, uuids, clone=False)
     modulated_input = teacache.modulate_input(cond_slice, sigma_value)
 
-    
     if teacache.prev_modulated is None:
         teacache.store_modulated(modulated_input)
         output = executor(*args, **kwargs)
@@ -548,7 +519,6 @@ def teacache_forward_wrapper(executor, *args, **kwargs):
         teacache.mark_compute()
         return output
 
-    
     curr, prev = modulated_input, teacache.prev_modulated
     if curr.shape != prev.shape:
         min_shape = tuple(min(a, b) for a, b in zip(curr.shape, prev.shape))
@@ -568,9 +538,9 @@ def teacache_forward_wrapper(executor, *args, **kwargs):
     if not force_compute:
         acc = teacache.record_relative_change(relative_change)
         should_skip = (acc < teacache.reuse_threshold)
-        should_skip = teacache.sync_bool(should_skip, mode="all")  
+        should_skip = teacache.sync_bool(should_skip, mode="all")
         if should_skip:
-            teacache.store_modulated(modulated_input)  
+            teacache.store_modulated(modulated_input)
             teacache.mark_skip()
             if teacache.verbose and teacache.is_log_rank:
                 logging.info(
@@ -580,7 +550,6 @@ def teacache_forward_wrapper(executor, *args, **kwargs):
             return teacache.apply_cache_diff(x, uuids)
         force_compute = True
 
-    
     output: torch.Tensor = executor(*args, **kwargs)
     teacache.update_cache_diff(output, x, uuids)
     teacache.x_prev_subsampled = teacache.subsample(x, uuids)
@@ -588,7 +557,7 @@ def teacache_forward_wrapper(executor, *args, **kwargs):
     teacache.output_prev_norm = teacache.sync_scalar(
         teacache.output_prev_subsampled.flatten().abs().mean(), op="max"
     )
-    teacache.store_modulated(modulated_input)  
+    teacache.store_modulated(modulated_input)
     teacache.mark_compute()
     if teacache.verbose and teacache.is_log_rank:
         logging.info("TeaCache — COMPUTE; accumulated_change reset.")
@@ -640,10 +609,6 @@ def teacache_sample_wrapper(executor, *args, **kwargs):
         guider.model_options = orig_model_options
 
 
-
-
-
-
 class RayEasyCacheNode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -662,6 +627,7 @@ class RayEasyCacheNode:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -718,6 +684,7 @@ class RayTeaCacheNode:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("ray_actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -763,6 +730,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RayEasyCache": "EasyCache (Raylight)",
-    "RayTeaCache": "TeaCache (Raylight)",
+    "RayEasyCache": "EasyCache (Ray)",
+    "RayTeaCache": "TeaCache (Ray)",
 }

@@ -4,7 +4,12 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
+## 🚧 WARNING
+FSDP is **BROKEN** in the latest ComfyUI (0.3.76).
+A fix is in progress.
+
 ## UPDATE
+- TeaCache and EasyCache added thanks to [rmatif](https://github.com/rmatif/raylight/tree/easycache)
 - Flux2, Hunyuan 1.5 USP, FSDP
 - Fix broken tqdm progress bar
 - AMD ROCm Aiter attention
