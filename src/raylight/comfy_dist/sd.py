@@ -4,9 +4,10 @@ import torch
 
 from raylight import comfy_dist
 
-import comfy
 from comfy.sd import model_detection_error_hint
 from comfy import model_detection, model_management
+import comfy
+
 
 
 def load_lora_for_models(model, lora, strength_model):
