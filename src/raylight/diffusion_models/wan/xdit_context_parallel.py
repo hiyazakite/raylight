@@ -169,7 +169,7 @@ def usp_dit_forward(
 
     torch._dynamo.graph_break()
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    x = get_sp_group().all_gather(x, dim=1)
+    x = get_sp_group().all_gather(x.contiguous(), dim=1)
     x = x[:, :orig_size, :]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     torch._dynamo.graph_break()

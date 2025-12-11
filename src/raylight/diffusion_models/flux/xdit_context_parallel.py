@@ -186,7 +186,6 @@ def usp_dit_forward(
     if img.dtype == torch.float16:
         img = torch.nan_to_num(img, nan=0.0, posinf=65504, neginf=-65504)
 
-
     img = torch.cat((txt, img), 1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img, img_orig_size = pad_to_world_size(img, dim=1)
@@ -255,8 +254,13 @@ def usp_single_stream_forward(
 
     # compute attention
     attn = attention(q, k, v, pe=pe, mask=attn_mask)
+
     # compute activation in mlp stream, cat again and run second linear layer
-    mlp = self.mlp_act(mlp)
+    if self.yak_mlp:
+        mlp = self.mlp_act(mlp[..., self.mlp_hidden_dim_first // 2:]) * mlp[..., :self.mlp_hidden_dim_first // 2]
+    else:
+        mlp = self.mlp_act(mlp)
+
     output = self.linear2(torch.cat((attn, mlp), 2))
     x += apply_mod(output, mod.gate, None, modulation_dims)
     if x.dtype == torch.float16:

@@ -234,3 +234,32 @@ def _inject_lumina(model_patcher, base_model, *args):
     for block in model.layers:
         block.attention.forward = types.MethodType(usp_joint_attention_forward, block.attention)
     model._forward = types.MethodType(usp_dit_forward, model)
+
+
+@USPInjectRegistry.register(model_base.Kandinsky5)
+def _inject_kandinsky5(model_patcher, base_model, *args):
+    from ..diffusion_models.kandinsky5.xdit_context_parallel import (
+        usp_dit_forward,
+        usp_self_attn_foward,
+        usp_self_attn_forward_chunked,
+        usp_cross_attn_forward,
+    )
+    model = base_model.diffusion_model
+    for text_block in model.text_transformer_blocks:
+        text_block.self_attention._forward = types.MethodType(
+            usp_self_attn_foward, text_block.self_attention)
+
+        text_block.self_attention._forward_chunked = types.MethodType(
+            usp_self_attn_forward_chunked, text_block.self_attention)
+
+    for visual_block in model.visual_transformer_blocks:
+        visual_block.self_attention._forward = types.MethodType(
+            usp_self_attn_foward, visual_block.self_attention)
+
+        visual_block.self_attention._forward_chunked = types.MethodType(
+            usp_self_attn_forward_chunked, visual_block.self_attention)
+
+        visual_block.cross_attention.forward = types.MethodType(
+            usp_cross_attn_forward, visual_block.cross_attention)
+
+    model._forward = types.MethodType(usp_dit_forward, model)

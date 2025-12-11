@@ -97,6 +97,12 @@ def _inject_lumina():
     return cfg_parallel_forward_wrapper
 
 
+@CFGParallelInjectRegistry.register(model_base.Kandinsky5)
+def _inject_kandinsky5():
+    from ..diffusion_models.kandinsky5.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+    return cfg_parallel_forward_wrapper
+
+
 # This will cause error for all non specified models above, since all of that will be funneled into this
 @CFGParallelInjectRegistry.register(model_base.BaseModel)
 def _inject_unet():
