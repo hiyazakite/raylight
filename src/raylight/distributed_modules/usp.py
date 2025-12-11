@@ -262,4 +262,4 @@ def _inject_kandinsky5(model_patcher, base_model, *args):
         visual_block.cross_attention.forward = types.MethodType(
             usp_cross_attn_forward, visual_block.cross_attention)
 
-    model._forward = types.MethodType(usp_dit_forward, model)
+    model.forward_orig = types.MethodType(usp_dit_forward, model)
