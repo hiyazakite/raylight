@@ -46,46 +46,46 @@ class FSDPShardRegistry:
 
 
 # Register per-model handlers
+if hasattr(model_base, "WAN21"):
+    @FSDPShardRegistry.register(model_base.WAN21)
+    @FSDPShardRegistry.register(model_base.WAN22)
+    def _wrap_wan(model, sd, cpu_offload):
+        return wan_shard(model, sd, cpu_offload)
 
-@FSDPShardRegistry.register(model_base.WAN21)
-@FSDPShardRegistry.register(model_base.WAN22)
-def _wrap_wan(model, sd, cpu_offload):
-    return wan_shard(model, sd, cpu_offload)
+if hasattr(model_base, "ChromaRadiance"):
+    @FSDPShardRegistry.register(model_base.ChromaRadiance)
+    def _wrap_chroma_radiance(model, sd, cpu_offload):
+        return chroma_radiance_shard(model, sd, cpu_offload)
 
+if hasattr(model_base, "Chroma"):
+    @FSDPShardRegistry.register(model_base.Chroma)
+    def _wrap_chroma(model, sd, cpu_offload):
+        return chroma_shard(model, sd, cpu_offload)
 
-@FSDPShardRegistry.register(model_base.ChromaRadiance)
-def _wrap_chroma_radiance(model, sd, cpu_offload):
-    return chroma_radiance_shard(model, sd, cpu_offload)
+if hasattr(model_base, "Flux"):
+    @FSDPShardRegistry.register(model_base.Flux)
+    def _wrap_flux(model, sd, cpu_offload):
+        return flux_shard(model, sd, cpu_offload)
 
+if hasattr(model_base, "QwenImage"):
+    @FSDPShardRegistry.register(model_base.QwenImage)
+    def _wrap_qwen(model, sd, cpu_offload):
+        return qwen_shard(model, sd, cpu_offload)
 
-@FSDPShardRegistry.register(model_base.Chroma)
-def _wrap_chroma(model, sd, cpu_offload):
-    return chroma_shard(model, sd, cpu_offload)
+if hasattr(model_base, "Hunyuan3Dv2"):
+    @FSDPShardRegistry.register(model_base.Hunyuan3Dv2)
+    def _wrap_hunyuan_3dv2(model, sd, cpu_offload):
+        return flux_shard(model, sd, cpu_offload)
 
+if hasattr(model_base, "HunyuanVideo"):
+    @FSDPShardRegistry.register(model_base.HunyuanVideo)
+    def _wrap_hunyuan(model, sd, cpu_offload):
+        return hunyuan_shard(model, sd, cpu_offload)
 
-@FSDPShardRegistry.register(model_base.Flux)
-def _wrap_flux(model, sd, cpu_offload):
-    return flux_shard(model, sd, cpu_offload)
-
-
-@FSDPShardRegistry.register(model_base.QwenImage)
-def _wrap_qwen(model, sd, cpu_offload):
-    return qwen_shard(model, sd, cpu_offload)
-
-
-@FSDPShardRegistry.register(model_base.Hunyuan3Dv2)
-def _wrap_hunyuan_3dv2(model, sd, cpu_offload):
-    return flux_shard(model, sd, cpu_offload)
-
-
-@FSDPShardRegistry.register(model_base.HunyuanVideo)
-def _wrap_hunyuan(model, sd, cpu_offload):
-    return hunyuan_shard(model, sd, cpu_offload)
-
-
-@FSDPShardRegistry.register(model_base.Lumina2)
-def _wrap_lumina(model, sd, cpu_offload):
-    return lumina_shard(model, sd, True)
+if hasattr(model_base, "Lumina2"):
+    @FSDPShardRegistry.register(model_base.Lumina2)
+    def _wrap_lumina(model, sd, cpu_offload):
+        return lumina_shard(model, sd, True)
 
 
 def patch_fsdp(self):
