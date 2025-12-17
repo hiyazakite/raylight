@@ -4,6 +4,9 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
+## WARNING
+0.4.0 ComfyUI is currently not supported
+
 ## UPDATE
 - Kandinsky5 model
 - Fix FSDP error cause by Ray cannot pickle None type return by `comfy.supported_models_base.BASE.__getattr__`
@@ -91,11 +94,13 @@ Its job is to split the model weights among GPUs.
   ```
   But this will hurt performance, it is like a sanity check if the Raylight can work, but there is so much performance
   left on the table.
-- **Windows** is in partial testing, switch to `dev` branch to test it. And scroll down below for more information
 - Example WF just open from your comfyui menu and browse templates
 - **GPU Topology** is very important, not all PCIe in your motherboard is equal.
 - VRAM leakage, when using [Ring > 1 instead of Ulysses](https://github.com/feifeibear/long-context-attention/issues/112).
   Solution : just increase Ulysses degree for now.
+- The PyTorch **NCCL** version will be replaced to `2.28.9` to fix issues with FP8 communication.
+- The PyTorch version will be `2.8.1` due to relaxed `dtype` constraints when using FSDP. You can still use `2.7.1`
+  or earlier. However, FSDP will not be function correctly in those versions.
 
 ## Operation
 
@@ -140,23 +145,15 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 
 ### NVidia
 
-1. **Ampere**: There is an issue with NCCL broadcast and reduction in FSDP on PyTorch 2.8.
-   Please use the previous version instead. FSDP works successfully on Torch 2.7.1 CU128 for Ampere.
-   Reference: https://github.com/pytorch/pytorch/issues/162057#issuecomment-3250217122
-
-2. **Turing**: Not tested. Please use FlashAttn1 instead of FlashAttn2 or Torch Attn.
-
-3. **Ada Lovelace**: There is also an issue with Torch 2.8 which when assigning
-   `device_id` to `torch.dist_init_process_group()` cause OOM.
-   In a mean time, you would see torch distributor complaining about device assigment, but other-
-   than that it should be working fine.
-
-4. **Blackwell**: Expected to work just like Ada Lovelace.
+1. **Turing**: Not tested. Please use FlashAttn1 instead of FlashAttn2 or Torch Attn.
+2. **Ampere**: Tested
+3. **Ada Lovelace**: Tested
+4. **Blackwell**: Tested
 
 ### AMD
 
 1. **MI3XX** : User confirmed working on 8xMI300X using ROCm compiled PyTorch and Flash Attention 2.
-2. **MI210** : Personally tested and working on MI210 using ROCm compiled PyTorch and builtin `Torch.Functional.SDPA`
+2. **MI210** : Personally tested and working on MI210 using ROCm compiled PyTorch and builtin `torch.nn.Functional.SDPA`
 
 ### Intel
 1. **Arc Pro B60** : Using [LLM Scaler](https://github.com/intel/llm-scaler/blob/main/omni/README.md/#wan22).
@@ -232,23 +229,11 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 **Legend:**
 - ✅ = Supported
 - ❌ = Not currently supported.
-- ❓ = Maybe work?
 
 **Notes:**
 - Non standard Wan variant (Phantom, S2V, etc...) is not tested
 - CFG parallel for Flux, Hunyuan, is technically supported by Raylight,
   but since these models do not support conditional batches (CFG = 1), enabling it has no effect.
-
-## Scaled vs Non-Scaled Models
-
-| Model       | USP | FSDP |
-|-------------|-----|------|
-| Non-Scaled  | ✅  | ✅   |
-| Scaled      | ✅  | ⚠️   |
-
-**Notes:**
-- Scaled models use multiple dtypes inside their transformer blocks: typically **FP32** for scale, **FP16** for bias, and **FP8** for weights.
-- Raylight FSDP can work with scaled model, but it really does not like it. Since FSDP shards must have uniform dtype, if not it will not be sharded.
 
 ## Attention
 
@@ -262,8 +247,6 @@ Activate FSDP, and set the Ulysses degree to the number of GPUs. Use the XFuser 
 
 **Notes:**
 - Tested on Wan 2.1 T2V 14B 832x480 33 frame 2 RTX 2000 ADA
-
-
 
 ## Wan T2V 1.3B
 <img width="1918" height="887" alt="image" src="https://github.com/user-attachments/assets/57b7cdf5-ebd5-4902-bccd-fa7bbfe9ef8b" />
@@ -330,8 +313,8 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
 1. Find raylight in the manager and install it.
 
 **Windows**
-1. Only works for **PyTorch 2.7**, because of [pytorch/pytorch#150381](https://github.com/pytorch/pytorch/issues/150381)
-2. POSIX and Win32 style paths can cause issues when importing **raylight**.
+1. After numerous testing, it still does not work on out of the box PyTorch, however if you want to try:
+2. First, build [NCCL](https://github.com/MyCaffe/NCCL) for Windows.
 3. Recommended steps:
    - Manually clone the **Raylight** repo
    - Switch to the `dev` branch for now
@@ -341,11 +324,7 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
    ..\..\..\python_embeded\python.exe -m pip install -r .\requirements.txt
    ..\..\..\python_embeded\python.exe -m pip install -e .
    ```
-4. Highly experimental — please open an issue if you encounter errors.
-5. Advisable to run in WSL since windows does not have NCCL support from PyTorch, raylight will run using GLOO,
-   which is slower than NCCL. Might not even worth it to run in windows other than WSL.
-
-
+4. Advice, just run in WSL, and symlink your ComfyUI model dir from windows to WSL.
 
 ## Support
 [PayPal](https://paypal.me/Komikndr)
