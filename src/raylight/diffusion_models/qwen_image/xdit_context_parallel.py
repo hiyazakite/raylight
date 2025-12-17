@@ -45,7 +45,7 @@ def usp_dit_forward(
         h = 0
         w = 0
         index = 0
-        ref_method = kwargs.get("ref_latents_method", "index")
+        ref_method = kwargs.get("ref_latents_method", self.default_ref_method)
         index_ref_method = (ref_method == "index") or (ref_method == "index_timestep_zero")
         timestep_zero = ref_method == "index_timestep_zero"
         for ref in ref_latents:
@@ -112,7 +112,7 @@ def usp_dit_forward(
     hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
     encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_world_size, dim=1)[sp_rank]
 
-    # Modified, freq rope : tuple(txt, img)
+    # Modified, freq rope : List[txt, img]
     image_rotary_emb[0] = torch.chunk(image_rotary_emb[0], sp_world_size, dim=1)[sp_rank]
     image_rotary_emb[1] = torch.chunk(image_rotary_emb[1], sp_world_size, dim=1)[sp_rank]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
