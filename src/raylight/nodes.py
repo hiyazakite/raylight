@@ -1,6 +1,7 @@
 import raylight
 import os
 import gc
+from typing import Any
 from pathlib import Path
 from copy import deepcopy
 
@@ -10,7 +11,7 @@ import comfy
 import folder_paths
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
-from comfy import sd, sample, utils
+from comfy import sd, sample, utils # type: ignore
 
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
@@ -149,19 +150,19 @@ class RayInitializer:
 
     def spawn_actor(
         self,
-        ray_cluster_address,
-        ray_cluster_namespace,
-        GPU,
-        ulysses_degree,
-        ring_degree,
-        cfg_degree,
-        sync_ulysses,
-        FSDP,
-        FSDP_CPU_OFFLOAD,
-        XFuser_attention,
-        ray_object_store_gb=2.0,
-        ray_dashboard_address="None",
-        torch_dist_address="None"
+        ray_cluster_address: str,
+        ray_cluster_namespace: str,
+        GPU: int,
+        ulysses_degree: int,
+        ring_degree: int ,
+        cfg_degree: int,
+        sync_ulysses: bool,
+        FSDP: bool,
+        FSDP_CPU_OFFLOAD: bool,
+        XFuser_attention: int,
+        ray_object_store_gb: float = 2.0,
+        ray_dashboard_address: str = "None",
+        torch_dist_address: str = "None"
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
@@ -177,7 +178,7 @@ class RayInitializer:
 
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        self.parallel_dict = dict()
+        self.parallel_dict: dict[str, Any] = dict()
         _monkey()
 
         world_size = GPU

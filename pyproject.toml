@@ -50,6 +50,10 @@ testpaths = [
     "tests",
 ]
 
+[tool.pyright]
+#typeCheckingMode = "strict"
+reportMissingImports = false
+
 [tool.mypy]
 files = "."
 
