@@ -87,6 +87,8 @@ Its job is to split the model weights among GPUs.
 
 ## RTM and Known Issues
 - Scroll further down for the installation guide.
+- If there is an error about NCCL installation, just install `pip install nvidia-nccl-cu12==2.28.9`.
+  Raylight use this NCCL lib instead of torch baked in NCCL.
 - If NCCL communication fails before running (e.g., watchdog timeout), set the following environment variables:
   ```bash
   export NCCL_P2P_DISABLE=1
