@@ -172,16 +172,19 @@ class RayWorker:
             from raylight.comfy_dist.model_patcher import LowVramPatch
 
             from raylight.comfy_dist.sd import fsdp_load_diffusion_model
-            from torch.distributed.fsdp import FSDPModule
 
             # Monkey patch
             model_patcher.LowVramPatch = LowVramPatch
             model_management.cleanup_models_gc = cleanup_models_gc
 
-            m = getattr(self.model, "model", None)
-            if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
-                del self.model
-                self.model = None
+            del self.model
+            del self.state_dict
+            self.model = None
+            self.state_dict = None
+            torch.cuda.synchronize()
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
+
             self.model, self.state_dict = fsdp_load_diffusion_model(
                 unet_path,
                 self.local_rank,
@@ -189,6 +192,9 @@ class RayWorker:
                 self.is_cpu_offload,
                 model_options=model_options,
             )
+            torch.cuda.synchronize()
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
         else:
             self.model = comfy.sd.load_diffusion_model(
                 unet_path, model_options=model_options,
@@ -363,6 +369,11 @@ class RayWorker:
 
         if self.parallel_dict["is_fsdp"] is True:
             self.model.patch_fsdp()
+            del self.state_dict
+            self.state_dict = None
+            torch.cuda.synchronize()
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
 
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.local_rank == 0:
