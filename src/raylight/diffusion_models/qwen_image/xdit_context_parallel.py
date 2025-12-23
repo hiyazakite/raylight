@@ -47,10 +47,15 @@ def usp_dit_forward(
         index = 0
         ref_method = kwargs.get("ref_latents_method", self.default_ref_method)
         index_ref_method = (ref_method == "index") or (ref_method == "index_timestep_zero")
+        negative_ref_method = ref_method == "negative_index"
         timestep_zero = ref_method == "index_timestep_zero"
         for ref in ref_latents:
             if index_ref_method:
                 index += 1
+                h_offset = 0
+                w_offset = 0
+            elif negative_ref_method:
+                index -= 1
                 h_offset = 0
                 w_offset = 0
             else:
