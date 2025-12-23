@@ -1,6 +1,7 @@
 import raylight
 import os
 import gc
+from typing import Any
 from pathlib import Path
 from copy import deepcopy
 
@@ -10,7 +11,7 @@ import comfy
 import folder_paths
 
 # Must manually insert comfy package or ray cannot import raylight to cluster
-from comfy import sd, sample, utils
+from comfy import sd, sample, utils # type: ignore
 
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
@@ -149,28 +150,35 @@ class RayInitializer:
 
     def spawn_actor(
         self,
-        ray_cluster_address,
-        ray_cluster_namespace,
-        GPU,
-        ulysses_degree,
-        ring_degree,
-        cfg_degree,
-        sync_ulysses,
-        FSDP,
-        FSDP_CPU_OFFLOAD,
-        XFuser_attention,
+        ray_cluster_address: str,
+        ray_cluster_namespace: str,
+        GPU: int,
+        ulysses_degree: int,
+        ring_degree: int ,
+        cfg_degree: int,
+        sync_ulysses: bool,
+        FSDP: bool,
+        FSDP_CPU_OFFLOAD: bool,
+        XFuser_attention: int,
+        ray_object_store_gb: float = 2.0,
+        ray_dashboard_address: str = "None",
+        torch_dist_address: str = "None"
     ):
         # THIS IS PYTORCH DIST ADDRESS
         # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
         # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
-        if "MASTER_ADDR" not in os.environ or "MASTER_PORT" not in os.environ:
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29500")
-            print("No env for torch dist MASTER_ADDR and MASTER_PORT, defaulting to 127.0.0.1:29500")
+        if torch_dist_address != "None":
+            torch_host, torch_port = torch_dist_address.rsplit(":", 1)
+            os.environ.setdefault("MASTER_ADDR", torch_host)
+            os.environ.setdefault("MASTER_PORT", torch_port)
+        else:
+            torch_host, torch_port = "127.0.0.1", "29500"
+            os.environ.setdefault("MASTER_ADDR", torch_host)
+            os.environ.setdefault("MASTER_PORT", torch_port)
 
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        self.parallel_dict = dict()
+        self.parallel_dict: dict[str, Any] = dict()
         _monkey()
 
         world_size = GPU
@@ -213,8 +221,15 @@ class RayInitializer:
             self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
             self.parallel_dict["is_fsdp"] = True
 
+        if ray_dashboard_address != "None":
+            dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
+            dashboard_port = int(dashboard_port)
+            enable_dashboard = True
+        else:
+            dashboard_host, dashboard_port = "127.0.0.1", None
+            enable_dashboard = False
 
-
+        ray_object_store_gb = int(ray_object_store_gb * 1024**3)
         runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
         if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
             runtime_env_base = _RAY_RUNTIME_ENV_REMOTE
@@ -226,6 +241,10 @@ class RayInitializer:
                 ray_cluster_address,
                 namespace=ray_cluster_namespace,
                 runtime_env=deepcopy(runtime_env_base),
+                object_store_memory=ray_object_store_gb,
+                include_dashboard=enable_dashboard,
+                dashboard_host=dashboard_host,
+                dashboard_port=dashboard_port
             )
         except Exception as e:
             ray.shutdown()
@@ -238,6 +257,55 @@ class RayInitializer:
         ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
         ray_actors = ray_actor_fn()
         return ([ray_actors, ray_actor_fn],)
+
+
+class RayInitializerAdvanced(RayInitializer):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ray_cluster_address": ("STRING", {
+                    "default": "local",
+                    "tooltip": "Address of Ray cluster different than torch distributed address"}),
+                "ray_cluster_namespace": ("STRING", {"default": "default"}),
+                "ray_object_store_gb": ("FLOAT", {
+                    "default": 2.0,
+                    "tooltip": "Ray global object store, default is plenty enough"}),
+                "ray_dashboard_address": ("STRING", {
+                    "default": "None",
+                    "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"}),
+                "torch_dist_address": ("STRING", {
+                    "default": "127.0.0.1:29500",
+                    "tooltip": "Might need to restart ComfyUI to apply"}),
+                "GPU": ("INT", {"default": 2}),
+                "ulysses_degree": ("INT", {"default": 2}),
+                "ring_degree": ("INT", {"default": 1}),
+                "cfg_degree": ("INT", {"default": 1}),
+                "sync_ulysses": ("BOOLEAN", {"default": False}),
+                "FSDP": ("BOOLEAN", {"default": False}),
+                "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
+                "XFuser_attention": (
+                    [
+                        "TORCH",
+                        "FLASH_ATTN",
+                        "FLASH_ATTN_3",
+                        "SAGE_AUTO_DETECT",
+                        "SAGE_FP16_TRITON",
+                        "SAGE_FP16_CUDA",
+                        "SAGE_FP8_CUDA",
+                        "SAGE_FP8_SM90",
+                        "AITER_ROCM",
+                    ],
+                    {"default": "TORCH"},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("RAY_ACTORS_INIT",)
+    RETURN_NAMES = ("ray_actors_init",)
+
+    FUNCTION = "spawn_actor"
+    CATEGORY = "Raylight"
 
 
 class RayUNETLoader:
@@ -711,6 +779,7 @@ NODE_CLASS_MAPPINGS = {
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoader": RayLoraLoader,
     "RayInitializer": RayInitializer,
+    "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
     "RayVAEDecodeDistributed": RayVAEDecodeDistributed
 }
@@ -721,6 +790,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoader": "Load Lora Model (Ray)",
     "RayInitializer": "Ray Init Actor",
+    "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
     "RayVAEDecodeDistributed": "Distributed VAE (Ray)"
 }

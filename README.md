@@ -4,9 +4,6 @@ Raylight. Using Ray Worker to manage multi GPU sampler setup. With XDiT-XFuser a
 
 *"Why buy 5090 when you can buy 2x5070s"-Komikndr*
 
-## WARNING
-0.4.0 ComfyUI is currently not supported
-
 ## UPDATE
 - Kandinsky5 model
 - Fix FSDP error cause by Ray cannot pickle None type return by `comfy.supported_models_base.BASE.__getattr__`
@@ -296,7 +293,8 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
 2. `cd raylight`
 3. Install dependencies:
    your_python_env - pip install -r requirements.txt
-4. Install FlashAttention:
+4. Install `pip install nvidia-nccl-cu12==2.28.9`, this is only needed if you are using FSDP with fp8 models with Nvidia GPUs
+5. Install FlashAttention 2 (optional):
    - Option A (NOT recommended due to long build time):
      pip install flash-attn --no-build-isolation
    - Option B (recommended, use prebuilt wheel):
@@ -309,7 +307,8 @@ https://github.com/user-attachments/assets/d5e262c7-16d5-4260-b847-27be2d809920
        ```
      For other versions, check:
         https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/
-5. Restart ComfyUI.
+6. Attention backend can be install like any other libs e.g: SageAttn, AITER, FA3 (optional)
+7. Restart ComfyUI.
 
 **ComfyUI Manager**
 1. Find raylight in the manager and install it.
