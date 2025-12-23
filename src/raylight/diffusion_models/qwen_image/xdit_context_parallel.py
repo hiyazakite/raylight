@@ -27,8 +27,8 @@ def usp_dit_forward(
     timesteps,
     context,
     attention_mask=None,
-    guidance: torch.Tensor = None,
     ref_latents=None,
+    additional_t_cond=None,
     transformer_options={},
     control=None,
     **kwargs
@@ -47,10 +47,15 @@ def usp_dit_forward(
         index = 0
         ref_method = kwargs.get("ref_latents_method", self.default_ref_method)
         index_ref_method = (ref_method == "index") or (ref_method == "index_timestep_zero")
+        negative_ref_method = ref_method == "negative_index"
         timestep_zero = ref_method == "index_timestep_zero"
         for ref in ref_latents:
             if index_ref_method:
                 index += 1
+                h_offset = 0
+                w_offset = 0
+            elif negative_ref_method:
+                index -= 1
                 h_offset = 0
                 w_offset = 0
             else:
@@ -91,14 +96,7 @@ def usp_dit_forward(
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
     encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
-    if guidance is not None:
-        guidance = guidance * 1000
-
-    temb = (
-        self.time_text_embed(timestep, hidden_states)
-        if guidance is None
-        else self.time_text_embed(timestep, guidance, hidden_states)
-    )
+    temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     hidden_states, hidden_states_orig_size = pad_to_world_size(hidden_states, dim=1)

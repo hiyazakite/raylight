@@ -24,9 +24,7 @@ def update_folder_names_and_paths(key, targets=[]):
     base = folder_paths.folder_names_and_paths.get(key, ([], {}))
     base = base[0] if isinstance(base[0], (list, set, tuple)) else []
     # find base key & add w/ fallback, sanity check + warning
-    target = next(
-        (x for x in targets if x in folder_paths.folder_names_and_paths), targets[0]
-    )
+    target = next((x for x in targets if x in folder_paths.folder_names_and_paths), targets[0])
     orig, _ = folder_paths.folder_names_and_paths.get(target, ([], {}))
     folder_paths.folder_names_and_paths[key] = (orig or base, {".gguf"})
     if base and base != orig:
@@ -49,26 +47,18 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         patches = self.patches[key]
         if is_quantized(weight):
             out_weight = weight.to(device_to)
-            patches = move_patch_to_device(
-                patches,
-                self.load_device if self.patch_on_device else self.offload_device,
-            )
+            patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
             # TODO: do we ever have legitimate duplicate patches? (i.e. patch on top of patched weight)
             out_weight.patches = [(patches, key)]
         else:
             inplace_update = self.weight_inplace_update or inplace_update
             if key not in self.backup:
-                self.backup[key] = collections.namedtuple(
-                    "Dimension", ["weight", "inplace_update"]
-                )(
-                    weight.to(device=self.offload_device, copy=inplace_update),
-                    inplace_update,
+                self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(
+                    weight.to(device=self.offload_device, copy=inplace_update), inplace_update
                 )
 
             if device_to is not None:
-                temp_weight = comfy.model_management.cast_to_device(
-                    weight, device_to, torch.float32, copy=True
-                )
+                temp_weight = comfy.model_management.cast_to_device(weight, device_to, torch.float32, copy=True)
             else:
                 temp_weight = weight.to(torch.float32, copy=True)
 
@@ -89,13 +79,23 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 if len(patches) > 0:
                     p.patches = []
         # TODO: Find another way to not unload after patches
-        return super().unpatch_model(
-            device_to=device_to, unpatch_weights=unpatch_weights
-        )
+        return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
+
+    def pin_weight_to_device(self, key):
+        op_key = key.rsplit('.', 1)[0]
+        if not self.mmap_released and op_key in self.named_modules_to_munmap:
+            # TODO: possible to OOM, find better way to detach
+            self.named_modules_to_munmap[op_key].to(self.load_device).to(self.offload_device)
+            del self.named_modules_to_munmap[op_key]
+        super().pin_weight_to_device(key)
 
     mmap_released = False
+    named_modules_to_munmap = {}
 
     def load(self, *args, force_patch_weights=False, **kwargs):
+        if not self.mmap_released:
+            self.named_modules_to_munmap = dict(self.model.named_modules())
+
         # always call `patch_weight_to_device` even for lowvram
         super().load(*args, force_patch_weights=True, **kwargs)
 
@@ -103,7 +103,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         if not self.mmap_released:
             linked = []
             if kwargs.get("lowvram_model_memory", 0) > 0:
-                for n, m in self.model.named_modules():
+                for n, m in self.named_modules_to_munmap.items():
                     if hasattr(m, "weight"):
                         device = getattr(m.weight, "device", None)
                         if device == self.offload_device:
@@ -120,6 +120,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                     # TODO: possible to OOM, find better way to detach
                     m.to(self.load_device).to(self.offload_device)
             self.mmap_released = True
+            self.named_modules_to_munmap = {}
 
     def clone(self, *args, **kwargs):
         src_cls = self.__class__
@@ -129,6 +130,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         self.__class__ = src_cls
         # GGUF specific clone values below
         n.patch_on_device = getattr(self, "patch_on_device", False)
+        n.mmap_released = getattr(self, "mmap_released", False)
         if src_cls != GGUFModelPatcher:
             n.size = 0  # force recalc
         return n

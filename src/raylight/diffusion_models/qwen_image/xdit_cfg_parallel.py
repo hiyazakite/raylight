@@ -10,7 +10,7 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
     cfg_rank = get_classifier_free_guidance_rank()
     cfg_world_size = get_classifier_free_guidance_world_size()
 
-    x, timestep, context, attention_mask, guidance, ref_latents, transformer_options = args
+    x, timestep, context, attention_mask, ref_latents, additional_t_cond, transformer_options = args
 
     if x.shape[0] == cfg_world_size:
         x = torch.chunk(x, cfg_world_size, dim=0)[cfg_rank]
@@ -22,8 +22,8 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
     if attention_mask is not None:
         attention_mask = torch.chunk(attention_mask, cfg_world_size, dim=0)[cfg_rank]
 
-    if guidance is not None:
-        guidance = torch.chunk(guidance, cfg_world_size, dim=0)[cfg_rank]
+    if additional_t_cond is not None:
+        additional_t_cond = torch.chunk(additional_t_cond, cfg_world_size, dim=0)[cfg_rank]
 
     if ref_latents is not None:
         ref_latents = torch.chunk(ref_latents, cfg_world_size, dim=0)[cfg_rank]
