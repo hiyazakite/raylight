@@ -110,19 +110,42 @@ class SafetensorOps(comfy.ops.manual_cast):
     """Operations factory that produces zero-copy aware layers."""
     
     class Linear(SafetensorLayer, comfy.ops.manual_cast.Linear):
+        def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+            torch.nn.Module.__init__(self)
+            self.in_features = in_features
+            self.out_features = out_features
+            self.weight = None
+            self.bias = None
+
         def forward(self, input):
             weight, bias = self.cast_bias_weight(input)
             return torch.nn.functional.linear(input, weight, bias)
 
     class Conv2d(SafetensorLayer, comfy.ops.manual_cast.Conv2d):
+        def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros', device=None, dtype=None):
+            torch.nn.Module.__init__(self)
+            self.weight = None
+            self.bias = None
+
         def forward(self, input):
             weight, bias = self.cast_bias_weight(input)
             return self._conv_forward(input, weight, bias)
             
     class Embedding(SafetensorLayer, comfy.ops.manual_cast.Embedding):
+        def __init__(self, num_embeddings, embedding_dim, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False, _weight=None, device=None, dtype=None):
+            torch.nn.Module.__init__(self)
+            self.num_embeddings = num_embeddings
+            self.embedding_dim = embedding_dim
+            self.padding_idx = padding_idx
+            self.max_norm = max_norm
+            self.norm_type = norm_type
+            self.scale_grad_by_freq = scale_grad_by_freq
+            self.sparse = sparse
+            self.weight = None
+
         def forward(self, input, out_dtype=None):
             output_dtype = out_dtype
-            if self.weight.dtype == torch.float16 or self.weight.dtype == torch.bfloat16:
+            if self.weight is not None and (self.weight.dtype == torch.float16 or self.weight.dtype == torch.bfloat16):
                 out_dtype = None
             
             # Use get_weight logic (via cast_bias_weight internal logic or direct)
@@ -140,6 +163,16 @@ class SafetensorOps(comfy.ops.manual_cast):
             ).to(dtype=output_dtype)
 
     class LayerNorm(SafetensorLayer, comfy.ops.manual_cast.LayerNorm):
+        def __init__(self, normalized_shape, eps=1e-05, elementwise_affine=True, device=None, dtype=None):
+            torch.nn.Module.__init__(self)
+            if isinstance(normalized_shape, int):
+                normalized_shape = (normalized_shape,)
+            self.normalized_shape = tuple(normalized_shape)
+            self.eps = eps
+            self.elementwise_affine = elementwise_affine
+            self.weight = None
+            self.bias = None
+
         def forward(self, input):
             if self.weight is None:
                 return super().forward(input)
@@ -149,6 +182,15 @@ class SafetensorOps(comfy.ops.manual_cast):
             )
 
     class GroupNorm(SafetensorLayer, comfy.ops.manual_cast.GroupNorm):
+        def __init__(self, num_groups, num_channels, eps=1e-05, affine=True, device=None, dtype=None):
+            torch.nn.Module.__init__(self)
+            self.num_groups = num_groups
+            self.num_channels = num_channels
+            self.eps = eps
+            self.affine = affine
+            self.weight = None
+            self.bias = None
+
         def forward(self, input):
             weight, bias = self.cast_bias_weight(input)
             return torch.nn.functional.group_norm(

@@ -500,34 +500,15 @@ class RayUNETLoader:
         loaded_futures = []
         patched_futures = []
 
-        if parallel_dict["is_fsdp"] is True:
-            worker0 = ray.get_actor("RayWorker:0")
-            cancellable_get(worker0.load_unet.remote(unet_path, model_options=model_options))
-            meta_model = cancellable_get(worker0.get_meta_model.remote())
-
-            for actor in gpu_actors:
-                if actor != worker0:
-                    loaded_futures.append(actor.set_meta_model.remote(meta_model))
-
-            cancellable_get(loaded_futures)
-            loaded_futures = []
-
-            for actor in gpu_actors:
-                loaded_futures.append(actor.set_state_dict.remote())
-
-            cancellable_get(loaded_futures)
-            loaded_futures = []
-        else:
-            # Parallel Loading Mode: All workers load simultaneously
-            # With lazy tensors, only mmap refs are cached at this stage
-            # Actual model instantiation is deferred to sampling time
-            print("[Raylight] Parallel UNet Load: Creating lazy wrappers on all workers...")
-            for actor in gpu_actors:
-                loaded_futures.append(
-                    actor.load_unet.remote(unet_path, model_options=model_options)
-                )
-            cancellable_get(loaded_futures)
-            loaded_futures = []
+        # Unified Parallel Loading: All workers load simultaneously
+        # For FSDP, Safetensors, and GGUF: uses ModelContext with zero-copy mmap
+        print(f"[Raylight] Parallel Load ({'FSDP' if parallel_dict['is_fsdp'] else 'Standard'}): Creating lazy wrappers...")
+        for actor in gpu_actors:
+            loaded_futures.append(
+                actor.load_unet.remote(unet_path, model_options=model_options)
+            )
+        cancellable_get(loaded_futures)
+        loaded_futures = []
 
         # Patching: Done SEQUENTIALLY to avoid RAM spikes
         # For safetensors with lazy wrappers, patching triggers model instantiation

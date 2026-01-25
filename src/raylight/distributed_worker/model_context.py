@@ -480,13 +480,34 @@ class FSDPContext(ModelContext):
     
     def instantiate_model(self, sd: Dict, state: ModelState):
         from raylight.comfy_dist.sd import fsdp_load_diffusion_model_stat_dict
+        from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
+        from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
         
+        # Apply One-Time FSDP Patches (like legacy _apply_fsdp_patches)
+        import comfy.model_patcher as model_patcher
+        import comfy.model_management as model_management
+        from raylight.comfy_dist.model_management import cleanup_models_gc
+        from raylight.comfy_dist.model_patcher import LowVramPatch
+        model_patcher.LowVramPatch = LowVramPatch
+        model_management.cleanup_models_gc = cleanup_models_gc
+
+        # JIT Loading: Wrap with LazySafetensor if not already (reusing logic from LazyTensors)
+        # This prevents the "huge RAM spike" by delaying materialization until key access
+        if self.use_mmap:
+            print(f"[FSDPContext] Wrapping state dict with LazySafetensors for JIT loading...")
+            sd = wrap_state_dict_lazy(sd)
+        
+        # Inject SafetensorOps to handle zero-copy assignment
+        # Unconditionally overwrite to ensure we use SafetensorLayer (like SafetensorsContext)
+        model_options = state.model_options.copy()
+        model_options["custom_operations"] = SafetensorOps
+
         model, state_dict = fsdp_load_diffusion_model_stat_dict(
             sd,
             self.worker.local_rank,
             self.worker.device_mesh,
             self.worker.is_cpu_offload,
-            model_options=state.model_options
+            model_options=model_options
         )
         
         if model is None:
