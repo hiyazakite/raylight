@@ -66,16 +66,18 @@ class SafetensorLayer(torch.nn.Module):
         if len(patches) > 0:
             # Move patches to GPU
             patch_list = []
+            last_key = None
             for p, key in patches:
                 patch_list += move_patch_to_device(p, device)
+                last_key = key
             
             # Apply patches on GPU
             # Using ray_calculate_weight (same as GGUF) for consistent LoRA math
-            weight = ray_calculate_weight(patch_list, weight, key)
+            weight = ray_calculate_weight(patch_list, weight, last_key)
             
         return weight
 
-    def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None):
+    def cast_bias_weight(self, input=None, dtype=None, device=None, bias_dtype=None):
         if input is not None:
             if dtype is None:
                 dtype = getattr(input, "dtype", torch.float32)
@@ -88,16 +90,16 @@ class SafetensorLayer(torch.nn.Module):
         non_blocking = comfy.model_management.device_supports_non_blocking(device)
         
         # Handle bias
-        if s.bias is not None:
+        if self.bias is not None:
             # Use get_weight to handle potential lazy + patches on bias (rare but possible)
-            bias = s.get_weight(s.bias, bias_dtype, device)
+            bias = self.get_weight(self.bias, bias_dtype, device)
             bias = comfy.ops.cast_to(
                 bias, bias_dtype, device, non_blocking=non_blocking, copy=False
             )
 
         # Handle weight - this triggers LazySafetensorTensor.to() which materializes
         # AND applies patches if present
-        weight = s.get_weight(s.weight, dtype, device)
+        weight = self.get_weight(self.weight, dtype, device)
         weight = comfy.ops.cast_to(
             weight, dtype, device, non_blocking=non_blocking, copy=False
         )

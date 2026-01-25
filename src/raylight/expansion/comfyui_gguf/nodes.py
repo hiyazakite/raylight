@@ -211,12 +211,14 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                                         new_patch = list(patch)
                                         new_patch[1] = new_v
                                         patch_list[i] = tuple(new_patch)
-                        elif isinstance(v[0], torch.Tensor) and v[0].device != self.offload_device:
-                            if v[0].numel() > 0:
-                                new_v = tuple(t.to(self.offload_device) if isinstance(t, torch.Tensor) and t.device != self.offload_device else t for t in v)
-                                new_patch = list(patch)
-                                new_patch[1] = new_v
-                                patch_list[i] = tuple(new_patch)
+                        elif isinstance(v[0], torch.Tensor):
+                             v0_tensor: Any = v[0]
+                             if v0_tensor.device != self.offload_device:
+                                 if v0_tensor.numel() > 0:
+                                     new_v = tuple(t.to(self.offload_device) if isinstance(t, torch.Tensor) and t.device != self.offload_device else t for t in v)
+                                     new_patch = list(patch)
+                                     new_patch[1] = new_v
+                                     patch_list[i] = tuple(new_patch)
 
         # Manually move non-GGUF weights (buffers etc) to target device
         if device_to is not None and unpatch_weights:
@@ -272,7 +274,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
 
 class RayGGUFLoader:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("unet_gguf"),),

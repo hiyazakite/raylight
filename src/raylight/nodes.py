@@ -126,7 +126,7 @@ _LOCAL_CLUSTER_ADDRESSES = {None, '', 'local', 'LOCAL'}
 
 class RayInitializer:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "ray_cluster_address": ("STRING", {"default": "local"}),
@@ -372,7 +372,7 @@ class RayInitializer:
 
 class RayInitializerAdvanced(RayInitializer):
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "ray_cluster_address": ("STRING", {
@@ -449,7 +449,7 @@ class RayInitializerAdvanced(RayInitializer):
 
 class RayUNETLoader:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models")
@@ -480,6 +480,7 @@ class RayUNETLoader:
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype):
         with monitor_memory("RayUNETLoader.load_ray_unet"):
             ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+            parallel_dict: Any = parallel_dict
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
@@ -518,7 +519,7 @@ class RayUNETLoader:
             loaded_futures = []
         else:
             # Parallel Loading Mode: All workers load simultaneously
-            # With LazySafetensorsModelPatcher, only mmap refs are cached at this stage
+            # With lazy tensors, only mmap refs are cached at this stage
             # Actual model instantiation is deferred to sampling time
             print("[Raylight] Parallel UNet Load: Creating lazy wrappers on all workers...")
             for actor in gpu_actors:
@@ -549,7 +550,7 @@ class RayUNETLoader:
 
 class XFuserKSamplerAdvanced:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "add_noise": (["enable", "disable"],),
@@ -652,13 +653,15 @@ class XFuserKSamplerAdvanced:
             for actor in gpu_actors
         ]
 
-        results = cancellable_get(futures)
+        results: Any = cancellable_get(futures)
+        if results is None:
+             raise RuntimeError("Raylight: Sampling failed or was cancelled.")
         return (results[0][0],)
 
 
 class DPKSamplerAdvanced:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "add_noise": (["enable", "disable"],),
@@ -728,8 +731,8 @@ class DPKSamplerAdvanced:
 
         gpu_actors = ray_actors["workers"]
 
-        parallel_dict = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
-        if parallel_dict["is_xdit"] is True:
+        parallel_dict: Any = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
+        if parallel_dict is not None and parallel_dict.get("is_xdit") is True:
             raise ValueError(
                 """
             Data Parallel KSampler only supports FSDP or standard Data Parallel (DP).
@@ -774,9 +777,23 @@ class DPKSamplerAdvanced:
             for i, actor in enumerate(gpu_actors)
         ]
 
-        results = cancellable_get(futures)
-        results = [result[0] for result in results]
-        return (results,)
+        results: Any = cancellable_get(futures)
+        if results is None:
+             raise RuntimeError("Raylight: Sampling failed or was cancelled.")
+        
+        if parallel_dict is not None and parallel_dict.get("is_xdit"):
+             return (results[0][0],)
+
+        # Standard mode: concat shards
+        out: Any = latent_image[0]
+        out = out.copy()
+        samples = []
+        for res in results:
+             if res is not None:
+                  samples.append(res[0]["samples"])
+        
+        out["samples"] = torch.cat(samples, dim=0)
+        return (out,)
 
 
 class Noise_RandomNoise:
@@ -826,7 +843,7 @@ class DPNoiseList:
 
 class RayVAEDecodeDistributed:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray Actor to submit the model into"}),
@@ -895,7 +912,7 @@ class RayVAEDecodeDistributed:
         spatial_compression = cancellable_get(gpu_actors[0].get_vae_spatial_compression.remote()) or 1
 
         # Causal VAE output formula: (Latent_T - 1) * compression + 1
-        if temporal_compression > 1:
+        if isinstance(temporal_compression, (int, float)) and temporal_compression > 1:
             total_output_frames = (total_frames - 1) * temporal_compression + 1
             overlap_latent_frames = 1 # 1 frame overlap is sufficient for continuity in causal VAE
         else:
@@ -999,7 +1016,10 @@ class RayVAEDecodeDistributed:
                     continue
                     
                 for ray_ref in ready:
-                    shard_index, result = cancellable_get(ray_ref)
+                    res_data: Any = cancellable_get(ray_ref)
+                    if res_data is None:
+                        continue
+                    shard_index, result = res_data
                     received_count += 1
                     
                     if isinstance(result, dict) and result.get("mmap", False):
@@ -1009,7 +1029,7 @@ class RayVAEDecodeDistributed:
                         print(f"[RayVAEDecode] Shard {shard_index} wrote {shape} to mmap. Stats: {stats}")
                     else:
                         # Fallback (Legacy / Failure fallback)
-                        shard_data = result
+                        shard_data: Any = result
                         print(f"[RayVAEDecode] Shard {shard_index} returned tensor {shard_data.shape} (Fallback path)")
                         
                         # Write to mmap manually
@@ -1025,7 +1045,10 @@ class RayVAEDecodeDistributed:
                             end_video_frame = start_video_frame + s_len
                         
                         if s_len > 0:
-                            full_image[start_video_frame:end_video_frame] = shard_data.to(torch.float32)
+                            # Use Any cast for results that linter misinterprets
+                            shard_data_any: Any = shard_data
+                            full_image_any: Any = full_image
+                            full_image_any[start_video_frame:end_video_frame] = shard_data_any.to(torch.float32)
 
                         del shard_data
 
@@ -1108,18 +1131,23 @@ class RayOffloadModel:
         
         gpu_actors = ray_actors["workers"]
         
-        # Offload from all workers SEQUENTIALLY to prevent OOM
-        print(f"[RayOffloadModel] Starting sequential offload for {len(gpu_actors)} workers...", flush=True)
+        # Offload from all workers IN PARALLEL
+        print(f"[RayOffloadModel] Starting PARALLEL offload for {len(gpu_actors)} workers...", flush=True)
+        
+        futures = []
         for i, actor in enumerate(gpu_actors):
-            try:
-                # Wait for each worker to finish before triggering the next
-                print(f"[RayOffloadModel] Offloading worker {i}...", flush=True)
-                ray.get(actor.offload_and_clear.remote())
-                # Free local memory handles immediately
-                gc.collect()
-                print(f"[RayOffloadModel] Worker {i} offloaded.", flush=True)
-            except Exception as e:
-                print(f"[RayOffloadModel] Error offloading worker {i}: {e}", flush=True)
+            print(f"[RayOffloadModel] Triggering offload for worker {i}...", flush=True)
+            futures.append(actor.offload_and_clear.remote())
+            
+        try:
+            # Wait for all to complete
+            cancellable_get(futures)
+            print("[RayOffloadModel] All workers offloaded.", flush=True)
+        except Exception as e:
+            print(f"[RayOffloadModel] Error during parallel offload: {e}", flush=True)
+            
+        # Free local memory handles immediately
+        gc.collect()
 
         print("[RayOffloadModel] ========== ALL WORKERS OFFLOADED ==========", flush=True)
         return (latent,)
@@ -1128,7 +1156,7 @@ class RayOffloadModel:
 
 class RayLoraLoaderModelOnly:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "ray_actors": ("RAY_ACTORS",),

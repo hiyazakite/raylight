@@ -1,11 +1,5 @@
 import os
 import sys
-import hashlib
-import pickle
-import ctypes
-import gc
-import torch
-import ray
 
 def evict_page_cache(path):
     """Tells the kernel to evict pages of the given file from the Page Cache."""
