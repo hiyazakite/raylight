@@ -264,7 +264,6 @@ class GGUFContext(ModelContext):
 
 
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
-from raylight.expansion.comfyui_lazytensors.model_patcher import LazySafetensorsModelPatcher
 
 
 # Check for optional fastsafetensors

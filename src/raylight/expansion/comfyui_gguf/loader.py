@@ -75,6 +75,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
 
     # filter and strip prefix
     has_prefix = False
+    prefix_len = 0
     if handle_prefix is not None:
         prefix_len = len(handle_prefix)
         tensor_names = set(tensor.name for tensor in reader.tensors)
@@ -318,7 +319,7 @@ def gguf_tokenizer_loader(path, temb_shape):
 
     if get_field(reader, "tokenizer.ggml.model", str) == "t5":
         if temb_shape == (256384, 4096): # probably UMT5
-            spm.trainer_spec.model_type == 1 # Unigram (do we have a T5 w/ BPE?)
+            spm.trainer_spec.model_type = 1 # Unigram (do we have a T5 w/ BPE?)
         else:
             raise NotImplementedError("Unknown model, can't set tokenizer!")
     else:
@@ -330,6 +331,10 @@ def gguf_tokenizer_loader(path, temb_shape):
     tokens = get_list_field(reader, "tokenizer.ggml.tokens", str)
     scores = get_list_field(reader, "tokenizer.ggml.scores", float)
     toktypes = get_list_field(reader, "tokenizer.ggml.token_type", int)
+
+    if tokens is None or scores is None or toktypes is None:
+        logging.warning("GGUF Tokenizer: Missing token data, skipping reconstruct.")
+        return torch.ByteTensor([])
 
     for idx, (token, score, toktype) in enumerate(zip(tokens, scores, toktypes)):
         # # These aren't present in the original?
@@ -377,6 +382,10 @@ def gguf_tekken_tokenizer_loader(path, temb_shape):
 
     tokens = get_list_field(reader, "tokenizer.ggml.tokens", str)
     toktypes = get_list_field(reader, "tokenizer.ggml.token_type", int)
+
+    if tokens is None or toktypes is None:
+        logging.warning("GGUF Tekken Tokenizer: Missing token data, skipping reconstruct.")
+        return torch.ByteTensor([])
 
     decoder = {v: k for k, v in bytes_to_unicode().items()}
     for idx, (token, toktype) in enumerate(zip(tokens, toktypes)):
