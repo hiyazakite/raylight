@@ -117,6 +117,22 @@ class LazySafetensor(torch.Tensor):
         
         Returns MaterializedTensor that keeps mmap ref for pointer-swap.
         """
+        # Optimization: Handle 'meta' device without reading data
+        device = None
+        if args and (isinstance(args[0], (str, torch.device))):
+            device = args[0]
+        elif "device" in kwargs:
+            device = kwargs["device"]
+            
+        if str(device) == "meta":
+            # Create empty meta tensor with same properties (Zero-Cost)
+            meta_tensor = torch.empty(self.shape, dtype=self.dtype, device="meta")
+            return MaterializedTensor(meta_tensor, self)
+            
+        # Optimization: Return self if already on target device
+        if device is not None and str(device) == str(self.device):
+            return self
+            
         # Use as_subclass to avoid cloning data on CPU (Zero-Copy)
         # This streams directly from mmap ref to GPU (via pinned memory or direct transfer)
         materialized_data = self.as_subclass(torch.Tensor).to(*args, **kwargs)
