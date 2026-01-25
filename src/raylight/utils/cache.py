@@ -29,6 +29,17 @@ class LRUStateCache:
             self._cache.move_to_end(key)  # Mark as recently used
             return self._cache[key]
         return None
+
+    def __getitem__(self, key: str) -> Dict[str, Any]:
+        """Dictionary-style get."""
+        val = self.get(key)
+        if val is None:
+            raise KeyError(key)
+        return val
+    
+    def __setitem__(self, key: str, value: Dict[str, Any]):
+        """Dictionary-style put."""
+        self.put(key, value)
     
     def put(self, key: str, value: Dict[str, Any]) -> Optional[str]:
         """Add or update state dict in cache.

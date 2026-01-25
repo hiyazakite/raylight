@@ -4,6 +4,7 @@ import torch
 import logging
 import collections
 import contextlib
+from typing import Any
 
 import ray
 
@@ -210,9 +211,9 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                                         new_patch = list(patch)
                                         new_patch[1] = new_v
                                         patch_list[i] = tuple(new_patch)
-                        elif torch.is_tensor(v[0]) and v[0].device != self.offload_device:
+                        elif isinstance(v[0], torch.Tensor) and v[0].device != self.offload_device:
                             if v[0].numel() > 0:
-                                new_v = tuple(t.to(self.offload_device) if torch.is_tensor(t) and t.device != self.offload_device else t for t in v)
+                                new_v = tuple(t.to(self.offload_device) if isinstance(t, torch.Tensor) and t.device != self.offload_device else t for t in v)
                                 new_patch = list(patch)
                                 new_patch[1] = new_v
                                 patch_list[i] = tuple(new_patch)
@@ -304,21 +305,21 @@ class RayGGUFLoader:
         patch_dtype,
     ):
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
-
+        parallel_dict: Any = parallel_dict
+        
+        model_options = {
+            "dequant_dtype": dequant_dtype,
+            "patch_dtype": patch_dtype
+        }
+        
         unet_path = folder_paths.get_full_path_or_raise("unet", unet_name)
 
         loaded_futures = []
         patched_futures = []
 
-        if parallel_dict["is_fsdp"] is True:
+        if parallel_dict.get("is_fsdp"):
             worker0 = ray.get_actor("RayWorker:0")
-            ray.get(
-                worker0.load_gguf_unet.remote(
-                    unet_path,
-                    dequant_dtype=dequant_dtype,
-                    patch_dtype=patch_dtype,
-                )
-            )
+            ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
             meta_model = ray.get(worker0.get_meta_model.remote())
 
             for actor in gpu_actors:
@@ -346,10 +347,9 @@ class RayGGUFLoader:
                 load_futures = []
                 for actor in gpu_actors:
                     load_futures.append(
-                        actor.load_gguf_unet.remote(
+                        actor.load_unet.remote(
                             unet_path,
-                            dequant_dtype=dequant_dtype,
-                            patch_dtype=patch_dtype,
+                            model_options=model_options,
                         )
                     )
                 ray.get(load_futures)
@@ -361,10 +361,9 @@ class RayGGUFLoader:
                 worker0 = ray.get_actor("RayWorker:0")
                 print("[Raylight] Starting Leader GGUF Load on Worker 0...")
                 ray.get(
-                    worker0.load_gguf_unet.remote(
+                    worker0.load_unet.remote(
                         unet_path,
-                        dequant_dtype=dequant_dtype,
-                        patch_dtype=patch_dtype,
+                        model_options=model_options,
                     )
                 )
 
@@ -394,11 +393,8 @@ class RayGGUFLoader:
                 ray.get(loaded_futures)
                 loaded_futures = []
 
-
-
-
         for actor in gpu_actors:
-            if parallel_dict["is_xdit"]:
+            if parallel_dict.get("is_xdit"):
                 patched_futures.append(actor.patch_usp.remote())
 
         ray.get(patched_futures)

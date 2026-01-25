@@ -90,9 +90,14 @@ class LoraManager:
 
     def reapply_loras_for_config(self, config_hash):
         """Re-apply all LoRAs for a specific config_hash after model reload."""
-        # Nothing to do if no config stored
-        if config_hash not in self._lora_configs:
-            print(f"[RayWorker {self.worker.local_rank}] No LoRAs registered for config {config_hash}. Skipping re-apply.")
+        # BRANCH ISOLATION: If config_hash is None or not registered, and we HAVE an active config,
+        # it means the user likely bypassed LoRA nodes. We must RESET to clean the model.
+        if config_hash is None or config_hash not in self._lora_configs:
+            if self._current_lora_config_hash is not None:
+                print(f"[RayWorker {self.worker.local_rank}] No LoRAs for hash {config_hash}. Resetting current config '{self._current_lora_config_hash}'...")
+                self.reset_loras()
+            else:
+                print(f"[RayWorker {self.worker.local_rank}] No LoRAs registered and none active. Skipping.")
             return True
         
         # Check if we already have the right config applied
