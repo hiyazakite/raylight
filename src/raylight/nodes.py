@@ -626,12 +626,11 @@ class XFuserKSamplerAdvanced:
 
         gpu_actors = ray_actors["workers"]
 
-        # Re-apply LoRAs for this branch's config_hash if needed
+        # Re-apply LoRAs for this branch's config_hash if needed (Always call to handle None/reset)
         lora_config_hash = ray_actors.get("lora_config_hash")
-        if lora_config_hash is not None:
-            print(f"[XFuserKSamplerAdvanced] Ensuring LoRAs for config_hash={lora_config_hash}...")
-            lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
-            cancellable_get(lora_futures)
+        print(f"[XFuserKSamplerAdvanced] Syncing LoRA state (config_hash={lora_config_hash})...")
+        lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
+        cancellable_get(lora_futures)
 
         futures = [
             actor.common_ksampler.remote(
@@ -750,12 +749,11 @@ class DPKSamplerAdvanced:
         if add_noise == "disable":
             disable_noise = True
 
-        # Re-apply LoRAs for this branch's config_hash if needed
+        # Re-apply LoRAs for this branch's config_hash if needed (Always call to handle None/reset)
         lora_config_hash = ray_actors.get("lora_config_hash")
-        if lora_config_hash is not None:
-            print(f"[DPKSamplerAdvanced] Ensuring LoRAs for config_hash={lora_config_hash}...")
-            lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
-            cancellable_get(lora_futures)
+        print(f"[DPKSamplerAdvanced] Syncing LoRA state (config_hash={lora_config_hash})...")
+        lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
+        cancellable_get(lora_futures)
 
         futures = [
             actor.common_ksampler.remote(

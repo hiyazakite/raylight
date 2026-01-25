@@ -57,19 +57,40 @@ class ModelContext(ABC):
         pass
     
     @abstractmethod
-    def instantiate_model(self, sd: Dict[str, torch.Tensor], state: ModelState):
+    def instantiate_model(self, sd: Dict[str, torch.Tensor], state: ModelState) -> Any:
         """Create ModelPatcher from state dict."""
-        pass
-    
-    @abstractmethod
-    def offload(self):
-        """Format-specific offload logic."""
         pass
     
     @abstractmethod
     def hot_load(self, device: torch.device):
         """Fast VRAM transfer for soft-reloaded models."""
         pass
+    
+    def offload(self):
+        """Standard offload: Move weights to CPU and release tracking."""
+        print(f"[{self.__class__.__name__}] Standard Offload: Releasing VRAM...")
+        
+        # Share the common offload cleanup logic
+        self.worker._common_offload_cleanup()
+        
+        # Clear model and tracking
+        self.worker.model = None
+        self.worker.current_unet_path = None
+        self.worker.current_sd_ref = None
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    def prepare_state_dict(self, sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Optional pre-processing of state dict before instantiation.
+        
+        Args:
+            sd: Original state dict
+            
+        Returns:
+            Processed state dict
+        """
+        return sd
     
     # ─── Shared Logic ────────────────────────────────────────
     
@@ -92,6 +113,9 @@ class ModelContext(ABC):
                 sd = self.load_state_dict_standard(state)
         
         # 3. Instantiate model
+        if sd is None:
+            raise RuntimeError(f"Failed to load state dict for {state.unet_path}")
+            
         self.worker.model = self.instantiate_model(sd, state)
         self._post_load(state, sd)
     
@@ -117,16 +141,15 @@ class ModelContext(ABC):
     def _post_load(self, state: ModelState, sd: Dict):
         """Common post-load setup for all formats."""
         self.worker.reload_params = state.to_dict()
-        self.worker.model.unet_path = state.unet_path
-        
-        if self.use_mmap:
-            self.worker.model.mmap_cache = sd
+        if self.worker.model is not None:
+            self.worker.model.unet_path = state.unet_path
+            
+            if self.use_mmap:
+                self.worker.model.mmap_cache = sd
         
         # Clear LoRA tracking for fresh re-application
-        if hasattr(self.worker, "_applied_loras"):
-            self.worker._applied_loras.clear()
-        if hasattr(self.worker, "_current_lora_config_hash"):
-            self.worker._current_lora_config_hash = None
+        if hasattr(self.worker, "lora_manager"):
+            self.worker.lora_manager.clear_tracking()
 
 
 class GGUFContext(ModelContext):
@@ -136,6 +159,18 @@ class GGUFContext(ModelContext):
         from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader
         sd, extra = gguf_sd_loader(state.unet_path)
         self.worker.gguf_metadata = extra.get("metadata", {})
+        return sd
+    
+    def prepare_state_dict(self, sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """GGUF: Strip prefixes and prepare for detection."""
+        keys = list(sd.keys())
+        
+        # The auto-detection (unet_prefix_from_state_dict) failed in previous runs (detected 'model.'), so we force 'diffusion_model.'
+        if any(k.startswith("diffusion_model.") for k in keys[:5]):
+             print(f"[GGUFContext {self.worker.local_rank}] Detected 'diffusion_model.' prefix. Force-stripping for detection...")
+             import comfy.utils
+             sd = comfy.utils.state_dict_prefix_replace(sd, {"diffusion_model.": ""}, filter_keys=True)
+        
         return sd
     
     def load_state_dict_standard(self, state: ModelState) -> Dict:
@@ -153,15 +188,15 @@ class GGUFContext(ModelContext):
         # Apply dequant/patch dtypes
         if state.dequant_dtype and state.dequant_dtype not in ("default", None):
             if state.dequant_dtype == "target":
-                ops.Linear.dequant_dtype = state.dequant_dtype
+                setattr(ops.Linear, "dequant_dtype", state.dequant_dtype)
             else:
-                ops.Linear.dequant_dtype = getattr(torch, state.dequant_dtype)
+                setattr(ops.Linear, "dequant_dtype", getattr(torch, state.dequant_dtype))
         
         if state.patch_dtype and state.patch_dtype not in ("default", None):
             if state.patch_dtype == "target":
-                ops.Linear.patch_dtype = state.patch_dtype
+                setattr(ops.Linear, "patch_dtype", state.patch_dtype)
             else:
-                ops.Linear.patch_dtype = getattr(torch, state.patch_dtype)
+                setattr(ops.Linear, "patch_dtype", getattr(torch, state.patch_dtype))
         
         # CRITICAL: Use shallow dict copy, NOT deep tensor clone!
         # sd.copy() copies dict keys/values but keeps tensor data shared (mmap refs intact)
@@ -188,20 +223,44 @@ class GGUFContext(ModelContext):
         return model
     
     def offload(self):
-        self.worker._clear_lora_gpu_refs()
-        self.worker.model.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
-        self.worker.model.current_device = torch.device('cpu')
+        """GGUF Soft-Offload: Restore mmap pointers to clear VRAM without copies."""
+        if self.worker.model is not None:
+            print(f"[GGUFContext {self.worker.local_rank}] GGUF Soft-Offload: Performing Zero-Copy Pointer Swap...")
+            
+            # 1. Clear LoRA GPU refs via manager
+            self.worker.lora_manager.clear_gpu_refs()
+            
+            # 2. Restore mmap pointers
+            self.worker.model.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
+            self.worker.model.current_device = torch.device('cpu')
+            
+            # 3. Store in worker-level mmap cache to survive model swaps
+            mmap_cache = getattr(self.worker.model, "mmap_cache", None)
+            if mmap_cache:
+                unet_path = getattr(self.worker.model, "unet_path", None)
+                if unet_path:
+                    self.worker.worker_mmap_cache[unet_path] = mmap_cache
+            
+            # 4. Shared cleanup
+            self.worker._common_offload_cleanup()
+            print(f"[GGUFContext {self.worker.local_rank}] GGUF Soft-Offload Complete.")
+        else:
+            self.worker.is_model_loaded = False
     
     def hot_load(self, device: torch.device):
+        if self.worker.model is None:
+            return
+
         # Re-hydrate mmap_cache from worker cache if needed
-        if (not hasattr(self.worker.model, "mmap_cache") or not self.worker.model.mmap_cache):
+        if not getattr(self.worker.model, "mmap_cache", None):
             unet_path = getattr(self.worker.model, "unet_path", None)
             if unet_path and unet_path in self.worker.state_cache:
                 print(f"[GGUFContext] Re-hydrating mmap_cache from LRU cache...")
                 self.worker.model.mmap_cache = self.worker.state_cache.get(unet_path)
         
-        self.worker.model.load(device, force_patch_weights=True)
-        self.worker.model.current_device = device
+        if hasattr(self.worker.model, "load"):
+            self.worker.model.load(device, force_patch_weights=True)
+            self.worker.model.current_device = device
 
 
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
@@ -266,38 +325,28 @@ class SafetensorsContext(ModelContext):
         return comfy.utils.load_torch_file(state.unet_path)
     
     def instantiate_model(self, sd: Dict, state: ModelState):
-        """Instantiate model with lazy tensor wrappers (like GGUF).
-        
-        Uses LazySafetensor to wrap mmap'd tensors. These wrappers
-        defer the clone until .to(device) is called, avoiding RAM spikes.
-        """
+        """Instantiate model with lazy state dict (zero-copy until load)."""
         import comfy.sd
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
         from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
         
-        print(f"[SafetensorsContext] Wrapping tensors with LazySafetensor...")
-        
-        # Wrap all mmap'd tensors with lazy wrappers
+        print(f"[SafetensorsContext] Wrapping state dict with LazySafetensors...")
         lazy_sd = wrap_state_dict_lazy(sd)
         
-        # Extract cast dtype if present
         load_options = state.model_options.copy()
         cast_dtype = load_options.pop("dtype", None)
-        
-        # Use Custom Ops to prevent parameter copying
         load_options["custom_operations"] = SafetensorOps
         
-        # Model construction uses lazy tensors & zero-copy ops - no cloning happens yet!
         model = comfy.sd.load_diffusion_model_state_dict(lazy_sd, model_options=load_options)
         
         if model is None:
             raise RuntimeError(f"Could not load model: {state.unet_path}")
         
-        # Apply cast dtype for execution
         if cast_dtype and hasattr(model, "model"):
             model.model.manual_cast_dtype = cast_dtype
-        
-        print(f"[SafetensorsContext] Model created with lazy tensors & ops (RAM should be low)")
+            
+        # Store mmap cache on the patcher for offload pointer-swapping
+        model.mmap_cache = sd
         return model
     
     def instantiate_model_with_fallback(self, sd: Dict, state: ModelState):
@@ -341,7 +390,7 @@ class SafetensorsContext(ModelContext):
         if not mmap_cache or not self._streaming_enabled:
             # Fallback: standard model.to()
             print(f"[SafetensorsContext] Using standard .to({device})...")
-            if hasattr(self.worker.model, "model"):
+            if self.worker.model is not None and hasattr(self.worker.model, "model"):
                 self.worker.model.model.to(device)
             return False
         
@@ -349,14 +398,14 @@ class SafetensorsContext(ModelContext):
             print(f"[SafetensorsContext] Streaming to {device} per-tensor...")
             wrapper = SafetensorMmapWrapper(mmap_cache)
             
-            if hasattr(self.worker.model, "model"):
+            if self.worker.model is not None and hasattr(self.worker.model, "model"):
                 transferred = wrapper.stream_to_model(self.worker.model.model, device)
                 print(f"[SafetensorsContext] Streamed {transferred} parameters to {device}")
             
             return True
         except Exception as e:
             print(f"[SafetensorsContext] Streaming transfer failed: {e}, falling back...")
-            if hasattr(self.worker.model, "model"):
+            if self.worker.model is not None and hasattr(self.worker.model, "model"):
                 self.worker.model.model.to(device)
             return False
     
@@ -364,19 +413,41 @@ class SafetensorsContext(ModelContext):
         """Pointer-swap offload: swap GPU tensors back to mmap refs (like GGUF)."""
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import swap_model_to_mmap
         
-        if self.worker.model is not None and hasattr(self.worker.model, 'model'):
-            print("[SafetensorsContext] Pointer-swap offload: Unpatching and swapping GPU tensors to mmap refs...")
+        if self.worker.model is not None:
+            print(f"[SafetensorsContext {self.worker.local_rank}] Safetensors Soft-Offload: Performing Pointer Swap...")
             
-            # CRITICAL: Unpatch first! 
-            # If LoRAs are applied, params are plain Tensors (on GPU).
-            # We must restore original MaterializedTensors (from backup) so they can be swapped.
-            if hasattr(self.worker.model, "unpatch_model"):
-                self.worker.model.unpatch_model(device_to=None, unpatch_weights=True)
+            # 1. Clear LoRA GPU refs via manager
+            self.worker.lora_manager.clear_gpu_refs()
             
-            mmap_cache = getattr(self.worker.model, "mmap_cache", None)
-            swap_model_to_mmap(self.worker.model.model, mmap_cache)
+            # 2. Extract model
+            model = self.worker.model
             
-            self.worker.model.current_device = torch.device('cpu')
+            # 3. Unpatch first!
+            if hasattr(model, "unpatch_model"):
+                model.unpatch_model(device_to=None, unpatch_weights=True)
+            
+            # 4. Swap GPU tensors to mmap refs
+            mmap_cache = getattr(model, "mmap_cache", None)
+            diffusion_model = getattr(model, "model", None)
+            if diffusion_model is not None and mmap_cache:
+                swap_model_to_mmap(diffusion_model, mmap_cache)
+                
+                # Store in worker-level mmap cache to survive model swaps
+                unet_path = getattr(model, "unet_path", None)
+                if unet_path:
+                    self.worker.worker_mmap_cache[unet_path] = mmap_cache
+            
+            model.current_device = torch.device('cpu')
+            
+            # 5. Shared cleanup
+            self.worker._common_offload_cleanup()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            print(f"[SafetensorsContext {self.worker.local_rank}] Safetensors Soft-Offload Complete.")
+        else:
+            self.worker.is_model_loaded = False
     
     def hot_load(self, device: torch.device):
         """Hot reload: re-materialize from mmap refs to GPU (like GGUF)."""
@@ -390,7 +461,7 @@ class SafetensorsContext(ModelContext):
             # Fallback: full reload from cache
             state = ModelState(**self.worker.reload_params)
             self.load(state)
-            if hasattr(self.worker.model, 'load'):
+            if self.worker.model is not None and hasattr(self.worker.model, 'load'):
                 self.worker.model.load(device)
 
 

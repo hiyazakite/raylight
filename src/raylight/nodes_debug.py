@@ -4,9 +4,8 @@ import folder_paths
 
 import ray
 import torch
+from typing import Any
 
-# Must manually insert comfy package or ray cannot import raylight to cluster
-from comfy import sd, sample, utils
 from .distributed_worker.ray_worker import (
     make_ray_actor_fn,
     ensure_fresh_actors,
@@ -167,6 +166,7 @@ class RayNF4Loader:
         unet_name,
     ):
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+        parallel_dict: Any = parallel_dict
 
         unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
