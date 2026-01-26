@@ -48,3 +48,28 @@ def inspect_tensor(t):
         print("====================")
     else:
         print("Regular Tensor:", t.shape, t.device)
+
+
+def align_model_to_cuda(model):
+    """
+    Align stragglers (params/buffers not wrapped by FSDP) to CUDA
+    to avoid "Multiple devices found" error in set_model_state_dict.
+    
+    This iterateively moves tensors to CUDA one-by-one to avoid VRAM spikes
+    that occur when calling model.to("cuda") on lazy tensors.
+    """
+    import torch
+    from torch.distributed.fsdp import FlatParameter
+
+    if not torch.cuda.is_available():
+        return
+
+    # Move non-sharded parameters
+    for p in model.parameters():
+        if not isinstance(p, FlatParameter) and p.device.type != 'cuda':
+            p.data = p.to("cuda")
+
+    # Move all buffers
+    for b in model.buffers():
+        if b.device.type != 'cuda':
+            b.data = b.to("cuda")
