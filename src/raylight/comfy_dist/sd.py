@@ -144,20 +144,18 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         device_mesh=device_mesh,
         is_cpu_offload=is_cpu_offload,
     )
+    
+    # Force all model modules to CPU/meta.
+    # This prevents "Multiple devices found" error in FSDP set_model_state_dict
+    # when mixing LazySafetensors (CPU) with buffers initialized on CUDA.
+    model_patcher.model.to("cpu")
+
     state_dict = model_patcher.model_state_dict()
     
-    # Fix: Detach model_sampling before moving to meta to preserve data on CPU
-    sampling_obj = getattr(model_patcher.model, "model_sampling", None)
-    if sampling_obj is not None:
-        model_patcher.model.model_sampling = None
-        if isinstance(model_patcher.model, torch.nn.Module) and "model_sampling" in model_patcher.model._modules:
-            del model_patcher.model._modules["model_sampling"]
-
-    model_patcher.model.to("meta")
-
-    # Restore model_sampling (still on CPU/Load Device)
-    if sampling_obj is not None:
-        model_patcher.model.model_sampling = sampling_obj
+    # Note: We do NOT move to "meta" here.
+    # LazySafetensor ensures parameters are memory-efficient (mmap backed).
+    # Moving to meta causes type conflicts with FSDP wrapping and LazySafetensor subclasses.
+    pass
 
     return model_patcher, state_dict
 

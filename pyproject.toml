@@ -69,10 +69,19 @@ allow_untyped_defs = true
 disable_error_code = "attr-defined"
 
 [tool.ruff]
-# extend-exclude = ["static", "ci/templates"]
 line-length = 140
-src = ["src", "tests"]
-target-version = "py39"
+select = ["E", "F"]
+ignore = [
+  # Whitespace / indentation – let Black handle this
+  "E101", "E111", "E114", "E117",
+  "E201", "E202", "E203", "E211",
+  "E221", "E222", "E225", "E231",
+  "E241", "E251", "E261", "E262",
+  "E265", "E266", "E271", "E272",
+  "E273", "E274", "E275",
+  "E301", "E302", "E303",
+  "W191", "W293",
+]
 
 # Add rules to ban exec/eval
 [tool.ruff.lint]

@@ -286,16 +286,34 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
         self.object_patches_backup.clear()
 
-    def __del__(self):
+    def release_memory(self):
+        """Explicitly free distributed tensor storage."""
         self.detach(unpatch_all=False)
         for m in self.model.modules():
             for p in m.parameters(recurse=False):
                 if isinstance(p, DTensor):
-                    local = p.to_local()
-                    _free_storage(local.data)
+                    try:
+                        local = p.to_local()
+                        _free_storage(local.data)
+                    except Exception:
+                        pass
                 elif isinstance(p, torch.Tensor):
-                    _free_storage(p.data)
+                    try:
+                        _free_storage(p.data)
+                    except Exception:
+                        pass
+        
+        # Additional cleanup for FSDP
+        if isinstance(self.model, FSDPModule):
+            # Try to force FSDP internal cleanup if possible
+            pass
 
+    def __del__(self):
+        try:
+            self.release_memory()
+        except:
+            pass
+            
         del self.model
         self.model = None
         comfy.model_management.soft_empty_cache()

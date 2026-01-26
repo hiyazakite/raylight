@@ -6,7 +6,6 @@ import torch
 import torch.distributed as dist
 import ray
 
-import comfy
 import comfy.patcher_extension as pe
 
 import raylight.distributed_modules.attention as xfuser_attn
@@ -16,12 +15,11 @@ from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 
 
 from raylight.utils.common import patch_ray_tqdm, cleanup_memory
-from raylight.utils.gguf import evict_page_cache, check_mmap_leak
+from raylight.utils.gguf import check_mmap_leak
 from raylight.utils.memory import monitor_memory
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from raylight.comfy_dist.utils import cancellable_get
 from ray.exceptions import RayActorError
-import inspect
 
 from raylight.distributed_worker.managers.lora_manager import LoraManager
 from raylight.distributed_worker.managers.vae_manager import VaeManager
@@ -507,7 +505,7 @@ class RayWorker:
         cleanup_memory()
 
     def reload_model_if_needed(self, load_device=None):
-        from raylight.distributed_worker.model_context import get_context, ModelState
+        from raylight.distributed_worker.model_context import get_context
         target_device = load_device if load_device is not None else self.device
         if self.model is not None:
             curr = getattr(self.model, "current_device", None)
