@@ -6,7 +6,6 @@ wrappers to replace module parameters without triggering materialization/copy.
 """
 import torch
 import comfy.ops
-import comfy.lora
 import comfy.model_management
 from .lazy_tensor import LazySafetensor
 from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
@@ -25,7 +24,6 @@ class SafetensorLayer(torch.nn.Module):
     
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         weight_key = f"{prefix}weight"
-        bias_key = f"{prefix}bias"
         weight = state_dict.get(weight_key)
         
         # CRITICAL: If weight is a lazy tensor, assign it directly!

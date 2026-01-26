@@ -26,12 +26,21 @@ class SamplerManager:
         latent_image = comfy.sample.fix_empty_latent_channels(work_model, latent_image)
 
         if self.worker.parallel_dict["is_fsdp"] is True:
+            # Propagate state_dict to patcher if not present (crucial for lazy/parallel path)
+            if getattr(work_model, "fsdp_state_dict", None) is None:
+                if hasattr(self.worker, "state_dict") and self.worker.state_dict is not None:
+                     print(f"[RayWorker {self.worker.local_rank}] Injecting saved FSDP state dict into model patcher...")
+                     work_model.set_fsdp_state_dict(self.worker.state_dict)
+
+            # NOTE: Logic to force model to CPU before FSDP was removed here (Legacy)
+            # We now handle device placement explicitly in the FSDP shard/load functions.
+            
             work_model.patch_fsdp()
             # FSDP cleanup
-            if hasattr(self.worker, "state_dict") and self.worker.state_dict is not None:
-                del self.worker.state_dict
-                self.worker.state_dict = None
-                cleanup_memory()
+            # if hasattr(self.worker, "state_dict") and self.worker.state_dict is not None:
+            #     del self.worker.state_dict
+            #     self.worker.state_dict = None
+            #     cleanup_memory()
 
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if self.worker.local_rank == 0:

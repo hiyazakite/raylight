@@ -7,7 +7,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, Optional, TYPE_CHECKING
 import os
-import logging
 
 import torch
 
@@ -255,7 +254,7 @@ class GGUFContext(ModelContext):
         if not getattr(self.worker.model, "mmap_cache", None):
             unet_path = getattr(self.worker.model, "unet_path", None)
             if unet_path and unet_path in self.worker.state_cache:
-                print(f"[GGUFContext] Re-hydrating mmap_cache from LRU cache...")
+                print("[GGUFContext] Re-hydrating mmap_cache from LRU cache...")
                 self.worker.model.mmap_cache = self.worker.state_cache.get(unet_path)
         
         if hasattr(self.worker.model, "load"):
@@ -268,7 +267,7 @@ from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
 
 # Check for optional fastsafetensors
 try:
-    import fastsafetensors
+    import fastsafetensors  # noqa: F401
     HAS_FASTSAFETENSORS = True
 except ImportError:
     HAS_FASTSAFETENSORS = False
@@ -292,7 +291,7 @@ class SafetensorsContext(ModelContext):
     def load_state_dict_mmap(self, state: ModelState) -> Dict:
         if self.use_fastsafe:
             try:
-                print(f"[SafetensorsContext] Using fastsafetensors (GDS if available)...")
+                print("[SafetensorsContext] Using fastsafetensors (GDS if available)...")
                 from fastsafetensors import SafeTensorsFileLoader, SingleGroup
                 
                 # Use SingleGroup for single-device usage (no ProcessGroup needed)
@@ -329,7 +328,7 @@ class SafetensorsContext(ModelContext):
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
         from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
         
-        print(f"[SafetensorsContext] Wrapping state dict with LazySafetensors...")
+        print("[SafetensorsContext] Wrapping state dict with LazySafetensors...")
         lazy_sd = wrap_state_dict_lazy(sd)
         
         load_options = state.model_options.copy()
@@ -356,11 +355,11 @@ class SafetensorsContext(ModelContext):
             if self._streaming_enabled:
                 # Streaming: shallow copy + deferred GPU transfer
                 model = self.instantiate_model(sd, state)
-                print(f"[SafetensorsContext] Streaming instantiation successful")
+                print("[SafetensorsContext] Streaming instantiation successful")
                 return model
         except Exception as e:
             print(f"[SafetensorsContext] Streaming failed: {e}")
-            print(f"[SafetensorsContext] Falling back to full clone...")
+            print("[SafetensorsContext] Falling back to full clone...")
             self._streaming_enabled = False  # Disable for future loads
         
         # Fallback: full clone (safe but higher RAM)
@@ -494,7 +493,7 @@ class FSDPContext(ModelContext):
         # JIT Loading: Wrap with LazySafetensor if not already (reusing logic from LazyTensors)
         # This prevents the "huge RAM spike" by delaying materialization until key access
         if self.use_mmap:
-            print(f"[FSDPContext] Wrapping state dict with LazySafetensors for JIT loading...")
+            print("[FSDPContext] Wrapping state dict with LazySafetensors for JIT loading...")
             sd = wrap_state_dict_lazy(sd)
         
         # Inject SafetensorOps to handle zero-copy assignment
@@ -517,12 +516,37 @@ class FSDPContext(ModelContext):
         return model
     
     def offload(self):
-        # FSDP offload: release both model and state dict
+        """
+        FSDP offload: release both model and state dict
+        FSDP requires full reload currently due to its nature (sharding)
+        TODO: Investigate hot loading for FSDP - we could flush the shards, remap the mmap cache, and reload the state dict but this is a lot of work
+        """
+        print(f"[FSDPContext {self.worker.local_rank}] FSDP Hard-Offload: Releasing all resources...")
+        
+        # 0. Clear GPU refs (weight_functions, patches) that might hold cyclic refs
+        self.worker.lora_manager.clear_gpu_refs()
+        
+        if self.worker.model is not None:
+            # Explicitly release DTensor/FSDP storage
+            if hasattr(self.worker.model, "release_memory"):
+                self.worker.model.release_memory()
+
+        # 2. Trigger shared cleanup (clears LoRA tracking, moves buffers to CPU, deleted cached attributes)
+        self.worker._common_offload_cleanup()
+        
+        # 3. Destroy references to allow GC
         self.worker.model = None
         self.worker.state_dict = None
+        
+        # 4. Final VRAM flush
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     def hot_load(self, device: torch.device):
-        # FSDP requires full reload
+        """
+        FSDP requires full reload currently due to its nature (sharding)
+        TODO: See offload for TODO
+        """
         state = ModelState(**self.worker.reload_params)
         self.load(state)
 

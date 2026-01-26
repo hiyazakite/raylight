@@ -1,5 +1,5 @@
 import torch
-from typing import Dict, Optional, Any
+from typing import Dict, Optional
 
 class SafetensorMmapWrapper:
     """Wraps mmap'd safetensor state dict for streaming GPU transfer.

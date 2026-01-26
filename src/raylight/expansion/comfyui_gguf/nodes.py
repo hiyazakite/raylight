@@ -1,23 +1,19 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
-import os
 import torch
 import logging
 import collections
-import contextlib
 from typing import Any
 
 import ray
 
-import comfy.sd
-import comfy.lora
 import comfy.float
 import comfy.utils
 import comfy.model_patcher
 import comfy.model_management
 import folder_paths
 
-from .ops import move_patch_to_device, GGMLTensor
-from .dequant import is_quantized, is_torch_compatible
+from .ops import move_patch_to_device
+from .dequant import is_quantized
 
 from raylight.distributed_worker.ray_worker import ensure_fresh_actors
 from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
@@ -187,7 +183,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 
             from raylight.utils.common import cleanup_memory
             cleanup_memory()
-            print(f"[GGUFModelPatcher] Offload Complete.")
+            print("[GGUFModelPatcher] Offload Complete.")
 
         # Move patches themselves back to offload device if they were on GPU
         for key, patch_list in self.patches.items():
@@ -241,7 +237,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             from .loader import gguf_sd_loader
             sd, _ = gguf_sd_loader(u_path)
             self.mmap_cache = sd
-            print(f"[GGUFModelPatcher] Re-hydration complete.")
+            print("[GGUFModelPatcher] Re-hydration complete.")
 
         super().load(*args, force_patch_weights=True, **kwargs)
 

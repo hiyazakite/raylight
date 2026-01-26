@@ -1,4 +1,5 @@
 from torch.distributed.fsdp import FSDPModule
+import torch
 from comfy import model_base
 
 from ..diffusion_models.wan.fsdp import shard_model_fsdp2 as wan_shard
@@ -85,7 +86,7 @@ if hasattr(model_base, "HunyuanVideo"):
 if hasattr(model_base, "Lumina2"):
     @FSDPShardRegistry.register(model_base.Lumina2)
     def _wrap_lumina(model, sd, cpu_offload):
-        return lumina_shard(model, sd, True)
+        return lumina_shard(model, sd, cpu_offload)
 
 
 def patch_fsdp(self):
@@ -96,6 +97,8 @@ def patch_fsdp(self):
         return self.model
 
     try:
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         self.model = FSDPShardRegistry.wrap(
             self.model,
             fsdp_state_dict=self.fsdp_state_dict,
