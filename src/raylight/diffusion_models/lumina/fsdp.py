@@ -1,5 +1,4 @@
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-from raylight.distributed_modules.utils import detect_dtype_mismatch
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffload
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 
 
@@ -10,18 +9,11 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
         if not name.startswith("layers."):
             ignored_params.add(param)
 
-    ref_dtype = diffusion_model.layers[0].attention.qkv.weight.dtype
-    
-    from torch.distributed.fsdp import CPUOffload
-    
     for i, layer in enumerate(diffusion_model.layers):
-        # This is for scaled model
-        ignored_block_params = detect_dtype_mismatch(layer, ref_dtype)
         diffusion_model.layers[i] = fully_shard(
             module=layer,
             mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
-            ignored_params=ignored_block_params,
             offload_policy=CPUOffload(offload_params=enable_cpu_offload)
         )
 
@@ -32,6 +24,17 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     import torch.distributed as dist
     if dist.is_initialized():
         dist.barrier()
+
+    # Align stragglers (params/buffers not wrapped by FSDP) to CUDA
+    if not enable_cpu_offload:
+        import torch
+        if torch.cuda.is_available():
+            for p in model.parameters():
+                if not isinstance(p, torch.distributed.fsdp.FlatParameter) and p.device.type != 'cuda':
+                    p.data = p.to("cuda")
+            for b in model.buffers():
+                 if b.device.type != 'cuda':
+                    b.data = b.to("cuda")
 
     if model_state_dict is not None:
         set_model_state_dict(
