@@ -26,20 +26,6 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
                 offload_policy=CPUOffload(offload_params=enable_cpu_offload))
     model.diffusion_model = diffusion_model
 
-    # CRITICAL: Ensure entire model is on CUDA if offloading is disabled
-    # This prevents "Multiple devices found" errors for unwrapped parameters/buffers
-    if not enable_cpu_offload:
-        import torch
-        if torch.cuda.is_available():
-            model.to("cuda")
-            # Force stragglers
-            for p in model.parameters():
-                if p.device.type != 'cuda':
-                    p.data = p.to("cuda")
-            for b in model.buffers():
-                 if b.device.type != 'cuda':
-                    b.data = b.to("cuda")
-
     # CPU OFFLOAD ONLY FOR LOW END OF THE LOWEND
     set_model_state_dict(
         model=model,

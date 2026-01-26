@@ -28,31 +28,6 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     fully_shard(diffusion_model, ignored_params=ignored_params, reshard_after_forward=True, offload_policy=CPUOffload(offload_params=enable_cpu_offload)) 
     model.diffusion_model = diffusion_model
     
-    # CRITICAL FIX: If CPU offloading is disabled, FSDP (via fully_shard) moves wrapped layers to CUDA.
-    # However, unwrapped parts (embeddings, final layers) stay on CPU (enforced by SamplerManager).
-    # This creates a mixed-device model that crashes set_model_state_dict with "Multiple devices found".
-    # We must rigorously align the entire model to CUDA if offload is False.
-    if not enable_cpu_offload:
-        import torch
-        if torch.cuda.is_available():
-            # This is safe; FSDP modules handle .to() by moving their local shard.
-            # Unwrapped modules move fully.
-            # We attempt to move the ROOT model (if possible) or at least the diffusion_model 
-            # and all its submodules.
-            
-            # 1. Move the ENTIRE model (handles unwrapped params and parent buffers)
-            # This fixes "Multiple devices found" if parent has buffers on CPU
-            model.to("cuda")
-            
-            # 2. Iterate and force any stragglers (buffers, etc not in children? unlikely but safe)
-            for p in model.parameters():
-                if p.device.type != 'cuda':
-                    p.data = p.to("cuda")
-            for b in model.buffers():
-                 if b.device.type != 'cuda':
-                    b.data = b.to("cuda")
-
-    
     # Sync before loading state dict
     import torch.distributed as dist
     if dist.is_initialized():
