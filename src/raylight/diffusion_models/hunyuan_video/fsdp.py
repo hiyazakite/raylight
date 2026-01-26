@@ -75,12 +75,17 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     if not enable_cpu_offload:
         align_model_to_cuda(model)
 
+    # If broadcast_from_rank0 is True, only rank 0 needs to load the state dict.
+    # Other ranks can clear their local state dict to save massive amounts of RAM/VRAM.
+    if dist.is_initialized() and dist.get_rank() > 0:
+        model_state_dict.clear()
+
     set_model_state_dict(
         model=model,
         model_state_dict=model_state_dict,
         options=StateDictOptions(
             full_state_dict=True,
-            broadcast_from_rank0=False,
+            broadcast_from_rank0=True,
             cpu_offload=enable_cpu_offload,
         ),
     )
