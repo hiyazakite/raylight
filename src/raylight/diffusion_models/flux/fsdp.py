@@ -6,16 +6,13 @@ from raylight.distributed_modules.utils import detect_dtype_mismatch
 def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     diffusion_model = model.diffusion_model
 
-    # Collect params we want to ignore (everything except single_blocks + double_blocks)
-    ignored_params = set()
-    for name, param in diffusion_model.named_parameters():
-        if (not name.startswith("single_blocks.")) and (not name.startswith("double_blocks.")):
-            ignored_params.add(param)
-
     # Check dtype missmatch from scaled model
     ref_dtype = diffusion_model.double_blocks[0].img_attn.qkv.weight.dtype
+    print(f"[FSDP Flux] Model Dtype: {ref_dtype}")
 
     # Shard single_blocks
+    from torch.distributed.fsdp import CPUOffload
+
     for i, block in enumerate(diffusion_model.single_blocks):
         ignored_block_params = detect_dtype_mismatch(block, ref_dtype)
         diffusion_model.single_blocks[i] = fully_shard(
@@ -23,6 +20,7 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
             mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
             ignored_params=ignored_block_params,
+            offload_policy=CPUOffload(offload_params=enable_cpu_offload)
         )
 
     # Shard double_blocks
@@ -33,13 +31,14 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
             mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
             ignored_params=ignored_block_params,
+            offload_policy=CPUOffload(offload_params=enable_cpu_offload)
         )
 
-    # Root wrap with ignored params
+    # Root wrap - Shards everything else (no skipped params)
     fully_shard(diffusion_model,
-                ignored_params=ignored_params,
                 mp_policy=MixedPrecisionPolicy(),
-                reshard_after_forward=True)
+                reshard_after_forward=True,
+                offload_policy=CPUOffload(offload_params=enable_cpu_offload))
 
     model.diffusion_model = diffusion_model
 
