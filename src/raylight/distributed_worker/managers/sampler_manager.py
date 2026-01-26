@@ -2,6 +2,7 @@ import torch
 import comfy.sample
 import comfy.utils
 import comfy.samplers
+import comfy.model_patcher
 from contextlib import contextmanager
 from raylight.utils.memory import monitor_memory
 from raylight.utils.common import Noise_EmptyNoise, Noise_RandomNoise, patch_ray_tqdm, cleanup_memory
@@ -34,6 +35,37 @@ class SamplerManager:
 
             # NOTE: Logic to force model to CPU before FSDP was removed here (Legacy)
             # We now handle device placement explicitly in the FSDP shard/load functions.
+            
+            # CRITICAL FOR FSDP: Bake LoRAs into weights before wrapping!
+            # Since 'use_orig_params=True' is not supported in this torch version, FSDP flattens params
+            # which breaks standard ComfyUI soft-patching (hooks). We must hard-patch (bake) first.
+            if hasattr(work_model, "patches") and work_model.patches:
+                 print(f"[RayWorker {self.worker.local_rank}] FSDP: Baking {len(work_model.patches)} patches into weights before sharding...")
+                 
+                 # Force in-place update so the underlying model instance (which FSDP wraps) is modified
+                 prev_inplace = work_model.weight_inplace_update
+                 work_model.weight_inplace_update = True
+                 
+                 # force_patch_weights=True permanently modifies the weights in work_model.model
+                 work_model.load(device_to="cpu", force_patch_weights=True)
+                 
+                 # Free memory: We don't need backups of the unbaked weights since we are committing to them
+                 if hasattr(work_model, "backup"):
+                     work_model.backup.clear()
+
+                 # Restore inplace flag
+                 work_model.weight_inplace_update = prev_inplace
+                 
+                 # CRITICAL: Prevent FSDP wrapper from reloading stale state_dict over our baked weights
+                 if hasattr(work_model, "set_fsdp_state_dict"):
+                     print(f"[RayWorker {self.worker.local_rank}] FSDP: Clearing fsdp_state_dict to preserve baked weights.")
+                     work_model.set_fsdp_state_dict(None)
+                 
+                 # Clear patches to prevent double application or tracking issues
+                 work_model.patches.clear()
+                 if hasattr(work_model, "patches_uuid"):
+                     import uuid
+                     work_model.patches_uuid = uuid.uuid4()
             
             work_model.patch_fsdp()
             # FSDP cleanup

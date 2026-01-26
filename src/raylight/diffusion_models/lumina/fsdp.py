@@ -58,14 +58,15 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     if dist.is_initialized():
         dist.barrier()
 
-    set_model_state_dict(
-        model=model,
-        model_state_dict=model_state_dict,
-        options=StateDictOptions(
-            full_state_dict=True,
-            broadcast_from_rank0=True, 
-            cpu_offload=enable_cpu_offload
-        ),
-    )
+    if model_state_dict is not None:
+        set_model_state_dict(
+            model=model,
+            model_state_dict=model_state_dict,
+            options=StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=False, 
+                cpu_offload=enable_cpu_offload
+            ),
+        )
 
     return model
