@@ -3,6 +3,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     StateDictOptions,
 )
+from raylight.distributed_modules.utils import align_model_to_cuda
 
 
 def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
@@ -72,14 +73,7 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
 
     # Align stragglers (params/buffers not wrapped by FSDP) to CUDA
     if not enable_cpu_offload:
-        import torch
-        if torch.cuda.is_available():
-            for p in model.parameters():
-                if not isinstance(p, torch.distributed.fsdp.FlatParameter) and p.device.type != 'cuda':
-                    p.data = p.to("cuda")
-            for b in model.buffers():
-                 if b.device.type != 'cuda':
-                    b.data = b.to("cuda")
+        align_model_to_cuda(model)
 
     set_model_state_dict(
         model=model,
