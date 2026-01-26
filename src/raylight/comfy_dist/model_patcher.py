@@ -139,7 +139,9 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
         with self.use_ejected():
-            if not isinstance(self.model.diffusion_model, FSDPModule):
+            # If we are baking weights (force_patch_weights=True), we MUST NOT wrap FSDP yet.
+            # We want to patch the original model first, THEN wrap it later.
+            if not isinstance(self.model.diffusion_model, FSDPModule) and not force_patch_weights:
                 self.patch_fsdp()
             else:
                 pass
@@ -260,6 +262,15 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
             for k in keys:
                 bk = self.backup[k]
+                weight, _, _ = get_key_weight(self.model, k)
+                
+                # Handling DTensor (FSDP) unpatching
+                if isinstance(weight, DTensor):
+                    # We cannot simple copy_() a full tensor into a DTensor.
+                    # Ideally we should re-shard the backup weight, but for now we skip 
+                    # to prevent crashing. Creating a proper distributed copy is complex here.
+                    continue
+
                 if bk.inplace_update:
                     comfy.utils.copy_to_param(self.model, k, bk.weight)
                 else:
