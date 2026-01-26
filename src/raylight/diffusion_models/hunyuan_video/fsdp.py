@@ -1,9 +1,8 @@
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffload
 from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     StateDictOptions,
 )
-from raylight.distributed_modules.utils import detect_dtype_mismatch
 
 
 def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
@@ -40,25 +39,20 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
         reshard_after_forward=True,
     )
 
-    # Check dtype missmatch from scaled model
-    ref_dtype = diffusion_model.double_blocks[0].img_attn.qkv.weight.dtype
-
     for i, block in enumerate(diffusion_model.single_blocks):
-        ignored_block_params = detect_dtype_mismatch(block, ref_dtype)
         diffusion_model.single_blocks[i] = fully_shard(
             module=block,
             mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
-            ignored_params=ignored_block_params,
+            offload_policy=CPUOffload(offload_params=enable_cpu_offload),
         )
 
     for i, block in enumerate(diffusion_model.double_blocks):
-        ignored_block_params = detect_dtype_mismatch(block, ref_dtype)
         diffusion_model.double_blocks[i] = fully_shard(
             module=block,
             mp_policy=MixedPrecisionPolicy(),
             reshard_after_forward=True,
-            ignored_params=ignored_block_params,
+            offload_policy=CPUOffload(offload_params=enable_cpu_offload),
         )
 
     # Root wrap with ignored params
@@ -70,6 +64,22 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     )
 
     model.diffusion_model = diffusion_model
+
+    # Sync before loading
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.barrier()
+
+    # Align stragglers (params/buffers not wrapped by FSDP) to CUDA
+    if not enable_cpu_offload:
+        import torch
+        if torch.cuda.is_available():
+            for p in model.parameters():
+                if not isinstance(p, torch.distributed.fsdp.FlatParameter) and p.device.type != 'cuda':
+                    p.data = p.to("cuda")
+            for b in model.buffers():
+                 if b.device.type != 'cuda':
+                    b.data = b.to("cuda")
 
     set_model_state_dict(
         model=model,
