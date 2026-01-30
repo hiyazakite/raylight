@@ -37,31 +37,37 @@ def modulate(x, scale):
     return x * (1 + scale.unsqueeze(1))
 
 
-def usp_dit_forward(self, x, timesteps, context, num_tokens, attention_mask=None, **kwargs):
+def usp_dit_forward(self, x, timesteps, context, num_tokens, attention_mask=None, ref_latents=[], ref_contexts=[], siglip_feats=[], transformer_options={}, **kwargs):
+    omni = len(ref_latents) > 0
+    if omni:
+        timesteps = torch.cat([timesteps * 0, timesteps], dim=0)
+
     t = 1.0 - timesteps
     cap_feats = context
     cap_mask = attention_mask
     bs, c, h, w = x.shape
     x = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_size, self.patch_size))
-    """
-    Forward pass of NextDiT.
-    t: (N,) tensor of diffusion timesteps
-    y: (N,) tensor of text tokens/features
-    """
 
     t = self.t_embedder(t * self.time_scale, dtype=x.dtype)  # (N, D)
     adaln_input = t
 
-    cap_feats = self.cap_embedder(
-        cap_feats
-    )  # (N, L, D)  # todo check if able to batchify w.o. redundant compute
+    if hasattr(self, "clip_text_pooled_proj") and self.clip_text_pooled_proj is not None:
+        pooled = kwargs.get("clip_text_pooled", None)
+        if pooled is not None:
+            pooled = self.clip_text_pooled_proj(pooled)
+        else:
+            pooled = torch.zeros((x.shape[0], self.clip_text_dim), device=x.device, dtype=x.dtype)
 
-    transformer_options = kwargs.get("transformer_options", {})
+        adaln_input = self.time_text_embed(torch.cat((t, pooled), dim=-1))
+
     x_is_tensor = isinstance(x, torch.Tensor)
-    x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(
-        x, cap_feats, cap_mask, t, num_tokens, transformer_options=transformer_options
+    x, mask, img_size, cap_size, freqs_cis, timestep_zero_index = self.patchify_and_embed(
+        x, cap_feats, cap_mask, adaln_input, num_tokens, 
+        ref_latents=ref_latents, ref_contexts=ref_contexts, 
+        siglip_feats=siglip_feats, transformer_options=transformer_options
     )
     freqs_cis = freqs_cis.to(x.device)
+
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     world_size = get_sequence_parallel_world_size()
     x = pad_to_divisible(x, world_size, dim=1)
@@ -70,9 +76,12 @@ def usp_dit_forward(self, x, timesteps, context, num_tokens, attention_mask=None
     x = torch.chunk(x, world_size, dim=1)[get_sequence_parallel_rank()]
     freqs_cis = torch.chunk(freqs_cis, world_size, dim=1)[get_sequence_parallel_rank()]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+
     for layer in self.layers:
         x = layer(
-            x, mask, freqs_cis, adaln_input, transformer_options=transformer_options
+            x, mask, freqs_cis, adaln_input, 
+            timestep_zero_index=timestep_zero_index, 
+            transformer_options=transformer_options
         )
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
