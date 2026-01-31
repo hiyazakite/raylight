@@ -1,8 +1,4 @@
 import torch
-import types
-import comfy.utils
-import comfy.sd
-import logging
 from raylight.utils.memory import monitor_memory
 from raylight.utils.common import cleanup_memory, force_malloc_trim
 
@@ -12,52 +8,45 @@ class VaeManager:
         self.vae_model = None
 
     def load_vae(self, vae_path):
+        from raylight.distributed_worker.model_context import get_context, ModelState
         from raylight.comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
-        state_dict = {}
-        metadata = None
-        if "pixel_space" in vae_path:
-            state_dict["pixel_space_vae"] = torch.tensor(1.0)
-        else:
-            # Use return_metadata=True to ensure correct versioning (LTX-1 vs LTX-2)
-            res = comfy.utils.load_torch_file(vae_path, return_metadata=True)
-            if isinstance(res, tuple):
-                state_dict, metadata = res
-            else:
-                state_dict = res
-                metadata = None
+        import types
 
-        # Diagnostics for VAE identification
-        key_check = "decoder.up_blocks.0.res_blocks.0.conv1.conv.weight"
-        if key_check in state_dict:
-            channels = state_dict[key_check].shape[0]
-            print(f"[RayWorker {self.worker.local_rank}] VAE Identification: {key_check} has {channels} channels.")
-            # Replicate ComfyUI logic for clarity in logs
-            version = 0
-            if channels == 512: version = 0
-            elif channels == 1024:
-                version = 1
-                if "encoder.down_blocks.1.conv.conv.bias" in state_dict: version = 2
-            print(f"[RayWorker {self.worker.local_rank}] VAE Identification: Guessed version {version}")
+        print(f"[RayWorker {self.worker.local_rank}] VAE Load via ModelContext: {vae_path}")
         
-        if metadata:
-            print(f"[RayWorker {self.worker.local_rank}] VAE Identification: Metadata found, contains 'config': {'config' in metadata}")
+        # 1. Get Unified Context (VAEContext for VAE models)
+        ctx = get_context(self.worker, vae_path, model_type="vae")
+        
+        # 2. Create Load State
+        state = ModelState(
+            unet_path=vae_path,
+            model_options={},
+        )
+        
+        # 3. Load state dict (with mmap caching if available)
+        if ctx.use_mmap and state.cache_key in self.worker.state_cache:
+             sd = self.worker.state_cache.get(state.cache_key)
+        else:
+             sd = ctx.load_state_dict_mmap(state) if ctx.use_mmap else ctx.load_state_dict_standard(state)
+             if ctx.use_mmap:
+                 self.worker.state_cache.put(state.cache_key, sd)
 
-        original_level = logging.getLogger().getEffectiveLevel()
-        # logging.getLogger().setLevel(logging.ERROR) # Let's see the warnings for now
-        try:
-            # Pass metadata to VAE constructor to correctly handle configs
-            vae_model = comfy.sd.VAE(sd=state_dict, metadata=metadata)
-            vae_model.throw_exception_if_invalid()
-        finally:
-            logging.getLogger().setLevel(original_level)
-
+        # 4. Instantiate model (creates VAE object with mmap_cache attached)
+        vae_model = ctx.instantiate_model(sd, state)
+        
+        # 5. Monkey patch decode optimizations
         vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
         vae_model.decode_tiled_ = types.MethodType(decode_tiled_, vae_model)
         vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
 
-        if self.worker.local_rank == 0:
-            print(f"VAE loaded in {self.worker.global_world_size} GPUs")
+        # 6. Stream weights to GPU (handled by context, same pattern as UNET)
+        ctx.stream_vae_to_device(vae_model, self.worker.device)
+
         self.vae_model = vae_model
+        
+        # Cleanup
+        cleanup_memory()
+
 
     def release_vae(self):
         """Explicitly release VAE model from memory to free RAM for other operations."""
@@ -165,9 +154,16 @@ class VaeManager:
         self.vae_model.first_stage_model.to(dtype)
         self.vae_model.vae_dtype = dtype
         
-        latents_to_decode = samples["samples"].to(dtype)
+        latents_to_decode = samples["samples"].to(dtype).to(self.worker.device)
         print(f"[RayWorker {self.worker.local_rank}] latents_to_decode shape: {latents_to_decode.shape}")
         print(f"[RayWorker {self.worker.local_rank}] tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
+        
+        # DEBUG: Verify decoder is on correct device before decode
+        for name, param in self.vae_model.first_stage_model.named_parameters():
+            if 'decoder' in name:
+                print(f"[RayWorker {self.worker.local_rank}] DECODER PARAM CHECK: {name} device={param.device}, mean={param.float().mean().item():.6f}")
+                break
+        print(f"[RayWorker {self.worker.local_rank}] VAE self.device={self.vae_model.device}, latents device={latents_to_decode.device}")
 
         images = self.vae_model.decode_tiled(
             latents_to_decode,
@@ -178,6 +174,10 @@ class VaeManager:
             overlap_t=temporal_overlap,
         )
         print(f"[RayWorker {self.worker.local_rank}] decode_tiled complete. Shape: {images.shape}")
+        
+        # DEBUG: Check raw decode output immediately
+        raw_min, raw_max, raw_mean = images.min().item(), images.max().item(), images.mean().item()
+        print(f"[RayWorker {self.worker.local_rank}] RAW decode stats: min={raw_min:.4f}, max={raw_max:.4f}, mean={raw_mean:.4f}")
         
         if torch.isnan(images).any():
             print(f"[RayWorker {self.worker.local_rank}] CRITICAL: VAE output STILL contains NaNs even in float32!")
@@ -228,7 +228,9 @@ class VaeManager:
                  images = images[:write_len]
 
             # Write (auto-cast to float32 if needed)
-            out_buffer[output_offset : output_offset + write_len] = images.to(torch.float32).cpu()
+            # Use copy_ to avoid intermediate CPU tensor allocation
+            out_buffer[output_offset : output_offset + write_len].copy_(images.to(torch.float32), non_blocking=True)
+            torch.cuda.synchronize() # Ensure copy completes before cleanup
             
             # Return stats only
             result_payload = {
@@ -252,6 +254,9 @@ class VaeManager:
         # This is critical to avoid VRAM accumulation across shards
         if self.vae_model is not None and hasattr(self.vae_model, 'first_stage_model'):
             self.vae_model.first_stage_model.to('cpu')
+            # Clear mmap cache to release any lingering tensor references
+            if hasattr(self.vae_model, 'mmap_cache'):
+                self.vae_model.mmap_cache = None
         
         print(f"[RayWorker {self.worker.local_rank}] Shard {shard_index} complete. Cleanup and return.")
         cleanup_memory()

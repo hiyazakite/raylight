@@ -551,18 +551,143 @@ class FSDPContext(ModelContext):
         self.load(state)
 
 
-def get_context(worker: "RayWorker", path: str) -> ModelContext:
+
+class VAEContext(SafetensorsContext):
+    """Context for VAE model loading with streaming mmap support."""
+    
+    def prepare_state_dict(self, sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """VAE: No prefix stripping needed (unlike UNET)."""
+        return sd
+        
+    def instantiate_model(self, sd: Dict, state: ModelState):
+        """Instantiate VAE model using comfy.sd.VAE (Standard ComfyUI path)."""
+        import comfy.sd
+        import comfy.utils
+        import logging
+        
+        print(f"[VAEContext] Standard VAE init with {len(sd)} keys")
+        
+        # CRITICAL: Load metadata from safetensor file
+        # Metadata contains VAE config that's essential for proper version detection
+        # The old working code used: comfy.utils.load_torch_file(vae_path, return_metadata=True)
+        metadata = None
+        try:
+            # Load just the metadata (not the tensors - those are already in sd)
+            import safetensors
+            with safetensors.safe_open(state.unet_path, framework="pt") as f:
+                metadata = f.metadata()
+            if metadata:
+                print(f"[VAEContext] Loaded metadata: contains 'config': {'config' in metadata}")
+        except Exception as e:
+            print(f"[VAEContext] Warning: Could not load metadata: {e}")
+        
+        # DEBUG: Check VAE version detection
+        if "decoder.up_blocks.0.res_blocks.0.conv1.conv.weight" in sd:
+            tensor_conv1 = sd["decoder.up_blocks.0.res_blocks.0.conv1.conv.weight"]
+            print(f"[VAEContext DEBUG] conv1 shape: {tensor_conv1.shape} (chan={tensor_conv1.shape[0]})")
+            if tensor_conv1.shape[0] == 512:
+                print("[VAEContext DEBUG] Detected LTX VAE version 0 (LTX1)")
+            elif tensor_conv1.shape[0] == 1024:
+                if "encoder.down_blocks.1.conv.conv.bias" in sd:
+                    print("[VAEContext DEBUG] Detected LTX VAE version 2 (LTX2 full)")
+                else:
+                    print("[VAEContext DEBUG] Detected LTX VAE version 1 (LTX2 basic)")
+        
+        # ComfyUI VAE init - PASS METADATA!
+        try:
+             vae_model = comfy.sd.VAE(sd=sd, metadata=metadata)
+             vae_model.throw_exception_if_invalid()
+             
+             # NOTE: Do NOT move to GPU here. Let the caller (VaeManager) handle 
+             # device placement via streaming or .to() so we can control the flow.
+
+        except Exception as e:
+             raise RuntimeError(f"Could not load VAE model: {state.unet_path}. Error: {e}")
+             
+        # Store original sd for potential streaming optimization
+        vae_model.mmap_cache = sd
+        return vae_model
+
+    def stream_vae_to_device(self, vae_model, device: torch.device) -> bool:
+        """Stream VAE weights to GPU per-tensor (avoids RAM spike).
+        
+        Handles both the streaming of weights from mmap AND the alignment 
+        of stragglers (buffers not in safetensor file) to GPU.
+        
+        Returns True if streaming was used, False if fallback applied.
+        """
+        from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
+        from raylight.distributed_modules.utils import align_model_to_cuda
+        
+        mmap_cache = getattr(vae_model, "mmap_cache", None)
+        
+        if not mmap_cache:
+            # Fallback: standard model.to()
+            print(f"[VAEContext] Using standard .to({device})...")
+            if hasattr(vae_model, "first_stage_model"):
+                vae_model.first_stage_model.to(device)
+            return False
+        
+        try:
+            print(f"[VAEContext] Streaming VAE to {device} per-tensor...")
+            wrapper = SafetensorMmapWrapper(mmap_cache)
+            
+            if hasattr(vae_model, "first_stage_model"):
+                transferred = wrapper.stream_to_model(vae_model.first_stage_model, device)
+                print(f"[VAEContext] Streamed {transferred} parameters to {device}")
+                
+                # Align stragglers (buffers not in safetensor) to CUDA
+                # This handles components like timestep_scale_multiplier
+                align_model_to_cuda(vae_model.first_stage_model)
+                print(f"[VAEContext] Aligned VAE stragglers to CUDA")
+            
+            return True
+        except Exception as e:
+            print(f"[VAEContext] Streaming transfer failed: {e}, falling back...")
+            if hasattr(vae_model, "first_stage_model"):
+                vae_model.first_stage_model.to(device)
+            return False
+
+    def offload(self):
+        """Soft-offload for VAE: Moves first_stage_model to CPU/mmap."""
+        print(f"[VAEContext {self.worker.local_rank}] VAE Offload: Releasing to System RAM/Mmap...")
+        
+        if self.worker.vae_model is not None:
+             # Similar to Safetensors, we can swap pointers if we want
+             # But VAEs are simpler. Usually just .to('cpu') is enough.
+             # However, to be consistent with 'mmap' zero-copy:
+             
+             model = self.worker.vae_model
+             if hasattr(model, "first_stage_model"):
+                  model.first_stage_model.to("cpu")
+                  
+             # Force cleanup
+             if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+             self.worker.vae_model = None # Release the reference to allow GC if needed
+             # or keep it if we want 'hot reload' to mean 'move back to GPU'
+             # Since Raylight manages vae via VaeManager.release_vae(), maybe we should coordinate?
+             # For now, this `offload` matches strict 'get off GPU' semantics.
+
+
+def get_context(worker: "RayWorker", path: str, model_type: str = "unet") -> ModelContext:
     """Factory function to select appropriate context based on config and file type.
     
     Args:
         worker: RayWorker instance
         path: Path to model file
+        model_type: "unet" or "vae"
         
     Returns:
         Appropriate ModelContext subclass instance
     """
+    if model_type == "vae":
+        return VAEContext(worker)
+        
     if worker.parallel_dict.get("is_fsdp"):
         return FSDPContext(worker)
     if path.lower().endswith(".gguf"):
         return GGUFContext(worker)
     return SafetensorsContext(worker)
+

@@ -873,8 +873,8 @@ class RayVAEDecodeDistributed:
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
 
         # 1. Load VAE on all workers
-        for actor in gpu_actors:
-            cancellable_get(actor.ray_vae_loader.remote(vae_path))
+        futures = [actor.ray_vae_loader.remote(vae_path) for actor in gpu_actors]
+        cancellable_get(futures)
 
         # 2. Shard samples temporally
         latents = samples["samples"]
