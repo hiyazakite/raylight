@@ -155,10 +155,6 @@ class RayInitializer:
                     "default": True,
                     "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."
                 }),
-                "pack_qkv": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enable combined QKV all-to-all optimization. Only works for self-attention models. Disable for cross-attention (LTXV, SD3, etc.)."
-                }),
                 "use_mmap": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Use memory-mapped (zero-copy) model loading. Enabled: parallel loading with OS page cache sharing. Disabled: sequential leader-follower loading (use if mmap causes issues)."
@@ -168,10 +164,6 @@ class RayInitializer:
                     "min": 1,
                     "max": 10,
                     "tooltip": "LRU cache size for mmap'd model state dicts. Higher values keep more models in RAM for fast reloading."
-                }),
-                "use_fastsafe": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Use fastsafetensors library for accelerated loading (requires pip install fastsafetensors). Enables GPUDirect Storage on compatible hardware."
                 }),
             }
         }
@@ -199,10 +191,8 @@ class RayInitializer:
         torch_dist_address: str = "None",
         gpu_indices: str = "",
         skip_comm_test: bool = True,
-        pack_qkv: bool = True,
         use_mmap: bool = True,
         mmap_cache_size: int = 2,
-        use_fastsafe: bool = False,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # THIS IS PYTORCH DIST ADDRESS
@@ -245,7 +235,6 @@ class RayInitializer:
             # Mmap settings for zero-copy loading
             self.parallel_dict["use_mmap"] = use_mmap
             self.parallel_dict["mmap_cache_size"] = mmap_cache_size
-            self.parallel_dict["use_fastsafe"] = use_fastsafe
 
             if (
                 ulysses_degree > 0
@@ -262,7 +251,6 @@ class RayInitializer:
                 self.parallel_dict["ring_degree"] = ring_degree
                 self.parallel_dict["cfg_degree"] = cfg_degree
                 self.parallel_dict["sync_ulysses"] = sync_ulysses
-                self.parallel_dict["pack_qkv"] = pack_qkv
 
             if FSDP:
                 self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
@@ -419,10 +407,6 @@ class RayInitializerAdvanced(RayInitializer):
                     "default": True,
                     "tooltip": "Skip NCCL communication test at startup. Saves ~10-15s but won't detect comm issues early."
                 }),
-                "pack_qkv": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Enable combined QKV all-to-all optimization. Only works for self-attention models. Disable for cross-attention (LTXV, SD3, etc.)."
-                }),
                 "use_mmap": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Use memory-mapped (zero-copy) model loading. Enabled: parallel loading with OS page cache sharing. Disabled: sequential leader-follower loading."
@@ -432,10 +416,6 @@ class RayInitializerAdvanced(RayInitializer):
                     "min": 1,
                     "max": 10,
                     "tooltip": "LRU cache size for mmap'd model state dicts."
-                }),
-                "use_fastsafe": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Use fastsafetensors library for accelerated loading (requires pip install fastsafetensors)."
                 }),
             }
         }

@@ -46,9 +46,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         if key not in self.patches:
             return
         
-        # Debug: Log when patches are being applied
         patches = self.patches[key]
-        print(f"[GGUFModelPatcher] Applying {len(patches)} patches to {key} -> {device_to}")
         
         # GHOST REFRESH: Pull from mmap_cache if available (handles 'meta' restoration)
         # This allows the model to re-hydrate from a fresh mapping.
@@ -86,7 +84,6 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         if unpatch_weights:
-            print(f"[GGUFModelPatcher] Zero-Copy Offload: Restoring mmap references (Target: {device_to})")
             
             # 1. Standard unpatch for non-weight state.
             super().unpatch_model(device_to=None, unpatch_weights=unpatch_weights)
@@ -160,7 +157,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                                 target_param.patches = []
                             moved_to_mmap += 1
             
-            print(f"[GGUFModelPatcher] Zero-Copy: Restored {moved_to_mmap} parameters to mmap.")
+
             
             # CRITICAL: Clear .patches on ALL parameters, not just those matched during swap.
             # GGMLTensor.to() copies .patches, so there may be GPU tensor refs on params
@@ -170,12 +167,9 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 if hasattr(param, "patches") and param.patches:
                     param.patches = []
                     cleared_patches += 1
-            if cleared_patches > 0:
-                print(f"[GGUFModelPatcher] Cleared .patches on {cleared_patches} parameters.")
+
             
-            # FALLBACK: If we failed to swap ANYTHING, we MUST still offload the VRAM!
             if moved_to_mmap == 0 and device_to is not None and device_to.type == "cpu":
-                 print(f"[GGUFModelPatcher] WARNING: Zero-Copy failed (0 swapped). Forcing standard offload to {device_to}...")
                  self.model.to(device_to)
             
             if device_to is not None:
@@ -183,7 +177,6 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 
             from raylight.utils.common import cleanup_memory
             cleanup_memory()
-            print("[GGUFModelPatcher] Offload Complete.")
 
         # Move patches themselves back to offload device if they were on GPU
         for key, patch_list in self.patches.items():
@@ -218,13 +211,9 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
 
         # Manually move non-GGUF weights (buffers etc) to target device
         if device_to is not None and unpatch_weights:
-             print(f"[GGUFModelPatcher] Offloading remaining buffers to {device_to}...")
-             moved_count = 0
              for buf in self.model.buffers():
                  if buf.device.type == 'cuda' and device_to.type == 'cpu':
                      buf.data = buf.data.to(device_to)
-                     moved_count += 1
-             print(f"[GGUFModelPatcher] Offloaded {moved_count} buffers to {device_to}.")
 
     def load(self, *args, force_patch_weights=False, **kwargs):
         # GHOST RE-HYDRATION: Re-map the GGUF file ONLY if cache is missing and we have a path.
@@ -233,11 +222,9 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         
         # Robust check for empty or missing cache
         if (m_cache is None or (isinstance(m_cache, dict) and len(m_cache) == 0)) and u_path:
-            print(f"[GGUFModelPatcher] Ghost Re-hydration: Mapping {u_path}...")
             from .loader import gguf_sd_loader
             sd, _ = gguf_sd_loader(u_path)
             self.mmap_cache = sd
-            print("[GGUFModelPatcher] Re-hydration complete.")
 
         super().load(*args, force_patch_weights=True, **kwargs)
 
@@ -340,8 +327,6 @@ class RayGGUFLoader:
             
             if use_mmap:
                 # PARALLEL: All workers load simultaneously via mmap
-                # OS page cache ensures single physical copy shared across processes
-                print("[Raylight] GGUF Parallel Mmap Load: All workers loading simultaneously...")
                 load_futures = []
                 for actor in gpu_actors:
                     load_futures.append(
@@ -353,11 +338,9 @@ class RayGGUFLoader:
                 ray.get(load_futures)
             else:
                 # SEQUENTIAL: Leader-follower to avoid RAM spikes
-                print("[Raylight] GGUF Sequential Load (mmap disabled): Using leader-follower pattern...")
                 
                 # 1. Leader (Worker 0) Load
                 worker0 = ray.get_actor("RayWorker:0")
-                print("[Raylight] Starting Leader GGUF Load on Worker 0...")
                 ray.get(
                     worker0.load_unet.remote(
                         unet_path,
@@ -378,7 +361,6 @@ class RayGGUFLoader:
                 }
 
                 # 3. Follower Hydration
-                print("[Raylight] Initializing Followers via Shared RAM (with mmap fallback)...")
                 for actor in gpu_actors:
                     if actor != worker0:
                         loaded_futures.append(

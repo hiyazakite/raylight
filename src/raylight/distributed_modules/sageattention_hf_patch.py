@@ -35,7 +35,8 @@ def _ensure_sageattention_core():
             from sageattention import core as core_module  # type: ignore
         except ImportError:
             core_module = types.SimpleNamespace()
-        module.core = core = core_module
+        setattr(module, "core", core_module)
+        core = core_module
 
     return module, core
 
