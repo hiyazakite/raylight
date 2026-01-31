@@ -5,13 +5,14 @@ across different formats (GGUF, Safetensors, FSDP) with optional mmap caching.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional, TYPE_CHECKING
+from typing import Dict, Any, Optional, Tuple, TYPE_CHECKING
 import os
 
 import torch
 
 if TYPE_CHECKING:
-    from .ray_worker import RayWorker
+    from .worker_config import WorkerConfig
+    from .managers.lora_manager import LoraManager
 
 
 @dataclass
@@ -39,144 +40,177 @@ class ModelContext(ABC):
     Each format (GGUF, Safetensors, FSDP) implements format-specific behavior.
     """
     
-    def __init__(self, worker: "RayWorker"):
-        self.worker = worker
-        self.use_mmap = worker.parallel_dict.get("use_mmap", True)
+    def __init__(self, use_mmap: bool = True):
+        self.use_mmap = use_mmap
     
     # ─── Abstract Methods (format-specific) ──────────────────
     
     @abstractmethod
-    def load_state_dict_mmap(self, state: ModelState) -> Dict[str, torch.Tensor]:
+    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Dict[str, torch.Tensor]:
         """Load state dict with mmap (zero-copy where possible)."""
         pass
     
     @abstractmethod
-    def load_state_dict_standard(self, state: ModelState) -> Dict[str, torch.Tensor]:
+    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig") -> Dict[str, torch.Tensor]:
         """Load state dict without mmap (fallback)."""
         pass
     
     @abstractmethod
-    def instantiate_model(self, sd: Dict[str, torch.Tensor], state: ModelState) -> Any:
+    def instantiate_model(self, sd: Dict[str, torch.Tensor], state: ModelState, config: "WorkerConfig") -> Any:
         """Create ModelPatcher from state dict."""
         pass
     
     @abstractmethod
-    def hot_load(self, device: torch.device):
+    def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
         """Fast VRAM transfer for soft-reloaded models."""
         pass
     
-    def offload(self):
+    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
         """Standard offload: Move weights to CPU and release tracking."""
         print(f"[{self.__class__.__name__}] Standard Offload: Releasing VRAM...")
         
         # Share the common offload cleanup logic
-        self.worker._common_offload_cleanup()
-        
-        # Clear model and tracking
-        self.worker.model = None
-        self.worker.current_unet_path = None
-        self.worker.current_sd_ref = None
+        self._common_offload_cleanup(model, lora_manager, config)
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
-    def prepare_state_dict(self, sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Optional pre-processing of state dict before instantiation.
+
+    def _common_offload_cleanup(self, model: Any, lora_manager: "LoraManager", config: "WorkerConfig"):
+        """Shared post-offload cleanup for all model formats."""
+        # Clear LoRA tracking for fresh re-application after reload
+        if lora_manager:
+            lora_manager.clear_tracking()
+            print(f"[RayWorker {config.local_rank}] LoRA tracking cleared.")
         
-        Args:
-            sd: Original state dict
-            
-        Returns:
-            Processed state dict
-        """
+        # Move buffers to CPU if model still exists
+        if model is not None:
+            diffusion_model = getattr(model, "model", None)
+            if diffusion_model is not None:
+                try:
+                    for name, buf in diffusion_model.named_buffers():
+                        if buf is not None and buf.device.type == 'cuda':
+                            buf.data = buf.data.to('cpu')
+                except Exception as e:
+                    print(f"[RayWorker {config.local_rank}] Buffer cleanup warning: {e}")
+                
+                # Delete cached PE tensors
+                for attr in ['_cached_pe', 'cached_pe', 'pe_cache', '_pe']:
+                    if hasattr(diffusion_model, attr):
+                        delattr(diffusion_model, attr)
+                    if hasattr(diffusion_model, 'diffusion_model'):
+                        inner = diffusion_model.diffusion_model
+                        if hasattr(inner, attr):
+                            delattr(inner, attr)
+        
+        # Force garbage collection and CUDA cleanup
+        from raylight.utils.common import cleanup_memory
+        cleanup_memory()
+        mem_now = torch.cuda.memory_allocated(config.device) / 1e9
+        print(f"[RayWorker {config.local_rank}] Post-Offload VRAM: {mem_now:.2f}GB")
+
+    
+    def prepare_state_dict(self, sd: Dict[str, torch.Tensor], config: "WorkerConfig") -> Dict[str, torch.Tensor]:
+        """Optional pre-processing of state dict before instantiation."""
         return sd
     
     # ─── Shared Logic ────────────────────────────────────────
     
-    def load(self, state: ModelState):
-        """Full load with cache check (shared logic for all formats)."""
-        cache = self.worker.state_cache
+    def load(self, state: ModelState, config: "WorkerConfig", state_cache: Any) -> Tuple[Any, Dict[str, Any]]:
+        """Full load with cache check (shared logic for all formats).
         
+        Returns:
+            (model, reload_params)
+        """
         # 1. Cache check (only if mmap enabled)
-        if self.use_mmap and state.cache_key in cache:
+        if self.use_mmap and state.cache_key in state_cache:
             print(f"[ModelContext] LRU Cache Hit: {os.path.basename(state.cache_key)}")
-            sd = cache.get(state.cache_key)
+            sd = state_cache.get(state.cache_key)
         else:
             # 2. Disk load (mmap or standard based on toggle)
             if self.use_mmap:
                 print(f"[ModelContext] Mmap Load: {os.path.basename(state.cache_key)}")
-                sd = self.load_state_dict_mmap(state)
-                cache.put(state.cache_key, sd)
+                sd = self.load_state_dict_mmap(state, config)
+                state_cache.put(state.cache_key, sd)
             else:
                 print(f"[ModelContext] Standard Load: {os.path.basename(state.cache_key)}")
-                sd = self.load_state_dict_standard(state)
+                sd = self.load_state_dict_standard(state, config)
         
         # 3. Instantiate model
         if sd is None:
             raise RuntimeError(f"Failed to load state dict for {state.unet_path}")
             
-        self.worker.model = self.instantiate_model(sd, state)
-        self._post_load(state, sd)
+        model = self.instantiate_model(sd, state, config)
+        
+        # Post-load setup
+        reload_params = state.to_dict()
+        if model is not None:
+             model.unet_path = state.unet_path
+             if self.use_mmap:
+                 model.mmap_cache = sd
+
+        return model, reload_params
     
-    def reload_if_needed(self, target_device: torch.device):
-        """Shared reload logic - checks device and triggers appropriate reload."""
-        model = self.worker.model
+    def reload_if_needed(self, model: Any, target_device: torch.device, reload_params: Dict[str, Any], config: "WorkerConfig", state_cache: Any) -> Tuple[Any, Dict[str, Any]]:
+        """Shared reload logic - checks device and triggers appropriate reload.
+        
+        Returns:
+            (model, reload_params) - potentially new model instance if full reload
+        """
         current = getattr(model, "current_device", None) if model else None
         
         if model is not None and str(current) == str(target_device):
             print(f"[ModelContext] Already on {target_device}, skipping reload.")
-            return
+            return model, reload_params
         
         if model is not None:
             # Soft reload - model object exists but on wrong device
             print(f"[ModelContext] Hot-loading to {target_device}...")
-            self.hot_load(target_device)
+            self.hot_load(model, target_device, reload_params, state_cache)
+            return model, reload_params
         else:
             # Full reload - model is None
-            print(f"[ModelContext] Full reload to {target_device}...")
-            state = ModelState(**self.worker.reload_params)
-            self.load(state)
-    
-    def _post_load(self, state: ModelState, sd: Dict):
-        """Common post-load setup for all formats."""
-        self.worker.reload_params = state.to_dict()
-        if self.worker.model is not None:
-            self.worker.model.unet_path = state.unet_path
+            if not reload_params:
+                 raise RuntimeError("Cannot reload model: No reload_params found.")
             
-            if self.use_mmap:
-                self.worker.model.mmap_cache = sd
-        
-        # Clear LoRA tracking for fresh re-application
-        if hasattr(self.worker, "lora_manager"):
-            self.worker.lora_manager.clear_tracking()
+            print(f"[ModelContext] Full reload to {target_device}...")
+            state = ModelState(**reload_params)
+            new_model, new_params = self.load(state, config, state_cache)
+            return new_model, new_params
 
 
 class GGUFContext(ModelContext):
     """Context for GGUF model loading with mmap support."""
     
-    def load_state_dict_mmap(self, state: ModelState) -> Dict:
+    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Dict:
         from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader
         sd, extra = gguf_sd_loader(state.unet_path)
-        self.worker.gguf_metadata = extra.get("metadata", {})
+        # We need to somehow persist metadata. 
+        # For now, we attach it to the SD or handle it in instantiate via side channel?
+        # A cleaner way is to return it, but load signature is fixed.
+        # Let's attach to SD as hidden attribute or rely on instantiate re-reading if affordable.
+        # Actually, `gguf_sd_loader` returns (sd, extra).
+        # We can store extra on the context instance temporarily since contexts are short-lived per-op?
+        # YES, context instances are created per op in get_context.
+        self._temp_gguf_metadata = extra.get("metadata", {})
         return sd
     
-    def prepare_state_dict(self, sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def prepare_state_dict(self, sd: Dict[str, torch.Tensor], config: "WorkerConfig") -> Dict[str, torch.Tensor]:
         """GGUF: Strip prefixes and prepare for detection."""
         keys = list(sd.keys())
         
         # The auto-detection (unet_prefix_from_state_dict) failed in previous runs (detected 'model.'), so we force 'diffusion_model.'
         if any(k.startswith("diffusion_model.") for k in keys[:5]):
-             print(f"[GGUFContext {self.worker.local_rank}] Detected 'diffusion_model.' prefix. Force-stripping for detection...")
+             print(f"[GGUFContext {config.local_rank}] Detected 'diffusion_model.' prefix. Force-stripping for detection...")
              import comfy.utils
              sd = comfy.utils.state_dict_prefix_replace(sd, {"diffusion_model.": ""}, filter_keys=True)
         
         return sd
     
-    def load_state_dict_standard(self, state: ModelState) -> Dict:
+    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig") -> Dict:
         # GGUF library always uses mmap internally
-        return self.load_state_dict_mmap(state)
+        return self.load_state_dict_mmap(state, config)
     
-    def instantiate_model(self, sd: Dict, state: ModelState):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
         from raylight.expansion.comfyui_gguf.ops import GGMLOps
         from raylight.expansion.comfyui_gguf.nodes import GGUFModelPatcher
         import comfy.sd
@@ -206,7 +240,7 @@ class GGUFContext(ModelContext):
         kwargs = {}
         valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
         if "metadata" in valid_params:
-            kwargs["metadata"] = getattr(self.worker, "gguf_metadata", {})
+            kwargs["metadata"] = getattr(self, "_temp_gguf_metadata", {})
         
         model = comfy.sd.load_diffusion_model_state_dict(
             isolated, 
@@ -218,48 +252,47 @@ class GGUFContext(ModelContext):
             raise RuntimeError(f"Could not load GGUF model: {state.unet_path}")
         
         model = GGUFModelPatcher.clone(model)
-        model.gguf_metadata = getattr(self.worker, "gguf_metadata", {})
+        model.gguf_metadata = getattr(self, "_temp_gguf_metadata", {})
         return model
     
-    def offload(self):
+    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
         """GGUF Soft-Offload: Restore mmap pointers to clear VRAM without copies."""
-        if self.worker.model is not None:
-            print(f"[GGUFContext {self.worker.local_rank}] GGUF Soft-Offload: Performing Zero-Copy Pointer Swap...")
+        if model is not None:
+            print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload: Performing Zero-Copy Pointer Swap...")
             
             # 1. Clear LoRA GPU refs via manager
-            self.worker.lora_manager.clear_gpu_refs()
+            if lora_manager:
+                lora_manager.clear_gpu_refs(model, config)
             
             # 2. Restore mmap pointers
-            self.worker.model.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
-            self.worker.model.current_device = torch.device('cpu')
+            model.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
+            model.current_device = torch.device('cpu')
             
             # 3. Store in worker-level mmap cache to survive model swaps
-            mmap_cache = getattr(self.worker.model, "mmap_cache", None)
+            mmap_cache = getattr(model, "mmap_cache", None)
             if mmap_cache:
-                unet_path = getattr(self.worker.model, "unet_path", None)
+                unet_path = getattr(model, "unet_path", None)
                 if unet_path:
-                    self.worker.worker_mmap_cache[unet_path] = mmap_cache
+                    worker_mmap_cache[unet_path] = mmap_cache
             
             # 4. Shared cleanup
-            self.worker._common_offload_cleanup()
-            print(f"[GGUFContext {self.worker.local_rank}] GGUF Soft-Offload Complete.")
-        else:
-            self.worker.is_model_loaded = False
+            self._common_offload_cleanup(model, lora_manager, config)
+            print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload Complete.")
     
-    def hot_load(self, device: torch.device):
-        if self.worker.model is None:
+    def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
+        if model is None:
             return
 
         # Re-hydrate mmap_cache from worker cache if needed
-        if not getattr(self.worker.model, "mmap_cache", None):
-            unet_path = getattr(self.worker.model, "unet_path", None)
-            if unet_path and unet_path in self.worker.state_cache:
+        if not getattr(model, "mmap_cache", None):
+            unet_path = getattr(model, "unet_path", None)
+            if unet_path and unet_path in state_cache:
                 print("[GGUFContext] Re-hydrating mmap_cache from LRU cache...")
-                self.worker.model.mmap_cache = self.worker.state_cache.get(unet_path)
+                model.mmap_cache = state_cache.get(unet_path)
         
-        if hasattr(self.worker.model, "load"):
-            self.worker.model.load(device, force_patch_weights=True)
-            self.worker.model.current_device = device
+        if hasattr(model, "load"):
+            model.load(device, force_patch_weights=True)
+            model.current_device = device
 
 
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
@@ -274,19 +307,19 @@ class LazyTensorContext(ModelContext):
     - Fallback to full clone if streaming fails
     """
     
-    def __init__(self, worker: "RayWorker"):
-        super().__init__(worker)
+    def __init__(self, use_mmap: bool = True):
+        super().__init__(use_mmap)
         self._streaming_enabled = True  # Can be disabled if issues detected
     
-    def load_state_dict_mmap(self, state: ModelState) -> Dict:
+    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Dict:
         import safetensors.torch
         return safetensors.torch.load_file(state.unet_path, device="cpu")
     
-    def load_state_dict_standard(self, state: ModelState) -> Dict:
+    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig") -> Dict:
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path)
     
-    def instantiate_model(self, sd: Dict, state: ModelState):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
         """Instantiate model with lazy state dict (zero-copy until load)."""
         import comfy.sd
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
@@ -311,14 +344,14 @@ class LazyTensorContext(ModelContext):
         model.mmap_cache = sd
         return model
     
-    def instantiate_model_with_fallback(self, sd: Dict, state: ModelState):
+    def instantiate_model_with_fallback(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
         """Try streaming approach with fallback to full clone."""
         import comfy.sd
         
         try:
             if self._streaming_enabled:
                 # Streaming: shallow copy + deferred GPU transfer
-                model = self.instantiate_model(sd, state)
+                model = self.instantiate_model(sd, state, config)
                 print("[LazyTensorContext] Streaming instantiation successful")
                 return model
         except Exception as e:
@@ -342,47 +375,45 @@ class LazyTensorContext(ModelContext):
         
         return model
     
-    def stream_to_device(self, device: torch.device) -> bool:
+    def stream_to_device(self, model: Any, device: torch.device) -> bool:
         """Stream model weights to GPU per-tensor (avoids RAM spike).
         
         Returns True if streaming was used, False if fallback applied.
         """
-        mmap_cache = getattr(self.worker.model, "mmap_cache", None)
+        mmap_cache = getattr(model, "mmap_cache", None)
         
         if not mmap_cache or not self._streaming_enabled:
             # Fallback: standard model.to()
             print(f"[LazyTensorContext] Using standard .to({device})...")
-            if self.worker.model is not None and hasattr(self.worker.model, "model"):
-                self.worker.model.model.to(device)
+            if model is not None and hasattr(model, "model"):
+                model.model.to(device)
             return False
         
         try:
             print(f"[LazyTensorContext] Streaming to {device} per-tensor...")
             wrapper = SafetensorMmapWrapper(mmap_cache)
             
-            if self.worker.model is not None and hasattr(self.worker.model, "model"):
-                transferred = wrapper.stream_to_model(self.worker.model.model, device)
+            if model is not None and hasattr(model, "model"):
+                transferred = wrapper.stream_to_model(model.model, device)
                 print(f"[LazyTensorContext] Streamed {transferred} parameters to {device}")
             
             return True
         except Exception as e:
             print(f"[LazyTensorContext] Streaming transfer failed: {e}, falling back...")
-            if self.worker.model is not None and hasattr(self.worker.model, "model"):
-                self.worker.model.model.to(device)
+            if model is not None and hasattr(model, "model"):
+                model.model.to(device)
             return False
     
-    def offload(self):
+    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
         """Pointer-swap offload: swap GPU tensors back to mmap refs (like GGUF)."""
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import swap_model_to_mmap
         
-        if self.worker.model is not None:
-            print(f"[LazyTensorContext {self.worker.local_rank}] Soft-Offload: Performing Pointer Swap...")
+        if model is not None:
+            print(f"[LazyTensorContext {config.local_rank}] Soft-Offload: Performing Pointer Swap...")
             
             # 1. Clear LoRA GPU refs via manager
-            self.worker.lora_manager.clear_gpu_refs()
-            
-            # 2. Extract model
-            model = self.worker.model
+            if lora_manager:
+                lora_manager.clear_gpu_refs(model, config)
             
             # 3. Unpatch first!
             if hasattr(model, "unpatch_model"):
@@ -397,51 +428,47 @@ class LazyTensorContext(ModelContext):
                 # Store in worker-level mmap cache to survive model swaps
                 unet_path = getattr(model, "unet_path", None)
                 if unet_path:
-                    self.worker.worker_mmap_cache[unet_path] = mmap_cache
+                    worker_mmap_cache[unet_path] = mmap_cache
             
             model.current_device = torch.device('cpu')
             
             # 5. Shared cleanup
-            self.worker._common_offload_cleanup()
+            self._common_offload_cleanup(model, lora_manager, config)
             
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
-            print(f"[LazyTensorContext {self.worker.local_rank}] Soft-Offload Complete.")
-        else:
-            self.worker.is_model_loaded = False
+            print(f"[LazyTensorContext {config.local_rank}] Soft-Offload Complete.")
+
     
-    def hot_load(self, device: torch.device):
+    def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
         """Hot reload: re-materialize from mmap refs to GPU (like GGUF)."""
         print(f"[LazyTensorContext] Hot reload to {device}...")
         
         # Model structure still exists, just reload weights to GPU
-        if self.worker.model is not None and hasattr(self.worker.model, 'load'):
-            self.worker.model.load(device)
-            self.worker.model.current_device = device
+        if model is not None and hasattr(model, 'load'):
+            model.load(device)
+            model.current_device = device
         else:
-            # Fallback: full reload from cache
-            state = ModelState(**self.worker.reload_params)
-            self.load(state)
-            if self.worker.model is not None and hasattr(self.worker.model, 'load'):
-                self.worker.model.load(device)
+            # Should have been handled by shared reload_if_needed logic for Full Reload
+            pass
 
 
 class FSDPContext(ModelContext):
     """Context for FSDP model loading with optional mmap for safetensors."""
     
-    def load_state_dict_mmap(self, state: ModelState) -> Dict:
+    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Dict:
         # Use safetensors mmap if file is .safetensors
         if state.unet_path.lower().endswith(".safetensors"):
             import safetensors.torch
             return safetensors.torch.load_file(state.unet_path, device="cpu")
-        return self.load_state_dict_standard(state)
+        return self.load_state_dict_standard(state, config)
     
-    def load_state_dict_standard(self, state: ModelState) -> Dict:
+    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig") -> Dict:
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path)
     
-    def instantiate_model(self, sd: Dict, state: ModelState):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
         from raylight.comfy_dist.sd import fsdp_load_diffusion_model_stat_dict
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
         from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
@@ -453,7 +480,7 @@ class FSDPContext(ModelContext):
         from raylight.comfy_dist.model_patcher import LowVramPatch
         model_patcher.LowVramPatch = LowVramPatch
         model_management.cleanup_models_gc = cleanup_models_gc
-
+        
         # JIT Loading: Wrap with LazySafetensor if not already (reusing logic from LazyTensors)
         # This prevents the "huge RAM spike" by delaying materialization until key access
         if self.use_mmap:
@@ -467,82 +494,77 @@ class FSDPContext(ModelContext):
 
         model, state_dict = fsdp_load_diffusion_model_stat_dict(
             sd,
-            self.worker.local_rank,
-            self.worker.device_mesh,
-            self.worker.is_cpu_offload,
+            config.local_rank,
+            getattr(config, "device_mesh", None), # Relying on device_mesh being in config
+            config.parallel_dict.get("fsdp_cpu_offload", False),
             model_options=model_options
         )
         
         if model is None:
             raise RuntimeError(f"Could not load FSDP model: {state.unet_path}")
         
-        self.worker.state_dict = state_dict
+        # FSDP special: attach state dict to model for retrieval? 
+        # Or return it? For now, we attach it to the model patcher if possible.
+        # But wait, original code set `worker.state_dict`.
+        # To remain stateless, we should return it or attach to model.
+        # Let's attach to model.
+        model.fsdp_state_dict = state_dict
         return model
     
-    def offload(self):
+    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
         """
         FSDP offload: release both model and state dict
         FSDP requires full reload currently due to its nature (sharding)
-        TODO: Investigate hot loading for FSDP - we could flush the shards, remap the mmap cache, and reload the state dict but this is a lot of work
         """
-        print(f"[FSDPContext {self.worker.local_rank}] FSDP Hard-Offload: Releasing all resources...")
+        print(f"[FSDPContext {config.local_rank}] FSDP Hard-Offload: Releasing all resources...")
         
         # 0. Clear GPU refs (weight_functions, patches) that might hold cyclic refs
-        self.worker.lora_manager.clear_gpu_refs()
+        if lora_manager:
+            lora_manager.clear_gpu_refs(model, config)
         
-        if self.worker.model is not None:
+        if model is not None:
             # Explicitly release DTensor/FSDP storage
-            if hasattr(self.worker.model, "release_memory"):
-                self.worker.model.release_memory()
+            if hasattr(model, "release_memory"):
+                model.release_memory()
 
-        # 2. Trigger shared cleanup (clears LoRA tracking, moves buffers to CPU, deleted cached attributes)
-        self.worker._common_offload_cleanup()
-        
-        # 3. Destroy references to allow GC
-        self.worker.model = None
-        self.worker.state_dict = None
+        # 2. Trigger shared cleanup
+        self._common_offload_cleanup(model, lora_manager, config)
         
         # 4. Final VRAM flush
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
-    def hot_load(self, device: torch.device):
+    def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
         """
         FSDP requires full reload currently due to its nature (sharding)
-        TODO: See offload for TODO
         """
-        state = ModelState(**self.worker.reload_params)
-        self.load(state)
-
+        # This shouldn't be reached if we follow reload_if_needed logic correctly for "None" model
+        pass
 
 
 class VAEContext(LazyTensorContext):
     """Context for VAE model loading with streaming mmap support."""
     
-    def prepare_state_dict(self, sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def prepare_state_dict(self, sd: Dict[str, torch.Tensor], config: "WorkerConfig") -> Dict[str, torch.Tensor]:
         """VAE: No prefix stripping needed (unlike UNET)."""
         return sd
         
-    def instantiate_model(self, sd: Dict, state: ModelState):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
         """Instantiate VAE model using comfy.sd.VAE (Standard ComfyUI path)."""
         import comfy.sd
         import comfy.utils
+        from safetensors.torch import safe_open
         
         print(f"[VAEContext] Standard VAE init with {len(sd)} keys")
         
-        # CRITICAL: Load metadata from safetensor file
-        # Metadata contains VAE config that's essential for proper version detection
-        # The old working code used: comfy.utils.load_torch_file(vae_path, return_metadata=True)
         metadata = None
         try:
-            # Load just the metadata (not the tensors - those are already in sd)
-            import safetensors
-            with safetensors.safe_open(state.unet_path, framework="pt") as f:
+            with safe_open(state.unet_path, framework="pt") as f:
                 metadata = f.metadata()
             if metadata:
                 print(f"[VAEContext] Loaded metadata: contains 'config': {'config' in metadata}")
-        except Exception as e:
-            print(f"[VAEContext] Warning: Could not load metadata: {e}")
+        except Exception:
+            pass  # Safetensors not installed or error
         
         # DEBUG: Check VAE version detection
         if "decoder.up_blocks.0.res_blocks.0.conv1.conv.weight" in sd:
@@ -560,10 +582,6 @@ class VAEContext(LazyTensorContext):
         try:
              vae_model = comfy.sd.VAE(sd=sd, metadata=metadata)
              vae_model.throw_exception_if_invalid()
-             
-             # NOTE: Do NOT move to GPU here. Let the caller (VaeManager) handle 
-             # device placement via streaming or .to() so we can control the flow.
-
         except Exception as e:
              raise RuntimeError(f"Could not load VAE model: {state.unet_path}. Error: {e}")
              
@@ -572,13 +590,7 @@ class VAEContext(LazyTensorContext):
         return vae_model
 
     def stream_vae_to_device(self, vae_model, device: torch.device) -> bool:
-        """Stream VAE weights to GPU per-tensor (avoids RAM spike).
-        
-        Handles both the streaming of weights from mmap AND the alignment 
-        of stragglers (buffers not in safetensor file) to GPU.
-        
-        Returns True if streaming was used, False if fallback applied.
-        """
+        """Stream VAE weights to GPU per-tensor (avoids RAM spike)."""
         from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
         from raylight.distributed_modules.utils import align_model_to_cuda
         
@@ -599,8 +611,7 @@ class VAEContext(LazyTensorContext):
                 transferred = wrapper.stream_to_model(vae_model.first_stage_model, device)
                 print(f"[VAEContext] Streamed {transferred} parameters to {device}")
                 
-                # Align stragglers (buffers not in safetensor) to CUDA
-                # This handles components like timestep_scale_multiplier
+                # Align stragglers
                 align_model_to_cuda(vae_model.first_stage_model)
                 print("[VAEContext] Aligned VAE stragglers to CUDA")
             
@@ -611,18 +622,8 @@ class VAEContext(LazyTensorContext):
                 vae_model.first_stage_model.to(device)
             return False
 
-    def offload(self, vae_model=None, release_reference: bool = False):
-        """Zero-copy soft-offload for VAE: Restores mmap pointers instead of copying to CPU.
-        
-        This matches the GGUF/LazyTensorContext pattern for consistent memory handling.
-        
-        Args:
-            vae_model: Optional VAE model to offload. If None, uses worker.vae_model.
-            release_reference: If True, also clears worker.vae_model reference.
-        """
-        from raylight.utils.common import cleanup_memory
-        
-        model = vae_model if vae_model is not None else getattr(self.worker, 'vae_model', None)
+    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
+        """Zero-copy soft-offload for VAE."""
         
         if model is None:
             return
@@ -631,26 +632,35 @@ class VAEContext(LazyTensorContext):
         first_stage = getattr(model, "first_stage_model", None)
         
         if mmap_cache and first_stage:
-            # ZERO-COPY: Restore mmap pointers instead of copying to CPU
-            print(f"[VAEContext {self.worker.local_rank}] Zero-Copy Offload: Restoring mmap pointers...")
+            # ZERO-COPY
+            print(f"[VAEContext {config.local_rank}] Zero-Copy Offload: Restoring mmap pointers...")
             
-            # Build param map for first_stage_model
+            # Param map logic...
             param_map = {name: param for name, param in first_stage.named_parameters()}
             buffer_map = {name: buf for name, buf in first_stage.named_buffers()}
             
             restored = 0
             for name, mmap_tensor in mmap_cache.items():
-                # VAE keys map directly (no prefix stripping needed unlike diffusion models)
+                target_param = None
                 if name in param_map:
-                    param_map[name].data = mmap_tensor
-                    restored += 1
+                    target_param = param_map[name]
                 elif name in buffer_map:
-                    buffer_map[name].data = mmap_tensor
+                    target_param = buffer_map[name]
+                
+                if target_param is None:
+                    simple_name = name.replace("first_stage_model.", "")
+                    if simple_name in param_map:
+                        target_param = param_map[simple_name]
+                    elif simple_name in buffer_map:
+                         target_param = buffer_map[simple_name]
+
+                if target_param is not None:
+                    target_param.data = mmap_tensor
                     restored += 1
             
-            print(f"[VAEContext {self.worker.local_rank}] Zero-Copy: Restored {restored}/{len(mmap_cache)} tensors to mmap.")
+            print(f"[VAEContext {config.local_rank}] Zero-Copy: Restored {restored}/{len(mmap_cache)} tensors to mmap.")
             
-            # Move any remaining GPU tensors to CPU (stragglers not in mmap)
+            # Move stragglers
             stragglers_moved = 0
             for name, param in first_stage.named_parameters():
                 if param.device.type == 'cuda':
@@ -662,42 +672,48 @@ class VAEContext(LazyTensorContext):
                     stragglers_moved += 1
             
             if stragglers_moved > 0:
-                print(f"[VAEContext {self.worker.local_rank}] Moved {stragglers_moved} stragglers to CPU.")
+                print(f"[VAEContext {config.local_rank}] Moved {stragglers_moved} stragglers to CPU.")
                     
         else:
-            # Fallback: standard .to('cpu') if no mmap cache available
-            print(f"[VAEContext {self.worker.local_rank}] VAE Offload: No mmap cache, using standard offload...")
+            # Fallback
+            print(f"[VAEContext {config.local_rank}] VAE Offload: No mmap cache, using standard offload...")
             if first_stage:
                 first_stage.to("cpu")
-            # Only clear mmap cache in fallback path (not needed)
             if hasattr(model, "mmap_cache"):
                 model.mmap_cache = None
             
         # Force cleanup
+        from raylight.utils.common import cleanup_memory
         cleanup_memory()
         
-        # Report VRAM status (consistent with other contexts)
-        mem_now = torch.cuda.memory_allocated(self.worker.device) / 1e9
-        print(f"[VAEContext {self.worker.local_rank}] Post-Offload VRAM: {mem_now:.2f}GB")
+        mem_now = torch.cuda.memory_allocated(config.device) / 1e9
+        print(f"[VAEContext {config.local_rank}] Post-Offload VRAM: {mem_now:.2f}GB")
 
 
-def get_context(worker: "RayWorker", path: str, model_type: str = "unet") -> ModelContext:
+def get_context(path: str, config: "WorkerConfig", model_type: str = "unet") -> ModelContext:
     """Factory function to select appropriate context based on config and file type.
     
     Args:
-        worker: RayWorker instance
         path: Path to model file
+        config: Worker configuration
         model_type: "unet" or "vae"
         
     Returns:
         Appropriate ModelContext subclass instance
     """
+    use_mmap = config.parallel_dict.get("use_mmap", True)
+    
     if model_type == "vae":
-        return VAEContext(worker)
+        return VAEContext(use_mmap=use_mmap)
         
-    if worker.parallel_dict.get("is_fsdp"):
-        return FSDPContext(worker)
+    if getattr(config, "is_fsdp", False):
+        if path.lower().endswith(".gguf"):
+            raise ValueError(
+                "[Raylight] FSDP is not supported for GGUF models. "
+                "GGUF quantization is incompatible with FSDP sharding. "
+                "Please use a standard Safetensors model or disable FSDP/Context Parallel to use GGUF."
+            )
+        return FSDPContext(use_mmap=use_mmap)
     if path.lower().endswith(".gguf"):
-        return GGUFContext(worker)
-    return LazyTensorContext(worker)
-
+        return GGUFContext(use_mmap=use_mmap)
+    return LazyTensorContext(use_mmap=use_mmap)
