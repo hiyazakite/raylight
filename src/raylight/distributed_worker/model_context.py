@@ -265,58 +265,22 @@ class GGUFContext(ModelContext):
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
 
 
-# Check for optional fastsafetensors
-try:
-    import fastsafetensors  # noqa: F401
-    HAS_FASTSAFETENSORS = True
-except ImportError:
-    HAS_FASTSAFETENSORS = False
-
-
-class SafetensorsContext(ModelContext):
+class LazyTensorContext(ModelContext):
     """Context for Safetensors model loading with streaming mmap support.
     
     Features:
     - Zero-copy mmap sharing via OS page cache (like GGUF)
     - Streaming GPU transfer (per-tensor to avoid RAM spike)
-    - Optional fastsafetensors for GDS acceleration
     - Fallback to full clone if streaming fails
     """
     
     def __init__(self, worker: "RayWorker"):
         super().__init__(worker)
-        self.use_fastsafe = worker.parallel_dict.get("use_fastsafe", False) and HAS_FASTSAFETENSORS
         self._streaming_enabled = True  # Can be disabled if issues detected
     
     def load_state_dict_mmap(self, state: ModelState) -> Dict:
-        if self.use_fastsafe:
-            try:
-                print("[SafetensorsContext] Using fastsafetensors (GDS if available)...")
-                from fastsafetensors import SafeTensorsFileLoader, SingleGroup
-                
-                # Use SingleGroup for single-device usage (no ProcessGroup needed)
-                loader = SafeTensorsFileLoader(state.unet_path, pg=SingleGroup(), device=str(self.worker.device))
-                
-                # Map the file for rank 0
-                loader.add_filenames({0: [state.unet_path]})
-                
-                # Load to device
-                buffer = loader.copy_file_to_device()
-                
-                # Build state dict
-                sd = {}
-                for key in buffer.get_keys():
-                    sd[key] = buffer.get_tensor(key)
-                
-                print(f"[SafetensorsContext] fastsafetensors loaded {len(sd)} tensors")
-                return sd
-            except Exception as e:
-                print(f"[SafetensorsContext] fastsafetensors failed: {e}, falling back to standard mmap")
-                import safetensors.torch
-                return safetensors.torch.load_file(state.unet_path, device="cpu")
-        else:
-            import safetensors.torch
-            return safetensors.torch.load_file(state.unet_path, device="cpu")
+        import safetensors.torch
+        return safetensors.torch.load_file(state.unet_path, device="cpu")
     
     def load_state_dict_standard(self, state: ModelState) -> Dict:
         import comfy.utils
@@ -328,7 +292,7 @@ class SafetensorsContext(ModelContext):
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
         from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
         
-        print("[SafetensorsContext] Wrapping state dict with LazySafetensors...")
+        print("[LazyTensorContext] Wrapping state dict with LazySafetensors...")
         lazy_sd = wrap_state_dict_lazy(sd)
         
         load_options = state.model_options.copy()
@@ -355,11 +319,11 @@ class SafetensorsContext(ModelContext):
             if self._streaming_enabled:
                 # Streaming: shallow copy + deferred GPU transfer
                 model = self.instantiate_model(sd, state)
-                print("[SafetensorsContext] Streaming instantiation successful")
+                print("[LazyTensorContext] Streaming instantiation successful")
                 return model
         except Exception as e:
-            print(f"[SafetensorsContext] Streaming failed: {e}")
-            print("[SafetensorsContext] Falling back to full clone...")
+            print(f"[LazyTensorContext] Streaming failed: {e}")
+            print("[LazyTensorContext] Falling back to full clone...")
             self._streaming_enabled = False  # Disable for future loads
         
         # Fallback: full clone (safe but higher RAM)
@@ -387,22 +351,22 @@ class SafetensorsContext(ModelContext):
         
         if not mmap_cache or not self._streaming_enabled:
             # Fallback: standard model.to()
-            print(f"[SafetensorsContext] Using standard .to({device})...")
+            print(f"[LazyTensorContext] Using standard .to({device})...")
             if self.worker.model is not None and hasattr(self.worker.model, "model"):
                 self.worker.model.model.to(device)
             return False
         
         try:
-            print(f"[SafetensorsContext] Streaming to {device} per-tensor...")
+            print(f"[LazyTensorContext] Streaming to {device} per-tensor...")
             wrapper = SafetensorMmapWrapper(mmap_cache)
             
             if self.worker.model is not None and hasattr(self.worker.model, "model"):
                 transferred = wrapper.stream_to_model(self.worker.model.model, device)
-                print(f"[SafetensorsContext] Streamed {transferred} parameters to {device}")
+                print(f"[LazyTensorContext] Streamed {transferred} parameters to {device}")
             
             return True
         except Exception as e:
-            print(f"[SafetensorsContext] Streaming transfer failed: {e}, falling back...")
+            print(f"[LazyTensorContext] Streaming transfer failed: {e}, falling back...")
             if self.worker.model is not None and hasattr(self.worker.model, "model"):
                 self.worker.model.model.to(device)
             return False
@@ -412,7 +376,7 @@ class SafetensorsContext(ModelContext):
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import swap_model_to_mmap
         
         if self.worker.model is not None:
-            print(f"[SafetensorsContext {self.worker.local_rank}] Safetensors Soft-Offload: Performing Pointer Swap...")
+            print(f"[LazyTensorContext {self.worker.local_rank}] Soft-Offload: Performing Pointer Swap...")
             
             # 1. Clear LoRA GPU refs via manager
             self.worker.lora_manager.clear_gpu_refs()
@@ -443,13 +407,13 @@ class SafetensorsContext(ModelContext):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
-            print(f"[SafetensorsContext {self.worker.local_rank}] Safetensors Soft-Offload Complete.")
+            print(f"[LazyTensorContext {self.worker.local_rank}] Soft-Offload Complete.")
         else:
             self.worker.is_model_loaded = False
     
     def hot_load(self, device: torch.device):
         """Hot reload: re-materialize from mmap refs to GPU (like GGUF)."""
-        print(f"[SafetensorsContext] Hot reload to {device}...")
+        print(f"[LazyTensorContext] Hot reload to {device}...")
         
         # Model structure still exists, just reload weights to GPU
         if self.worker.model is not None and hasattr(self.worker.model, 'load'):
@@ -497,7 +461,7 @@ class FSDPContext(ModelContext):
             sd = wrap_state_dict_lazy(sd)
         
         # Inject SafetensorOps to handle zero-copy assignment
-        # Unconditionally overwrite to ensure we use SafetensorLayer (like SafetensorsContext)
+        # Unconditionally overwrite to ensure we use SafetensorLayer (like LazyTensorContext)
         model_options = state.model_options.copy()
         model_options["custom_operations"] = SafetensorOps
 
@@ -552,7 +516,7 @@ class FSDPContext(ModelContext):
 
 
 
-class VAEContext(SafetensorsContext):
+class VAEContext(LazyTensorContext):
     """Context for VAE model loading with streaming mmap support."""
     
     def prepare_state_dict(self, sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -563,7 +527,6 @@ class VAEContext(SafetensorsContext):
         """Instantiate VAE model using comfy.sd.VAE (Standard ComfyUI path)."""
         import comfy.sd
         import comfy.utils
-        import logging
         
         print(f"[VAEContext] Standard VAE init with {len(sd)} keys")
         
@@ -639,7 +602,7 @@ class VAEContext(SafetensorsContext):
                 # Align stragglers (buffers not in safetensor) to CUDA
                 # This handles components like timestep_scale_multiplier
                 align_model_to_cuda(vae_model.first_stage_model)
-                print(f"[VAEContext] Aligned VAE stragglers to CUDA")
+                print("[VAEContext] Aligned VAE stragglers to CUDA")
             
             return True
         except Exception as e:
@@ -648,27 +611,74 @@ class VAEContext(SafetensorsContext):
                 vae_model.first_stage_model.to(device)
             return False
 
-    def offload(self):
-        """Soft-offload for VAE: Moves first_stage_model to CPU/mmap."""
-        print(f"[VAEContext {self.worker.local_rank}] VAE Offload: Releasing to System RAM/Mmap...")
+    def offload(self, vae_model=None, release_reference: bool = False):
+        """Zero-copy soft-offload for VAE: Restores mmap pointers instead of copying to CPU.
         
-        if self.worker.vae_model is not None:
-             # Similar to Safetensors, we can swap pointers if we want
-             # But VAEs are simpler. Usually just .to('cpu') is enough.
-             # However, to be consistent with 'mmap' zero-copy:
-             
-             model = self.worker.vae_model
-             if hasattr(model, "first_stage_model"):
-                  model.first_stage_model.to("cpu")
-                  
-             # Force cleanup
-             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-             self.worker.vae_model = None # Release the reference to allow GC if needed
-             # or keep it if we want 'hot reload' to mean 'move back to GPU'
-             # Since Raylight manages vae via VaeManager.release_vae(), maybe we should coordinate?
-             # For now, this `offload` matches strict 'get off GPU' semantics.
+        This matches the GGUF/LazyTensorContext pattern for consistent memory handling.
+        
+        Args:
+            vae_model: Optional VAE model to offload. If None, uses worker.vae_model.
+            release_reference: If True, also clears worker.vae_model reference.
+        """
+        from raylight.utils.common import cleanup_memory
+        
+        model = vae_model if vae_model is not None else getattr(self.worker, 'vae_model', None)
+        
+        if model is None:
+            return
+        
+        mmap_cache = getattr(model, "mmap_cache", None)
+        first_stage = getattr(model, "first_stage_model", None)
+        
+        if mmap_cache and first_stage:
+            # ZERO-COPY: Restore mmap pointers instead of copying to CPU
+            print(f"[VAEContext {self.worker.local_rank}] Zero-Copy Offload: Restoring mmap pointers...")
+            
+            # Build param map for first_stage_model
+            param_map = {name: param for name, param in first_stage.named_parameters()}
+            buffer_map = {name: buf for name, buf in first_stage.named_buffers()}
+            
+            restored = 0
+            for name, mmap_tensor in mmap_cache.items():
+                # VAE keys map directly (no prefix stripping needed unlike diffusion models)
+                if name in param_map:
+                    param_map[name].data = mmap_tensor
+                    restored += 1
+                elif name in buffer_map:
+                    buffer_map[name].data = mmap_tensor
+                    restored += 1
+            
+            print(f"[VAEContext {self.worker.local_rank}] Zero-Copy: Restored {restored}/{len(mmap_cache)} tensors to mmap.")
+            
+            # Move any remaining GPU tensors to CPU (stragglers not in mmap)
+            stragglers_moved = 0
+            for name, param in first_stage.named_parameters():
+                if param.device.type == 'cuda':
+                    param.data = param.data.to('cpu')
+                    stragglers_moved += 1
+            for name, buf in first_stage.named_buffers():
+                if buf.device.type == 'cuda':
+                    buf.data = buf.data.to('cpu')
+                    stragglers_moved += 1
+            
+            if stragglers_moved > 0:
+                print(f"[VAEContext {self.worker.local_rank}] Moved {stragglers_moved} stragglers to CPU.")
+                    
+        else:
+            # Fallback: standard .to('cpu') if no mmap cache available
+            print(f"[VAEContext {self.worker.local_rank}] VAE Offload: No mmap cache, using standard offload...")
+            if first_stage:
+                first_stage.to("cpu")
+            # Only clear mmap cache in fallback path (not needed)
+            if hasattr(model, "mmap_cache"):
+                model.mmap_cache = None
+            
+        # Force cleanup
+        cleanup_memory()
+        
+        # Report VRAM status (consistent with other contexts)
+        mem_now = torch.cuda.memory_allocated(self.worker.device) / 1e9
+        print(f"[VAEContext {self.worker.local_rank}] Post-Offload VRAM: {mem_now:.2f}GB")
 
 
 def get_context(worker: "RayWorker", path: str, model_type: str = "unet") -> ModelContext:
@@ -689,5 +699,5 @@ def get_context(worker: "RayWorker", path: str, model_type: str = "unet") -> Mod
         return FSDPContext(worker)
     if path.lower().endswith(".gguf"):
         return GGUFContext(worker)
-    return SafetensorsContext(worker)
+    return LazyTensorContext(worker)
 

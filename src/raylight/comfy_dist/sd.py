@@ -148,6 +148,7 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
     # Force all model modules to CPU/meta.
     # This prevents "Multiple devices found" error in FSDP set_model_state_dict
     # when mixing LazySafetensors (CPU) with buffers initialized on CUDA.
+    assert model_patcher.model is not None
     model_patcher.model.to("cpu")
 
     state_dict = model_patcher.model_state_dict()

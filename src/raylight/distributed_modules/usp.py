@@ -62,7 +62,7 @@ if hasattr(model_base, "WAN21_HuMo"):
             usp_t2v_cross_attn_gather_forward
         )
         model = base_model.diffusion_model
-        model.wan_attn_block_class.audio_cross_attn.forward = type.MethodType(usp_t2v_cross_attn_gather_forward, model.wan_attn_block_class.audio_cross_attn)
+        model.wan_attn_block_class.audio_cross_attn.forward = types.MethodType(usp_t2v_cross_attn_gather_forward, model.wan_attn_block_class.audio_cross_attn)
         for block in model.blocks:
             block.self_attn.forward = types.MethodType(usp_self_attn_forward, block.self_attn)
             block.cross_attn.forward = types.MethodType(usp_t2v_cross_attn_forward, block.cross_attn)
@@ -228,10 +228,8 @@ if hasattr(model_base, "CosmosPredict2"):
 if hasattr(model_base, "CosmosVideo"):
     @USPInjectRegistry.register(model_base.CosmosVideo)
     def _inject_cosmos_video(model_patcher, base_model, *args):
-        pass
         from ..diffusion_models.cosmos.xdit_context_parallel import (
             usp_general_dit_forward,
-            usp_general_attention_forward
         )
         model = base_model.diffusion_model
         model._forward = types.MethodType(usp_general_dit_forward, model)

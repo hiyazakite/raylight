@@ -40,6 +40,8 @@ class VaeManager:
         vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
 
         # 6. Stream weights to GPU (handled by context, same pattern as UNET)
+        from raylight.distributed_worker.model_context import VAEContext
+        assert isinstance(ctx, VAEContext)
         ctx.stream_vae_to_device(vae_model, self.worker.device)
 
         self.vae_model = vae_model
@@ -65,11 +67,13 @@ class VaeManager:
         return True
 
     def get_temporal_compression(self):
-        if self.vae_model is None: return None
+        if self.vae_model is None:
+            return None
         return self.vae_model.temporal_compression_decode()
 
     def get_spatial_compression(self):
-        if self.vae_model is None: return None
+        if self.vae_model is None:
+            return None
         return self.vae_model.spacial_compression_decode()
 
     def check_health(self, samples, shard_index):
@@ -120,6 +124,7 @@ class VaeManager:
         if temporal_size < temporal_overlap * 2:
             temporal_overlap = temporal_overlap // 2
         
+        assert self.vae_model is not None, "VAE model must be loaded before decode"
         temporal_compression = self.vae_model.temporal_compression_decode()
         if temporal_compression is not None:
             temporal_size = max(2, temporal_size // temporal_compression)
@@ -250,16 +255,13 @@ class VaeManager:
         del images
         del latents_to_decode
         
-        # Release VAE from GPU VRAM (keep in CPU RAM for potential reuse within same prompt)
-        # This is critical to avoid VRAM accumulation across shards
-        if self.vae_model is not None and hasattr(self.vae_model, 'first_stage_model'):
-            self.vae_model.first_stage_model.to('cpu')
-            # Clear mmap cache to release any lingering tensor references
-            if hasattr(self.vae_model, 'mmap_cache'):
-                self.vae_model.mmap_cache = None
+        # Release VAE from GPU VRAM using context's offload method
+        # (Consistent with diffusion model pattern)
+        from raylight.distributed_worker.model_context import VAEContext
+        vae_ctx = VAEContext(self.worker)
+        vae_ctx.offload(self.vae_model)
         
-        print(f"[RayWorker {self.worker.local_rank}] Shard {shard_index} complete. Cleanup and return.")
-        cleanup_memory()
+        print(f"[RayWorker {self.worker.local_rank}] Shard {shard_index} complete.")
 
         # Force OS to reclaim freed memory (fixes RSS creep on Worker 0)
         force_malloc_trim()
