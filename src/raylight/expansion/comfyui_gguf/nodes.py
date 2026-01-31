@@ -349,7 +349,7 @@ class RayGGUFLoader:
                 )
 
                 # 2. Get Ref & Metadata
-                base_ref = ray.get(worker0.get_base_ref.remote())
+                base_ref = ray.get(worker0.create_patched_ref.remote())
                 gguf_metadata = ray.get(worker0.get_gguf_metadata.remote())
 
                 # Prepare params for fallback

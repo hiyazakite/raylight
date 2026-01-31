@@ -1014,22 +1014,8 @@ class RayVAEDecodeDistributed:
                         del shard_data
 
             del remaining
-            del futures # Ensure all futures are deleted to release Ray object store references
+            del futures 
 
-            # Add batch dimension if needed to match ComfyUI expectation (1, T, H, W, C)?
-            # Usually images are just a list of frames. Tensor shape (T, H, W, C).
-            # ComfyUI "IMAGE" type is (BATCH, H, W, C). For video, BATCH = Frames.
-            # So (T, H, W, 3) is correct.
-            
-            # 6. Cleanup shared file?
-            # If we delete the file now, full_image relies on valid fd/mapping.
-            # Since torch.from_file uses Mmap, we should keep the file until we don't need it?
-            # Or reliance on unlinked file logic (Linux only).
-            # To be safe and cross-platform compatible, we should ideally keep it.
-            # BUT we want to ensure it gets cleaned up.
-            # We can register it with a cleaner or rely on /tmp cleaners.
-            # For now, let's unlink it. On Linux, unlinking an open file keeps it alive for the process.
-            # Torch likely holds the fd.
             try:
                 os.unlink(mmap_path)
                 print(f"[RayVAEDecode] Unlinked temp mmap file: {mmap_path}")
@@ -1154,16 +1140,6 @@ class RayLoraLoaderModelOnly:
         lora_config_hash = hash(new_chain)
         
         if strength_model == 0:
-            # Even if strength is 0, we should probably pass through the actors
-            # But technically it doesn't change the model state relative to the *previous* state?
-            # Actually, standard Comfy behavior is to effectively ignore 0 strength loras.
-            # But if we were stacking, maybe we should preserve the chain?
-            # Let's keep it simple: if strength 0, we just return original actors effectively skipping this one
-            # BUT we need to be careful if we want to support disabling loras mid-chain.
-            # For now, let's just return actors as-is, BUT with the chain un-modified? 
-            # Or should we add it with 0 strength? 
-            # Existing code returned early. Let's return early but we might break the chain if we don't pass the new chain.
-            # If we don't add it to the chain, the next node will append to the OLD chain. This is correct for "skipping".
             return (ray_actors,)
 
         gpu_actors = ray_actors["workers"]
