@@ -27,7 +27,9 @@ class LRUStateCache:
         """
         if key in self._cache:
             self._cache.move_to_end(key)  # Mark as recently used
+            print(f"[LRUStateCache] Hit for key: {key} (size={len(self._cache)})")
             return self._cache[key]
+        print(f"[LRUStateCache] Miss for key: {key}")
         return None
 
     def __getitem__(self, key: str) -> Dict[str, Any]:
@@ -61,6 +63,7 @@ class LRUStateCache:
                 evicted_key, _ = self._cache.popitem(last=False)
                 print(f"[LRUStateCache] Evicted: {evicted_key}")
             self._cache[key] = value
+            print(f"[LRUStateCache] Added key: {key} (size={len(self._cache)})")
         
         return evicted_key
     
