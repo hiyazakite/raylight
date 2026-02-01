@@ -56,7 +56,7 @@ class ModelContext(ABC):
         pass
     
     @abstractmethod
-    def instantiate_model(self, sd: Dict[str, torch.Tensor], state: ModelState, config: "WorkerConfig") -> Any:
+    def instantiate_model(self, sd: Dict[str, torch.Tensor], state: ModelState, config: "WorkerConfig", metadata: Any = None) -> Any:
         """Create ModelPatcher from state dict."""
         pass
     
@@ -114,7 +114,60 @@ class ModelContext(ABC):
         return sd
     
     # ─── Shared Logic ────────────────────────────────────────
+
+
     
+    def _compute_checksum(self, sd: Dict[str, Any]) -> str:
+        """Compute a lightweight checksum for debug verification."""
+        try:
+            keys = sorted(list(sd.keys()))
+            if not keys:
+                return "empty"
+            
+            # Sample first, middle, last
+            indices = [0, len(keys)//2, len(keys)-1]
+            checksum_parts = []
+            for idx in indices:
+                k = keys[idx]
+                v = sd[k]
+                if hasattr(v, "shape"):
+                    meta = f"{k}:{v.shape}:{v.dtype}"
+                    # Add custom attributes check for GGML
+                    if hasattr(v, "tensor_type"):
+                        meta += f":{v.tensor_type}"
+                    
+                    # Add small data sample (first value)
+                    # Use .flatten()[0] to avoid shape issues, verify it's a tensor
+                    if v.numel() > 0:
+                        val = v.flatten()[0].item() if not v.is_meta else 0
+                        meta += f":{val:.4f}"
+                    checksum_parts.append(meta)
+            
+            return "|".join(checksum_parts)
+        except Exception as e:
+            return f"checksum_error:{e}"
+
+    def _verify_checksum(self, sd: Dict[str, Any], stored_checksum: str, context_tag: str = "ModelContext") -> bool:
+        """Verify state dict against stored checksum and log results.
+        
+        Args:
+            sd: The state dict to check
+            stored_checksum: The trusted checksum from cache
+            context_tag: Tag for logging (e.g. 'GGUFContext')
+            
+        Returns:
+            bool: True if checksum matches, False otherwise
+        """
+        current_checksum = self._compute_checksum(sd)
+        if stored_checksum != current_checksum:
+            print(f"[{context_tag}] CRITICAL: Cache Corruption Detected!")
+            print(f"  Stored:  {stored_checksum}")
+            print(f"  Current: {current_checksum}")
+            return False
+        else:
+            print(f"[{context_tag}] Cache Integrity Verified (Checksum match).")
+            return True
+
     def load(self, state: ModelState, config: "WorkerConfig", state_cache: Any) -> Tuple[Any, Dict[str, Any]]:
         """Full load with cache check (shared logic for all formats).
         
@@ -122,24 +175,59 @@ class ModelContext(ABC):
             (model, reload_params)
         """
         # 1. Cache check (only if mmap enabled)
+        metadata = None
+        checksum = None
+        
         if self.use_mmap and state.cache_key in state_cache:
             print(f"[ModelContext] LRU Cache Hit: {os.path.basename(state.cache_key)}")
-            sd = state_cache.get(state.cache_key)
+            cached = state_cache.get(state.cache_key)
+            
+            # Handle metadata-aware cache format
+            if isinstance(cached, tuple) and len(cached) >= 2 and isinstance(cached[0], dict):
+                 sd = cached[0]
+                 metadata = cached[1]
+                 # Retrieve checksum if present (v3 format: sd, meta, checksum)
+                 if len(cached) >= 3:
+                     stored_checksum = cached[2]
+                     self._verify_checksum(sd, stored_checksum, context_tag="ModelContext")
+            else:
+                 sd = cached
         else:
             # 2. Disk load (mmap or standard based on toggle)
             if self.use_mmap:
                 print(f"[ModelContext] Mmap Load: {os.path.basename(state.cache_key)}")
-                sd = self.load_state_dict_mmap(state, config)
-                state_cache.put(state.cache_key, sd)
+                res = self.load_state_dict_mmap(state, config)
+                
+                # Metadata aware return
+                if isinstance(res, tuple) and len(res) == 2:
+                    sd, metadata = res
+                    # Compute checksum on fresh load
+                    checksum = self._compute_checksum(sd)
+                    # Cache tuple with checksum
+                    state_cache.put(state.cache_key, (sd, metadata, checksum))
+                    print(f"[ModelContext] Cached model with checksum: {checksum}")
+                else:
+                    sd = res
+                    # Standard cache (tuple with empty meta and checksum)
+                    checksum = self._compute_checksum(sd)
+                    state_cache.put(state.cache_key, (sd, {}, checksum))
             else:
                 print(f"[ModelContext] Standard Load: {os.path.basename(state.cache_key)}")
                 sd = self.load_state_dict_standard(state, config)
         
-        # 3. Instantiate model
         if sd is None:
             raise RuntimeError(f"Failed to load state dict for {state.unet_path}")
             
-        model = self.instantiate_model(sd, state, config)
+        # 3. Prepare state dict (e.g. strip prefixes) without modifying cache
+        # Note: If prepare_state_dict modifies in-place, we must copy first if we want cache pristine.
+        # But GGUFContext usually returns a new dict if keys change.
+        # For safety with cache references, we can check logic.
+        sd_to_use = self.prepare_state_dict(sd, config)
+        
+        # 4. Instantiate model
+        model = self.instantiate_model(sd_to_use, state, config, metadata=metadata)
+        
+
         
         # Post-load setup
         reload_params = state.to_dict()
@@ -149,6 +237,8 @@ class ModelContext(ABC):
                  model.mmap_cache = sd
 
         return model, reload_params
+    
+
     
     def reload_if_needed(self, model: Any, target_device: torch.device, reload_params: Dict[str, Any], config: "WorkerConfig", state_cache: Any) -> Tuple[Any, Dict[str, Any]]:
         """Shared reload logic - checks device and triggers appropriate reload.
@@ -181,36 +271,28 @@ class ModelContext(ABC):
 class GGUFContext(ModelContext):
     """Context for GGUF model loading with mmap support."""
     
-    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Dict:
+    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Any:
         from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader
         sd, extra = gguf_sd_loader(state.unet_path)
-        # We need to somehow persist metadata. 
-        # For now, we attach it to the SD or handle it in instantiate via side channel?
-        # A cleaner way is to return it, but load signature is fixed.
-        # Let's attach to SD as hidden attribute or rely on instantiate re-reading if affordable.
-        # Actually, `gguf_sd_loader` returns (sd, extra).
-        # We can store extra on the context instance temporarily since contexts are short-lived per-op?
-        # YES, context instances are created per op in get_context.
-        self._temp_gguf_metadata = extra.get("metadata", {})
-        return sd
+        # Return tuple to cache metadata
+        metadata = extra.get("metadata", {})
+        return sd, metadata
     
     def prepare_state_dict(self, sd: Dict[str, torch.Tensor], config: "WorkerConfig") -> Dict[str, torch.Tensor]:
-        """GGUF: Strip prefixes and prepare for detection."""
-        keys = list(sd.keys())
-        
-        # The auto-detection (unet_prefix_from_state_dict) failed in previous runs (detected 'model.'), so we force 'diffusion_model.'
-        if any(k.startswith("diffusion_model.") for k in keys[:5]):
-             print(f"[GGUFContext {config.local_rank}] Detected 'diffusion_model.' prefix. Force-stripping for detection...")
-             import comfy.utils
-             sd = comfy.utils.state_dict_prefix_replace(sd, {"diffusion_model.": ""}, filter_keys=True)
-        
+        """GGUF: Legacy behavior was NOT to strip prefixes here (Comfy handles it)."""
+        # The stripping logic below was present in legacy code but Unused.
+        # Activating it caused regression. Restoring pass-through behavior.
+        # keys = list(sd.keys())
+        # if any(k.startswith("diffusion_model.") for k in keys[:5]):
+        #      # ...
+        #      pass
         return sd
     
     def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig") -> Dict:
         # GGUF library always uses mmap internally
         return self.load_state_dict_mmap(state, config)
     
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
         from raylight.expansion.comfyui_gguf.ops import GGMLOps
         from raylight.expansion.comfyui_gguf.nodes import GGUFModelPatcher
         import comfy.sd
@@ -238,9 +320,13 @@ class GGUFContext(ModelContext):
         
         # Build kwargs for metadata if supported
         kwargs = {}
+        # Metadata logic: If cache hit provided metadata, use it.
+        # Else try self._temp_gguf_metadata (legacy fallback, maybe redundant now)
+        gguf_meta = metadata if metadata is not None else getattr(self, "_temp_gguf_metadata", {})
+        
         valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
         if "metadata" in valid_params:
-            kwargs["metadata"] = getattr(self, "_temp_gguf_metadata", {})
+            kwargs["metadata"] = gguf_meta
         
         model = comfy.sd.load_diffusion_model_state_dict(
             isolated, 
@@ -252,8 +338,10 @@ class GGUFContext(ModelContext):
             raise RuntimeError(f"Could not load GGUF model: {state.unet_path}")
         
         model = GGUFModelPatcher.clone(model)
-        model.gguf_metadata = getattr(self, "_temp_gguf_metadata", {})
+        model.gguf_metadata = gguf_meta
         return model
+    
+
     
     def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
         """GGUF Soft-Offload: Restore mmap pointers to clear VRAM without copies."""
@@ -269,11 +357,13 @@ class GGUFContext(ModelContext):
             model.current_device = torch.device('cpu')
             
             # 3. Store in worker-level mmap cache to survive model swaps
-            mmap_cache = getattr(model, "mmap_cache", None)
-            if mmap_cache:
-                unet_path = getattr(model, "unet_path", None)
-                if unet_path:
-                    worker_mmap_cache[unet_path] = mmap_cache
+            # REMOVED: This overwrites the (sd, meta, checksum) tuple with just the dict,
+            # destroying the checksum. ModelContext.load already handles caching correctly.
+            # mmap_cache = getattr(model, "mmap_cache", None)
+            # if mmap_cache:
+            #     unet_path = getattr(model, "unet_path", None)
+            #     if unet_path:
+            #         worker_mmap_cache[unet_path] = mmap_cache
             
             # 4. Shared cleanup
             self._common_offload_cleanup(model, lora_manager, config)
@@ -282,13 +372,30 @@ class GGUFContext(ModelContext):
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
         if model is None:
             return
+            
+        print(f"[GGUFContext] Hot-loading to {device}...")
 
         # Re-hydrate mmap_cache from worker cache if needed
+        unet_path = getattr(model, "unet_path", None)
+        
         if not getattr(model, "mmap_cache", None):
-            unet_path = getattr(model, "unet_path", None)
             if unet_path and unet_path in state_cache:
-                print("[GGUFContext] Re-hydrating mmap_cache from LRU cache...")
-                model.mmap_cache = state_cache.get(unet_path)
+                print(f"[GGUFContext] Re-hydrating mmap_cache from LRU cache: {os.path.basename(unet_path)}")
+                cached = state_cache.get(unet_path)
+                
+                # Handle metadata/checksum cache format (tuple)
+                if isinstance(cached, tuple) and len(cached) >= 2 and isinstance(cached[0], dict):
+                    model.mmap_cache = cached[0]
+                else:
+                    # Legacy or direct dict
+                    model.mmap_cache = cached
+        
+        # ALWAYS Verify checksum if available in cache (ensure we didn't corrupt it)
+        if getattr(model, "mmap_cache", None) and unet_path and unet_path in state_cache:
+             cached = state_cache.get(unet_path)
+             if isinstance(cached, tuple) and len(cached) >= 3:
+                 stored_sum = cached[2]
+                 self._verify_checksum(model.mmap_cache, stored_sum, context_tag="GGUFContext")
         
         if hasattr(model, "load"):
             model.load(device, force_patch_weights=True)
@@ -319,7 +426,7 @@ class LazyTensorContext(ModelContext):
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path)
     
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
         """Instantiate model with lazy state dict (zero-copy until load)."""
         import comfy.sd
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
@@ -407,7 +514,7 @@ class LazyTensorContext(ModelContext):
     def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
         """Pointer-swap offload: swap GPU tensors back to mmap refs (like GGUF)."""
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import swap_model_to_mmap
-        
+         
         if model is not None:
             print(f"[LazyTensorContext {config.local_rank}] Soft-Offload: Performing Pointer Swap...")
             
@@ -468,7 +575,7 @@ class FSDPContext(ModelContext):
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path)
     
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
         from raylight.comfy_dist.sd import fsdp_load_diffusion_model_stat_dict
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
         from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
@@ -549,7 +656,7 @@ class VAEContext(LazyTensorContext):
         """VAE: No prefix stripping needed (unlike UNET)."""
         return sd
         
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
         """Instantiate VAE model using comfy.sd.VAE (Standard ComfyUI path)."""
         import comfy.sd
         import comfy.utils
@@ -588,6 +695,13 @@ class VAEContext(LazyTensorContext):
         # Store original sd for potential streaming optimization
         vae_model.mmap_cache = sd
         return vae_model
+
+    def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
+        """Hot reload VAE using stream_vae_to_device logic to restore from mmap."""
+        print(f"[VAEContext] Hot-loading VAE to {device} via mmap stream...")
+        self.stream_vae_to_device(model, device)
+
+
 
     def stream_vae_to_device(self, vae_model, device: torch.device) -> bool:
         """Stream VAE weights to GPU per-tensor (avoids RAM spike)."""

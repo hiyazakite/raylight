@@ -30,16 +30,8 @@ class VaeManager:
             model_options={},
         )
         
-        # 3. Load state dict (with mmap caching if available)
-        if ctx.use_mmap and state.cache_key in state_cache:
-             sd = state_cache.get(state.cache_key)
-        else:
-             sd = ctx.load_state_dict_mmap(state, config) if ctx.use_mmap else ctx.load_state_dict_standard(state, config)
-             if ctx.use_mmap:
-                 state_cache.put(state.cache_key, sd)
-
-        # 4. Instantiate model (creates VAE object with mmap_cache attached)
-        vae_model = ctx.instantiate_model(sd, state, config)
+        # 3. Unified Load (Handles Caching & Instantiation)
+        vae_model, _ = ctx.load(state, config, state_cache)
         
         # 5. Monkey patch decode optimizations
         vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)
@@ -196,11 +188,17 @@ class VaeManager:
         finally:
             # Release VAE from GPU VRAM using context's offload method
             # (Consistent with diffusion model pattern)
+            # Release VAE from GPU VRAM using context's offload method
+            # (Consistent with diffusion model pattern)
+            
+            # Use factory to get correct context type (VAE defaults to standard VAEContext)
+            # We don't have the original path easily here if not stored, 
+            # BUT VAEs are almost always standard unless we support GGUF VAEs (rare).
+            # For now, we reconstruct standard VAEContext or rely on what load_vae used.
+            # Strategy: Default to VAEContext since we don't persist 'ctx' in manager.
+            
             from raylight.distributed_worker.model_context import VAEContext
-            # We recreate a VAEContext just for offload logic, passing no mmap needed flag?
-            # VAEContext constructor is now `__init__(use_mmap=True)`.
-            # We need to pass dependencies to `offload`.
-            vae_ctx = VAEContext(use_mmap=True)
+            vae_ctx = VAEContext(use_mmap=config.parallel_dict.get("use_mmap", True))
             vae_ctx.offload(self.vae_model, lora_manager, {}, config)
             
             print(f"[RayWorker {config.local_rank}] VAE Offload in finally block complete.")

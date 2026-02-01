@@ -37,9 +37,6 @@ from raylight.distributed_worker.managers.sampler_manager import SamplerManager
 
 # Comfy cli args, does not get pass through into ray actor
 
-from .worker_config import WorkerConfig
-
-
 class RayWorker:
 
 
@@ -54,29 +51,15 @@ class RayWorker:
         self.model_type = None
         self.state_dict = None
         self.overwrite_cast_dtype = None
-        self.reload_params = None
         
-        # Create Immutable Config
-        self.config = WorkerConfig(
-            local_rank=self.local_rank,
-            device_id=self.device_id,
-            device=torch.device(f"cuda:{self.device_id}"),
-            parallel_dict=self.parallel_dict,
-            global_world_size=self.global_world_size
-        )
-
         # Managers
-        self.lora_manager = LoraManager() # Stateless
-        self.vae_manager = VaeManager() # Stateless
-        self.sampler_manager = SamplerManager() # Stateless initialization
+        self.lora_manager = LoraManager(self)
+        self.vae_manager = VaeManager(self)
+        self.sampler_manager = SamplerManager(self)
         
         # LRU cache for mmap'd state dicts (replaces worker_mmap_cache)
         from raylight.utils.cache import LRUStateCache
-        cache_size = parallel_dict.get("mmap_cache_size", 4) 
-        if cache_size < 3:
-            print(f"[RayWorker {self.local_rank}] WARNING: mmap_cache_size={cache_size} is too small for UNET+VAE. Forcing to 4.")
-            cache_size = 4
-        print(f"[RayWorker {self.local_rank}] Initialized LRU State Cache with size={cache_size}")
+        cache_size = parallel_dict.get("mmap_cache_size", 2)
         self.state_cache = LRUStateCache(max_size=cache_size)
         
         # Legacy alias for backward compatibility
@@ -129,7 +112,6 @@ class RayWorker:
         # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
         if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
             self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
-            self.config.device_mesh = self.device_mesh
         else:
             print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
 
@@ -233,13 +215,8 @@ class RayWorker:
         
         from raylight.distributed_worker.model_context import get_context
         unet_path = getattr(self.model, "unet_path", "")
-        ctx = get_context(unet_path, self.config)
-        ctx.offload(self.model, self.lora_manager, self.state_cache, self.config)
-        
-        # Clear references
-        self.model = None
-        self.current_unet_path = None
-        self.current_sd_ref = None
+        ctx = get_context(self, unet_path)
+        ctx.offload()
         
         print(f"[RayWorker {self.local_rank}] Offload complete.")
     
@@ -314,14 +291,13 @@ class RayWorker:
 
 
 
-
     def _load_via_context(self, unet_path, model_options, dequant_dtype=None, patch_dtype=None):
         """Unified internal loader that leverages ModelContext abstraction."""
         from raylight.distributed_worker.model_context import get_context, ModelState
         
         # Idempotency Check
         if (self.model is not None and 
-            getattr(self, "reload_params", None) and 
+            hasattr(self, "reload_params") and 
             self.reload_params.get("unet_path") == unet_path and
             self.reload_params.get("dequant_dtype") == dequant_dtype and
             self.reload_params.get("patch_dtype") == patch_dtype):
@@ -329,10 +305,8 @@ class RayWorker:
             return
 
         state = ModelState(unet_path, model_options, dequant_dtype, patch_dtype)
-        ctx = get_context(unet_path, self.config)
-        
-        # FUNCTIONAL LOAD: Update references from return values
-        self.model, self.reload_params = ctx.load(state, self.config, self.state_cache)
+        ctx = get_context(self, unet_path)
+        ctx.load(state)
         
         # Format flags and coordinating refs
         self.is_gguf = unet_path.lower().endswith(".gguf") or dequant_dtype is not None
@@ -426,22 +400,10 @@ class RayWorker:
             self.model = bnb_load_diffusion_model(unet_path)
 
     def load_lora(self, lora_path, strength_model, lora_config_hash=None):
-        self.reload_model_if_needed()
-        return self.lora_manager.load_lora(
-            self.model, 
-            self.config, 
-            lora_path, 
-            strength_model, 
-            lora_config_hash
-        )
+        return self.lora_manager.load_lora(lora_path, strength_model, lora_config_hash)
 
     def reapply_loras_for_config(self, config_hash):
-        self.reload_model_if_needed()
-        return self.lora_manager.reapply_loras_for_config(
-            self.model, 
-            self.config, 
-            config_hash
-        )
+        return self.lora_manager.reapply_loras_for_config(config_hash)
 
     def apply_model_sampling(self, model_sampling_patch):
         if self.model is not None:
@@ -454,9 +416,6 @@ class RayWorker:
         if not hasattr(self, 'base_sd_ref') or self.base_sd_ref is None:
             raise RuntimeError("Base Ref not set!")
         return self.base_sd_ref
-
-    def get_gguf_metadata(self):
-        return getattr(self, "gguf_metadata", {})
 
     def _enforce_zero_copy(self, state_dict):
         try:
@@ -536,19 +495,10 @@ class RayWorker:
         is_gguf = getattr(self, "is_gguf", False)
         if isinstance(state_dict, dict) and state_dict.get("is_gguf"):
             is_gguf = True
-        
-        # Determine path safely
-        unet_path = getattr(self, "current_unet_path", "")
-        if not unet_path:
-             # Fallback if unet_path isn't set (e.g. strict state dict load), rely on config or default
-             unet_path = "model.gguf" if is_gguf else "model.safetensors"
-
-        ctx = get_context(unet_path, self.config)
-        state_dict = ctx.prepare_state_dict(state_dict, self.config)
-        state = ModelState(unet_path=unet_path, model_options=model_options)
-        
-        self.model = ctx.instantiate_model(state_dict, state, self.config)
-        
+        ctx = get_context(self, "model.gguf" if is_gguf else "model.safetensors")
+        state_dict = ctx.prepare_state_dict(state_dict)
+        state = ModelState(unet_path=getattr(self, "current_unet_path", ""), model_options=model_options)
+        self.model = ctx.instantiate_model(state_dict, state)
         self._enforce_zero_copy(state_dict)
         self.is_model_loaded = True
         cleanup_memory()
@@ -556,20 +506,19 @@ class RayWorker:
     def reload_model_if_needed(self, load_device=None):
         from raylight.distributed_worker.model_context import get_context
         target_device = load_device if load_device is not None else self.device
+        if self.model is not None:
+            curr = getattr(self.model, "current_device", None)
+            if str(curr) == str(target_device):
+                return
         
-        # Check logic delegated to context, but we need to pass current state
+        needs_reload = self.model is None or (getattr(self.model, 'current_device', None) is not None and str(self.model.current_device) != str(target_device))
+        if not needs_reload:
+            return
+        
         if hasattr(self, 'reload_params') and self.reload_params:
             unet_path = self.reload_params.get("unet_path", "")
-            ctx = get_context(unet_path, self.config)
-            
-            # Context returns updated model/params if reload happened
-            self.model, self.reload_params = ctx.reload_if_needed(
-                self.model, 
-                target_device, 
-                self.reload_params, 
-                self.config, 
-                self.state_cache
-            )
+            ctx = get_context(self, unet_path)
+            ctx.reload_if_needed(target_device)
         elif hasattr(self, 'base_sd_ref') and self.base_sd_ref is not None:
             self.load_unet_from_state_dict(self.base_sd_ref, model_options={})
         else:
@@ -582,11 +531,11 @@ class RayWorker:
         ray.actor.exit_actor()
 
     def ray_vae_loader(self, vae_path):
-        self.vae_manager.load_vae(vae_path, self.config, self.state_cache)
+        self.vae_manager.load_vae(vae_path)
         self.vae_model = self.vae_manager.vae_model
 
     def ray_vae_release(self):
-        result = self.vae_manager.release_vae(self.local_rank)
+        result = self.vae_manager.release_vae()
         self.vae_model = None
         return result
 
@@ -597,7 +546,7 @@ class RayWorker:
         return self.vae_manager.get_spatial_compression()
 
     def _check_vae_health(self, samples, shard_index):
-        self.vae_manager.check_health(samples, shard_index, self.config)
+        self.vae_manager.check_health(samples, shard_index)
 
     def ray_vae_decode(
         self,
@@ -625,9 +574,6 @@ class RayWorker:
             mmap_path,
             mmap_shape,
             output_offset,
-            config=self.config,
-            lora_manager=self.lora_manager,
-            state_cache=self.state_cache,
         )
 
 
@@ -644,16 +590,9 @@ class RayWorker:
         sigmas,
         latent_image,
     ):
-        result, model_modified = self.sampler_manager.custom_sampler(
-            self.model,
-            self.config,
-            add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image,
-            state_dict=getattr(self, "state_dict", None)
+        return self.sampler_manager.custom_sampler(
+            add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image
         )
-        if model_modified:
-            print(f"[RayWorker {self.local_rank}] Model modified by SamplerManager (e.g. baked weights). Clearing reload params.")
-            self.reload_params = None
-        return result
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
@@ -674,19 +613,11 @@ class RayWorker:
         force_full_denoise=False,
         sigmas=None,
     ):
-        result, model_modified = self.sampler_manager.common_ksampler(
-            self.model,
-            self.config,
+        return self.sampler_manager.common_ksampler(
             seed, steps, cfg, sampler_name, scheduler, positive, negative,
             latent, denoise, disable_noise, start_step, last_step,
-            force_full_denoise, sigmas,
-             state_dict=getattr(self, "state_dict", None)
+            force_full_denoise, sigmas
         )
-        if model_modified:
-            print(f"[RayWorker {self.local_rank}] Model modified by SamplerManager (e.g. baked weights). Clearing reload params.")
-            self.reload_params = None
-        return result
-
 
 
 class RayCOMMTester:

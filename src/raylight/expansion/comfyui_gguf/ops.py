@@ -201,10 +201,6 @@ class GGMLLayer(torch.nn.Module):
             destination[prefix + "temp.weight"] = temp
 
         return
-        # This would return the dequantized state dict
-        destination[prefix + "weight"] = self.get_weight(self.weight)
-        if bias is not None:
-            destination[prefix + "bias"] = self.get_weight(self.bias)
 
     def get_weight(self, tensor, dtype):
         if tensor is None:

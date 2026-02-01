@@ -160,10 +160,10 @@ class RayInitializer:
                     "tooltip": "Use memory-mapped (zero-copy) model loading. Enabled: parallel loading with OS page cache sharing. Disabled: sequential leader-follower loading (use if mmap causes issues)."
                 }),
                 "mmap_cache_size": ("INT", {
-                    "default": 2,
+                    "default": 4, # Increased default for safety
                     "min": 1,
-                    "max": 10,
-                    "tooltip": "LRU cache size for mmap'd model state dicts. Higher values keep more models in RAM for fast reloading."
+                    "max": 100,
+                    "tooltip": "Number of models to keep in mmap cache (NOT GB). Zero-copy, so high values are cheap."
                 }),
             }
         }
