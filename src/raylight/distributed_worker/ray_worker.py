@@ -234,7 +234,7 @@ class RayWorker:
         from raylight.distributed_worker.model_context import get_context
         unet_path = getattr(self.model, "unet_path", "")
         ctx = get_context(unet_path, self.config)
-        ctx.offload(self.model, self.lora_manager, self.state_cache, self.config)
+        ctx.offload(self.model, self.lora_manager, self.state_cache, self.config)  # type: ignore[arg-type]
         
         # Clear references
         self.model = None
@@ -320,11 +320,12 @@ class RayWorker:
         from raylight.distributed_worker.model_context import get_context, ModelState
         
         # Idempotency Check
+        rp = getattr(self, "reload_params", None)
         if (self.model is not None and 
-            getattr(self, "reload_params", None) and 
-            self.reload_params.get("unet_path") == unet_path and
-            self.reload_params.get("dequant_dtype") == dequant_dtype and
-            self.reload_params.get("patch_dtype") == patch_dtype):
+            rp is not None and 
+            rp.get("unet_path") == unet_path and
+            rp.get("dequant_dtype") == dequant_dtype and
+            rp.get("patch_dtype") == patch_dtype):
             print(f"[RayWorker {self.local_rank}] Idempotent Load: {os.path.basename(unet_path)} already loaded.")
             return
 
