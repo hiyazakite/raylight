@@ -10,6 +10,8 @@ import os
 
 import torch
 
+from raylight.utils.checksum import compute_model_checksum, verify_model_checksum
+
 if TYPE_CHECKING:
     from .worker_config import WorkerConfig
     from .managers.lora_manager import LoraManager
@@ -65,7 +67,7 @@ class ModelContext(ABC):
         """Fast VRAM transfer for soft-reloaded models."""
         pass
     
-    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
+    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
         """Standard offload: Move weights to CPU and release tracking."""
         print(f"[{self.__class__.__name__}] Standard Offload: Releasing VRAM...")
         
@@ -75,7 +77,7 @@ class ModelContext(ABC):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _common_offload_cleanup(self, model: Any, lora_manager: "LoraManager", config: "WorkerConfig"):
+    def _common_offload_cleanup(self, model: Any, lora_manager: Optional["LoraManager"], config: "WorkerConfig"):
         """Shared post-offload cleanup for all model formats."""
         # Clear LoRA tracking for fresh re-application after reload
         if lora_manager:
@@ -115,81 +117,29 @@ class ModelContext(ABC):
     
     # ─── Shared Logic ────────────────────────────────────────
 
-
-    
-    def _compute_checksum(self, sd: Dict[str, Any]) -> str:
-        """Compute a lightweight checksum for debug verification."""
-        try:
-            keys = sorted(list(sd.keys()))
-            if not keys:
-                return "empty"
-            
-            # Sample first, middle, last
-            indices = [0, len(keys)//2, len(keys)-1]
-            checksum_parts = []
-            for idx in indices:
-                k = keys[idx]
-                v = sd[k]
-                if hasattr(v, "shape"):
-                    meta = f"{k}:{v.shape}:{v.dtype}"
-                    # Add custom attributes check for GGML
-                    if hasattr(v, "tensor_type"):
-                        meta += f":{v.tensor_type}"
-                    
-                    # Add small data sample (first value)
-                    # Use .flatten()[0] to avoid shape issues, verify it's a tensor
-                    if v.numel() > 0:
-                        val = v.flatten()[0].item() if not v.is_meta else 0
-                        meta += f":{val:.4f}"
-                    checksum_parts.append(meta)
-            
-            return "|".join(checksum_parts)
-        except Exception as e:
-            return f"checksum_error:{e}"
-
-    def _verify_checksum(self, sd: Dict[str, Any], stored_checksum: str, context_tag: str = "ModelContext") -> bool:
-        """Verify state dict against stored checksum and log results.
-        
-        Args:
-            sd: The state dict to check
-            stored_checksum: The trusted checksum from cache
-            context_tag: Tag for logging (e.g. 'GGUFContext')
-            
-        Returns:
-            bool: True if checksum matches, False otherwise
-        """
-        current_checksum = self._compute_checksum(sd)
-        if stored_checksum != current_checksum:
-            print(f"[{context_tag}] CRITICAL: Cache Corruption Detected!")
-            print(f"  Stored:  {stored_checksum}")
-            print(f"  Current: {current_checksum}")
-            return False
-        else:
-            print(f"[{context_tag}] Cache Integrity Verified (Checksum match).")
-            return True
-
     def load(self, state: ModelState, config: "WorkerConfig", state_cache: Any) -> Tuple[Any, Dict[str, Any]]:
-        """Full load with cache check (shared logic for all formats).
+        """Unified model loading logic.
         
-        Returns:
-            (model, reload_params)
+        1. Check cache for existing state dict.
+        2. If not in cache, load from disk (mmap or standard).
+        3. Prepare state dict (e.g., strip prefixes).
+        4. Instantiate model.
+        5. Perform post-load setup.
         """
-        # 1. Cache check (only if mmap enabled)
-        metadata = None
-        checksum = None
+        sd = None
+        metadata = {}
         
-        if self.use_mmap and state.cache_key in state_cache:
-            print(f"[ModelContext] LRU Cache Hit: {os.path.basename(state.cache_key)}")
-            cached = state_cache.get(state.cache_key)
-            
-            # Handle metadata-aware cache format
+        # 1. Check cache
+        cached = state_cache.get(state.cache_key)
+        if cached is not None:
+            print(f"[ModelContext] Cache Hit: {os.path.basename(state.cache_key)}")
             if isinstance(cached, tuple) and len(cached) >= 2 and isinstance(cached[0], dict):
                  sd = cached[0]
                  metadata = cached[1]
                  # Retrieve checksum if present (v3 format: sd, meta, checksum)
                  if len(cached) >= 3:
                      stored_checksum = cached[2]
-                     self._verify_checksum(sd, stored_checksum, context_tag="ModelContext")
+                     verify_model_checksum(sd, stored_checksum, metadata, context_tag="ModelContext")
             else:
                  sd = cached
         else:
@@ -202,14 +152,14 @@ class ModelContext(ABC):
                 if isinstance(res, tuple) and len(res) == 2:
                     sd, metadata = res
                     # Compute checksum on fresh load
-                    checksum = self._compute_checksum(sd)
+                    checksum = compute_model_checksum(sd, metadata)
                     # Cache tuple with checksum
                     state_cache.put(state.cache_key, (sd, metadata, checksum))
                     print(f"[ModelContext] Cached model with checksum: {checksum}")
                 else:
                     sd = res
                     # Standard cache (tuple with empty meta and checksum)
-                    checksum = self._compute_checksum(sd)
+                    checksum = compute_model_checksum(sd)
                     state_cache.put(state.cache_key, (sd, {}, checksum))
             else:
                 print(f"[ModelContext] Standard Load: {os.path.basename(state.cache_key)}")
@@ -222,6 +172,9 @@ class ModelContext(ABC):
         # Note: If prepare_state_dict modifies in-place, we must copy first if we want cache pristine.
         # But GGUFContext usually returns a new dict if keys change.
         # For safety with cache references, we can check logic.
+        if not isinstance(sd, dict):
+            raise RuntimeError(f"State dict must be a dict, got {type(sd)} for {state.unet_path}")
+            
         sd_to_use = self.prepare_state_dict(sd, config)
         
         # 4. Instantiate model
@@ -343,7 +296,7 @@ class GGUFContext(ModelContext):
     
 
     
-    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
+    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
         """GGUF Soft-Offload: Restore mmap pointers to clear VRAM without copies."""
         if model is not None:
             print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload: Performing Zero-Copy Pointer Swap...")
@@ -395,7 +348,10 @@ class GGUFContext(ModelContext):
              cached = state_cache.get(unet_path)
              if isinstance(cached, tuple) and len(cached) >= 3:
                  stored_sum = cached[2]
-                 self._verify_checksum(model.mmap_cache, stored_sum, context_tag="GGUFContext")
+                 # cached[1] is metadata
+                 meta = cached[1] if isinstance(cached[1], dict) else None
+                 if isinstance(model.mmap_cache, dict):
+                     verify_model_checksum(model.mmap_cache, stored_sum, meta, context_tag="GGUFContext")
         
         if hasattr(model, "load"):
             model.load(device, force_patch_weights=True)
@@ -511,7 +467,7 @@ class LazyTensorContext(ModelContext):
                 model.model.to(device)
             return False
     
-    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
+    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
         """Pointer-swap offload: swap GPU tensors back to mmap refs (like GGUF)."""
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import swap_model_to_mmap
          
@@ -551,6 +507,16 @@ class LazyTensorContext(ModelContext):
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
         """Hot reload: re-materialize from mmap refs to GPU (like GGUF)."""
         print(f"[LazyTensorContext] Hot reload to {device}...")
+        
+        # Verify checksum if available
+        unet_path = getattr(model, "unet_path", None)
+        if unet_path and unet_path in state_cache:
+            cached = state_cache.get(unet_path)
+            if isinstance(cached, tuple) and len(cached) >= 3:
+                stored_sum = cached[2]
+                meta = cached[1] if isinstance(cached[1], dict) else None
+                if isinstance(model.mmap_cache, dict):
+                    verify_model_checksum(model.mmap_cache, stored_sum, meta, context_tag="LazyTensorContext")
         
         # Model structure still exists, just reload weights to GPU
         if model is not None and hasattr(model, 'load'):
@@ -618,7 +584,7 @@ class FSDPContext(ModelContext):
         model.fsdp_state_dict = state_dict
         return model
     
-    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
+    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
         """
         FSDP offload: release both model and state dict
         FSDP requires full reload currently due to its nature (sharding)
@@ -699,6 +665,17 @@ class VAEContext(LazyTensorContext):
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
         """Hot reload VAE using stream_vae_to_device logic to restore from mmap."""
         print(f"[VAEContext] Hot-loading VAE to {device} via mmap stream...")
+        
+        # Verify checksum if available
+        unet_path = getattr(model, "unet_path", None)
+        if unet_path and unet_path in state_cache:
+            cached = state_cache.get(unet_path)
+            if isinstance(cached, tuple) and len(cached) >= 3:
+                stored_sum = cached[2]
+                meta = cached[1] if isinstance(cached[1], dict) else None
+                if isinstance(model.mmap_cache, dict):
+                    verify_model_checksum(model.mmap_cache, stored_sum, meta, context_tag="VAEContext")
+
         self.stream_vae_to_device(model, device)
 
 
@@ -736,7 +713,7 @@ class VAEContext(LazyTensorContext):
                 vae_model.first_stage_model.to(device)
             return False
 
-    def offload(self, model: Any, lora_manager: "LoraManager", worker_mmap_cache: Dict, config: "WorkerConfig"):
+    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
         """Zero-copy soft-offload for VAE."""
         
         if model is None:
