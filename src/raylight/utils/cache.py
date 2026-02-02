@@ -5,6 +5,19 @@ evicting least-recently-used entries when capacity is exceeded.
 """
 from collections import OrderedDict
 from typing import Dict, Any, Optional
+from dataclasses import dataclass, field
+
+
+@dataclass
+class CachedState:
+    """Structured cache entry for model state."""
+    state_dict: Dict[str, Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    checksum: Optional[str] = None
+    
+    @property
+    def is_valid(self) -> bool:
+        return self.state_dict is not None
 
 
 class LRUStateCache:
@@ -17,13 +30,13 @@ class LRUStateCache:
                       When exceeded, least-recently-used entry is evicted.
         """
         self.max_size = max_size
-        self._cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._cache: OrderedDict[str, CachedState] = OrderedDict()
     
-    def get(self, key: str) -> Optional[Dict[str, Any]]:
+    def get(self, key: str) -> Optional[CachedState]:
         """Get cached state dict, marking it as recently used.
         
         Returns:
-            State dict if cached, None otherwise.
+            CachedState if cached, None otherwise.
         """
         if key in self._cache:
             self._cache.move_to_end(key)  # Mark as recently used
@@ -32,27 +45,31 @@ class LRUStateCache:
         print(f"[LRUStateCache] Miss for key: {key}")
         return None
 
-    def __getitem__(self, key: str) -> Dict[str, Any]:
+    def __getitem__(self, key: str) -> CachedState:
         """Dictionary-style get."""
         val = self.get(key)
         if val is None:
             raise KeyError(key)
         return val
     
-    def __setitem__(self, key: str, value: Dict[str, Any]):
+    def __setitem__(self, key: str, value: CachedState):
         """Dictionary-style put."""
         self.put(key, value)
     
-    def put(self, key: str, value: Dict[str, Any]) -> Optional[str]:
+    def put(self, key: str, value: CachedState) -> Optional[str]:
         """Add or update state dict in cache.
         
         Args:
             key: Cache key (typically file path)
-            value: State dict to cache
+            value: CachedState object
             
         Returns:
             Key of evicted entry if eviction occurred, None otherwise.
         """
+        if not isinstance(value, CachedState):
+             # Runtime guard to prevent regression during migration
+             raise ValueError(f"LRUStateCache only accepts CachedState, got {type(value)}")
+
         evicted_key = None
         
         if key in self._cache:

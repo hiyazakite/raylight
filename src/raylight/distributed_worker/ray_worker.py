@@ -237,11 +237,12 @@ class RayWorker:
         ctx.offload(self.model, self.lora_manager, self.state_cache, self.config)  # type: ignore[arg-type]
         
         # Clear references
-        self.model = None
-        self.current_unet_path = None
-        self.current_sd_ref = None
+        # self.model = None  <-- DISABLED to enable Hot-Load (Soft Offload)
+        # self.current_unet_path = None
+        # self.current_sd_ref = None
         
-        print(f"[RayWorker {self.local_rank}] Offload complete.")
+        print(f"[RayWorker {self.local_rank}] Offload complete (Model object preserved for hot-reload).")
+
     
     def _common_offload_cleanup(self):
         """Shared post-offload cleanup for all model formats."""
@@ -330,7 +331,7 @@ class RayWorker:
             return
 
         state = ModelState(unet_path, model_options, dequant_dtype, patch_dtype)
-        ctx = get_context(unet_path, self.config)
+        ctx = get_context(unet_path, self.config, model_options=model_options)
         
         # FUNCTIONAL LOAD: Update references from return values
         self.model, self.reload_params = ctx.load(state, self.config, self.state_cache)
@@ -357,11 +358,7 @@ class RayWorker:
         with monitor_memory(f"RayWorker {self.local_rank} - load_unet", device=self.device):
             self.current_unet_path = unet_path
             
-            # BitsAndBytes (Legacy path for now)
-            if "bnb_4bit" in model_options or "load_in_4bit" in model_options:
-                return self.load_bnb_unet(unet_path)
-
-            # Unified Path: FSDP, GGUF & Safetensors
+            # Unified Path: FSDP, GGUF, Safetensors & BNB
             self._load_via_context(unet_path, model_options)
             
             # FSDP Specific: Link the lazy state dict to the patcher
@@ -401,30 +398,7 @@ class RayWorker:
         else:
              raise ValueError("[RayWorker] Cannot RELOAD GGUF: Missing reload params for parallel loading.")
 
-    def load_bnb_unet(self, unet_path):
-        if self.parallel_dict["is_fsdp"] is True:
-            # Inline legacy patches for BNB FSDP
-            import comfy.model_patcher as model_patcher
-            import comfy.model_management as model_management
-            from raylight.comfy_dist.model_management import cleanup_models_gc
-            from raylight.comfy_dist.model_patcher import LowVramPatch
-            model_patcher.LowVramPatch = LowVramPatch
-            model_management.cleanup_models_gc = cleanup_models_gc
-
-            from raylight.comfy_dist.sd import fsdp_bnb_load_diffusion_model
-            from torch.distributed.fsdp import FSDPModule
-            
-            m = getattr(self.model, "model", None)
-            if m is not None and isinstance(getattr(m, "diffusion_model", None), FSDPModule):
-                del self.model
-                self.model = None
-
-            self.model, self.state_dict = fsdp_bnb_load_diffusion_model(
-                unet_path, self.local_rank, self.device_mesh, self.is_cpu_offload,
-            )
-        else:
-            from raylight.comfy_dist.sd import bnb_load_diffusion_model
-            self.model = bnb_load_diffusion_model(unet_path)
+    # load_bnb_unet removed - migrated to BNBContext
 
     def load_lora(self, lora_path, strength_model, lora_config_hash=None):
         self.reload_model_if_needed()
@@ -459,50 +433,7 @@ class RayWorker:
     def get_gguf_metadata(self):
         return getattr(self, "gguf_metadata", {})
 
-    def _enforce_zero_copy(self, state_dict):
-        try:
-             count = 0
-             cast_count = 0
-             prefixes = ["", "model.diffusion_model.", "diffusion_model."]
-             if self.model is None or not hasattr(self.model, "model") or self.model.model is None:
-                 print("[Raylight] Zero-Copy check skipped: No model loaded.")
-                 return
-             
-             for name, param in self.model.model.named_parameters():
-                 key_found = None
-                 if name in state_dict:
-                     key_found = name
-                 else:
-                     for p in prefixes:
-                         if (p + name) in state_dict:
-                             key_found = p + name
-                             break
-                 
-                 if not key_found:
-                     for p in ["diffusion_model.", "model.diffusion_model."]:
-                         if name.startswith(p):
-                             stripped_name = name[len(p):]
-                             if stripped_name in state_dict:
-                                 key_found = stripped_name
-                                 break
-                 
-                 if key_found:
-                     shared_tensor = state_dict[key_found]
-                     if param.data_ptr() != shared_tensor.data_ptr():
-                         if param.dtype == shared_tensor.dtype and param.shape == shared_tensor.shape:
-                             param.data = shared_tensor
-                             count += 1
-                         elif param.shape == shared_tensor.shape:
-                              param.data = shared_tensor
-                              cast_count += 1
 
-             if count > 0 or cast_count > 0:
-                 print(f"[Raylight] Memory Sharing ENFORCED: {count} exact + {cast_count} casted parameters linked back.")
-                 cleanup_memory()
-             else:
-                 print("[Raylight] Zero-Copy check passed.")
-        except Exception as e:
-            print(f"[Raylight] Memory Optimization Error: {e}")
 
     def load_unet_from_state_dict(self, state_dict, model_options):
         import ray
@@ -526,12 +457,7 @@ class RayWorker:
                  self.is_model_loaded = True
                  return
 
-            print(f"[RayWorker {self.local_rank}] Fallback: Standard Load...")
-            import comfy.sd
-            self.model = comfy.sd.load_diffusion_model_state_dict(state_dict, model_options=model_options)
-            if self.model is not None and hasattr(self.model, "model") and self.model.model is not None:
-                if next(self.model.model.parameters()).device.type == 'meta':
-                     self.model.model.to("cpu")
+
 
         from raylight.distributed_worker.model_context import get_context, ModelState
         is_gguf = getattr(self, "is_gguf", False)
@@ -546,11 +472,28 @@ class RayWorker:
 
         ctx = get_context(unet_path, self.config)
         state_dict = ctx.prepare_state_dict(state_dict, self.config)
-        state = ModelState(unet_path=unet_path, model_options=model_options)
+        
+        # FIX: Ensure GGUF config is propagated during full reload
+        dequant_dtype = None
+        patch_dtype = None
+        if hasattr(self, "reload_params") and self.reload_params:
+             dequant_dtype = self.reload_params.get("dequant_dtype")
+             patch_dtype = self.reload_params.get("patch_dtype")
+        # Also check model_options if passed explicitly
+        if isinstance(model_options, dict):
+             if "dequant_dtype" in model_options: dequant_dtype = model_options["dequant_dtype"]
+             if "patch_dtype" in model_options: patch_dtype = model_options["patch_dtype"]
+
+        state = ModelState(
+             unet_path=unet_path, 
+             model_options=model_options,
+             dequant_dtype=dequant_dtype,
+             patch_dtype=patch_dtype
+        )
+
         
         self.model = ctx.instantiate_model(state_dict, state, self.config)
         
-        self._enforce_zero_copy(state_dict)
         self.is_model_loaded = True
         cleanup_memory()
 
