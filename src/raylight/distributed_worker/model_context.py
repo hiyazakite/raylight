@@ -11,6 +11,7 @@ import os
 import torch
 
 from raylight.utils.checksum import compute_model_checksum, verify_model_checksum
+from raylight.utils.cache import CachedState
 
 if TYPE_CHECKING:
     from .worker_config import WorkerConfig
@@ -133,15 +134,17 @@ class ModelContext(ABC):
         cached = state_cache.get(state.cache_key)
         if cached is not None:
             print(f"[ModelContext] Cache Hit: {os.path.basename(state.cache_key)}")
-            if isinstance(cached, tuple) and len(cached) >= 2 and isinstance(cached[0], dict):
-                 sd = cached[0]
-                 metadata = cached[1]
-                 # Retrieve checksum if present (v3 format: sd, meta, checksum)
-                 if len(cached) >= 3:
-                     stored_checksum = cached[2]
-                     verify_model_checksum(sd, stored_checksum, metadata, context_tag="ModelContext")
+            
+            # Handle structured CachedState
+            if isinstance(cached, CachedState):
+                sd = cached.state_dict
+                metadata = cached.metadata
+                if cached.checksum:
+                    verify_model_checksum(sd, cached.checksum, metadata, context_tag="ModelContext")
             else:
-                 sd = cached
+                 # Should not happen if cache is strictly typed
+                 print(f"[ModelContext] Warning: Invalid cache entry type: {type(cached)}")
+                 return None, {}
         else:
             # 2. Disk load (mmap or standard based on toggle)
             if self.use_mmap:
@@ -151,16 +154,18 @@ class ModelContext(ABC):
                 # Metadata aware return
                 if isinstance(res, tuple) and len(res) == 2:
                     sd, metadata = res
-                    # Compute checksum on fresh load
-                    checksum = compute_model_checksum(sd, metadata)
-                    # Cache tuple with checksum
-                    state_cache.put(state.cache_key, (sd, metadata, checksum))
-                    print(f"[ModelContext] Cached model with checksum: {checksum}")
                 else:
                     sd = res
-                    # Standard cache (tuple with empty meta and checksum)
-                    checksum = compute_model_checksum(sd)
-                    state_cache.put(state.cache_key, (sd, {}, checksum))
+                
+                # Compute checksum
+                checksum = compute_model_checksum(sd, metadata)
+                
+                # Store as CachedState
+                cached_entry = CachedState(state_dict=sd, metadata=metadata, checksum=checksum)
+                state_cache.put(state.cache_key, cached_entry)
+                
+                print(f"[ModelContext] Cached model with checksum: {checksum}")
+
             else:
                 print(f"[ModelContext] Standard Load: {os.path.basename(state.cache_key)}")
                 sd = self.load_state_dict_standard(state, config)
@@ -266,6 +271,11 @@ class GGUFContext(ModelContext):
             else:
                 setattr(ops.Linear, "patch_dtype", getattr(torch, state.patch_dtype))
         
+        print(f"[GGUFContext DEBUG] Instantiate Config | Dequant: {state.dequant_dtype} | Patch: {state.patch_dtype}")
+
+        
+        # Use helper for consistency (optional refactor later, but leaving inline for now to minimize churn)
+        
         # CRITICAL: Use shallow dict copy, NOT deep tensor clone!
         # sd.copy() copies dict keys/values but keeps tensor data shared (mmap refs intact)
         # This matches original gguf_load_diffusion_model behavior
@@ -296,6 +306,24 @@ class GGUFContext(ModelContext):
     
 
     
+    def _apply_ops_config(self, ops, dequant_dtype, patch_dtype):
+        """Helper to apply GGUF ops configuration."""
+        print(f"[GGUFContext DEBUG] Applying Ops Config | Dequant: {dequant_dtype} | Patch: {patch_dtype}")
+        if dequant_dtype and dequant_dtype not in ("default", None):
+            if dequant_dtype == "target":
+                setattr(ops.Linear, "dequant_dtype", dequant_dtype)
+            else:
+                setattr(ops.Linear, "dequant_dtype", getattr(torch, dequant_dtype, None))
+        
+        if patch_dtype and patch_dtype not in ("default", None):
+            if patch_dtype == "target":
+                setattr(ops.Linear, "patch_dtype", patch_dtype)
+            else:
+                setattr(ops.Linear, "patch_dtype", getattr(torch, patch_dtype, None))
+        
+        print(f"[GGUFContext DEBUG] Ops Config Result | Linear.dequant_dtype: {getattr(ops.Linear, 'dequant_dtype', 'None')} | Linear.patch_dtype: {getattr(ops.Linear, 'patch_dtype', 'None')}")
+
+
     def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
         """GGUF Soft-Offload: Restore mmap pointers to clear VRAM without copies."""
         if model is not None:
@@ -309,16 +337,7 @@ class GGUFContext(ModelContext):
             model.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
             model.current_device = torch.device('cpu')
             
-            # 3. Store in worker-level mmap cache to survive model swaps
-            # REMOVED: This overwrites the (sd, meta, checksum) tuple with just the dict,
-            # destroying the checksum. ModelContext.load already handles caching correctly.
-            # mmap_cache = getattr(model, "mmap_cache", None)
-            # if mmap_cache:
-            #     unet_path = getattr(model, "unet_path", None)
-            #     if unet_path:
-            #         worker_mmap_cache[unet_path] = mmap_cache
-            
-            # 4. Shared cleanup
+            # 3. Shared cleanup
             self._common_offload_cleanup(model, lora_manager, config)
             print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload Complete.")
     
@@ -328,6 +347,18 @@ class GGUFContext(ModelContext):
             
         print(f"[GGUFContext] Hot-loading to {device}...")
 
+        # Restore GGUF ops configuration (Critical for performance!)
+        # The global class attributes on GGMLOps.Linear might have been lost/reset
+        if hasattr(model, "model_options"):
+            ops = model.model_options.get("custom_operations")
+            if ops:
+                self._apply_ops_config(
+                    ops, 
+                    reload_params.get("dequant_dtype"), 
+                    reload_params.get("patch_dtype")
+                )
+
+
         # Re-hydrate mmap_cache from worker cache if needed
         unet_path = getattr(model, "unet_path", None)
         
@@ -336,22 +367,16 @@ class GGUFContext(ModelContext):
                 print(f"[GGUFContext] Re-hydrating mmap_cache from LRU cache: {os.path.basename(unet_path)}")
                 cached = state_cache.get(unet_path)
                 
-                # Handle metadata/checksum cache format (tuple)
-                if isinstance(cached, tuple) and len(cached) >= 2 and isinstance(cached[0], dict):
-                    model.mmap_cache = cached[0]
-                else:
-                    # Legacy or direct dict
-                    model.mmap_cache = cached
+                # Structured CachedState hit
+                if isinstance(cached, CachedState):
+                    model.mmap_cache = cached.state_dict
         
         # ALWAYS Verify checksum if available in cache (ensure we didn't corrupt it)
         if getattr(model, "mmap_cache", None) and unet_path and unet_path in state_cache:
              cached = state_cache.get(unet_path)
-             if isinstance(cached, tuple) and len(cached) >= 3:
-                 stored_sum = cached[2]
-                 # cached[1] is metadata
-                 meta = cached[1] if isinstance(cached[1], dict) else None
+             if isinstance(cached, CachedState) and cached.checksum:
                  if isinstance(model.mmap_cache, dict):
-                     verify_model_checksum(model.mmap_cache, stored_sum, meta, context_tag="GGUFContext")
+                     verify_model_checksum(model.mmap_cache, cached.checksum, cached.metadata, context_tag="GGUFContext")
         
         if hasattr(model, "load"):
             model.load(device, force_patch_weights=True)
@@ -488,10 +513,10 @@ class LazyTensorContext(ModelContext):
             if diffusion_model is not None and mmap_cache:
                 swap_model_to_mmap(diffusion_model, mmap_cache)
                 
-                # Store in worker-level mmap cache to survive model swaps
-                unet_path = getattr(model, "unet_path", None)
-                if unet_path:
-                    worker_mmap_cache[unet_path] = mmap_cache
+                # Swapped GPU tensors back to mmap refs.
+                # No need to store back to worker_mmap_cache as ModelContext.load already manages
+                # the rich CachedState (checksum, metadata) in the cache.
+                pass
             
             model.current_device = torch.device('cpu')
             
@@ -512,11 +537,11 @@ class LazyTensorContext(ModelContext):
         unet_path = getattr(model, "unet_path", None)
         if unet_path and unet_path in state_cache:
             cached = state_cache.get(unet_path)
-            if isinstance(cached, tuple) and len(cached) >= 3:
-                stored_sum = cached[2]
-                meta = cached[1] if isinstance(cached[1], dict) else None
+            
+            # Structured CachedState
+            if isinstance(cached, CachedState) and cached.checksum:
                 if isinstance(model.mmap_cache, dict):
-                    verify_model_checksum(model.mmap_cache, stored_sum, meta, context_tag="LazyTensorContext")
+                    verify_model_checksum(model.mmap_cache, cached.checksum, cached.metadata, context_tag="LazyTensorContext")
         
         # Model structure still exists, just reload weights to GPU
         if model is not None and hasattr(model, 'load'):
@@ -670,11 +695,11 @@ class VAEContext(LazyTensorContext):
         unet_path = getattr(model, "unet_path", None)
         if unet_path and unet_path in state_cache:
             cached = state_cache.get(unet_path)
-            if isinstance(cached, tuple) and len(cached) >= 3:
-                stored_sum = cached[2]
-                meta = cached[1] if isinstance(cached[1], dict) else None
+            
+            # Structured CachedState
+            if isinstance(cached, CachedState) and cached.checksum:
                 if isinstance(model.mmap_cache, dict):
-                    verify_model_checksum(model.mmap_cache, stored_sum, meta, context_tag="VAEContext")
+                    verify_model_checksum(model.mmap_cache, cached.checksum, cached.metadata, context_tag="VAEContext")
 
         self.stream_vae_to_device(model, device)
 
@@ -780,14 +805,56 @@ class VAEContext(LazyTensorContext):
         mem_now = torch.cuda.memory_allocated(config.device) / 1e9
         print(f"[VAEContext {config.local_rank}] Post-Offload VRAM: {mem_now:.2f}GB")
 
+class BNBContext(ModelContext):
+    """Context for BitsAndBytes (4-bit) model loading."""
+    
+    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig") -> Dict:
+        # BNB loaders currently handle loading from disk internally so we return a dummy dict
+        return {"__bnb_internal__": True}
 
-def get_context(path: str, config: "WorkerConfig", model_type: str = "unet") -> ModelContext:
+    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Dict:
+         return self.load_state_dict_standard(state, config)
+
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
+        unet_path = state.unet_path
+        
+        if config.is_fsdp:
+            # Inline patches for BNB FSDP (ported from RayWorker)
+            import comfy.model_patcher as model_patcher
+            import comfy.model_management as model_management
+            from raylight.comfy_dist.model_management import cleanup_models_gc
+            from raylight.comfy_dist.model_patcher import LowVramPatch
+            
+            model_patcher.LowVramPatch = LowVramPatch
+            model_management.cleanup_models_gc = cleanup_models_gc
+
+            from raylight.comfy_dist.sd import fsdp_bnb_load_diffusion_model
+            
+            model, state_dict = fsdp_bnb_load_diffusion_model(
+                unet_path, 
+                config.local_rank, 
+                config.device_mesh, 
+                config.parallel_dict.get("fsdp_cpu_offload", False)
+            )
+            model.fsdp_state_dict = state_dict
+            return model
+        else:
+            from raylight.comfy_dist.sd import bnb_load_diffusion_model
+            return bnb_load_diffusion_model(unet_path)
+
+    def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
+        # BNB models are difficult to hot-load due to 4-bit/CPU offload config
+        pass
+
+
+def get_context(path: str, config: "WorkerConfig", model_type: str = "unet", model_options: Optional[Dict] = None) -> ModelContext:
     """Factory function to select appropriate context based on config and file type.
     
     Args:
         path: Path to model file
         config: Worker configuration
         model_type: "unet" or "vae"
+        model_options: Optional model load options (needed for BNB detection)
         
     Returns:
         Appropriate ModelContext subclass instance
@@ -796,6 +863,9 @@ def get_context(path: str, config: "WorkerConfig", model_type: str = "unet") -> 
     
     if model_type == "vae":
         return VAEContext(use_mmap=use_mmap)
+    
+    if model_options and ("bnb_4bit" in model_options or "load_in_4bit" in model_options):
+        return BNBContext(use_mmap=False) # BNB manages its own memory/loading
         
     if getattr(config, "is_fsdp", False):
         if path.lower().endswith(".gguf"):
