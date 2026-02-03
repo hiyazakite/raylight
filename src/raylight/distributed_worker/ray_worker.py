@@ -192,7 +192,7 @@ class RayWorker:
             raise ValueError("Model being set is not meta, can cause OOM in large model")
 
     def set_state_dict(self):
-        if self.model is not None:
+        if self.model is not None and self.state_dict is not None:
             self.model.set_fsdp_state_dict(self.state_dict)
 
     def get_compute_capability(self):
@@ -332,6 +332,13 @@ class RayWorker:
 
         state = ModelState(unet_path, model_options, dequant_dtype, patch_dtype)
         ctx = get_context(unet_path, self.config, model_options=model_options)
+
+        # OPTIMIZATION: Clear existing model before loading new one to prevent memory spike (2x weights)
+        if self.model is not None:
+            print(f"[RayWorker {self.local_rank}] Clearing previous model to free memory before reload...")
+            self.model = None
+            from raylight.utils.common import cleanup_memory
+            cleanup_memory()
         
         # FUNCTIONAL LOAD: Update references from return values
         self.model, self.reload_params = ctx.load(state, self.config, self.state_cache)
@@ -350,7 +357,9 @@ class RayWorker:
             "mode": "disk_parallel",
             "path": unet_path,
             "is_gguf": self.is_gguf,
-            "is_fsdp": self.parallel_dict.get("is_fsdp", False)
+            "model_options": model_options,
+            "dequant_dtype": dequant_dtype,
+            "patch_dtype": patch_dtype,
         })
 
     def load_unet(self, unet_path, model_options):
@@ -363,7 +372,10 @@ class RayWorker:
             
             # FSDP Specific: Link the lazy state dict to the patcher
             if self.parallel_dict.get("is_fsdp"):
-                self.set_state_dict()
+                 # Note: model_context.load() already attaches fsdp_state_dict to the model returned.
+                 # We only need to set it if we have an explicit override in self.state_dict.
+                if self.state_dict is not None:
+                    self.set_state_dict()
                 
             self.is_model_loaded = True
             return True
@@ -411,6 +423,18 @@ class RayWorker:
         )
 
     def reapply_loras_for_config(self, config_hash):
+        # SAFETY: If model is baked (FSDP destructively modified weights), we cannot unbake.
+        # We must reload from base reference if we need to change LoRA config.
+        # FIX: Only force reload if the config hash implies a CHANGE.
+        current_hash = getattr(self.lora_manager, "_current_lora_config_hash", None)
+        
+        if (self.model is not None and 
+            getattr(self.model, "is_fsdp_baked", False) and 
+            current_hash != config_hash):
+            
+            print(f"[RayWorker {self.local_rank}] Model is FSDP-baked and LoRA config changed ({current_hash} -> {config_hash}). Forcing base reload.")
+            self.reload_params = None
+            
         self.reload_model_if_needed()
         return self.lora_manager.reapply_loras_for_config(
             self.model, 
@@ -446,16 +470,18 @@ class RayWorker:
             self.current_sd_ref = state_dict
             state_dict = ray.get(state_dict)
 
-            if isinstance(state_dict, dict) and state_dict.get("parallel_load_mode", False):
-                 unet_path = state_dict.get("unet_path")
-                 load_options = state_dict.get("model_options", {}).copy()
-                 cast_dtype = load_options.pop("dtype", None)
-                 import comfy.sd
-                 self.model = comfy.sd.load_diffusion_model(unet_path, model_options=load_options)
-                 if cast_dtype:
-                      self.model.model.manual_cast_dtype = cast_dtype
-                 self.is_model_loaded = True
-                 return
+            if isinstance(state_dict, dict):
+                if state_dict.get("mode") == "disk_parallel":
+                     print(f"[RayWorker {self.local_rank}] Reloading from disk reference (FSDP/Parallel aware)...")
+                     self._load_via_context(
+                         state_dict["path"],
+                         state_dict.get("model_options", {}),
+                         state_dict.get("dequant_dtype"),
+                         state_dict.get("patch_dtype")
+                     )
+                     return
+
+
 
 
 
@@ -595,8 +621,10 @@ class RayWorker:
             state_dict=getattr(self, "state_dict", None)
         )
         if model_modified:
-            print(f"[RayWorker {self.local_rank}] Model modified by SamplerManager (e.g. baked weights). Clearing reload params.")
-            self.reload_params = None
+            print(f"[RayWorker {self.local_rank}] Model modified by SamplerManager (e.g. baked weights).")
+            # OPTIMIZATION: Do not clear reload_params blindly. 
+            # We now handle "Dirty Baked State" safety via is_fsdp_baked flag in reapply_loras_for_config.
+            # self.reload_params = None 
         return result
 
     @patch_temp_fix_ck_ops
@@ -627,8 +655,9 @@ class RayWorker:
              state_dict=getattr(self, "state_dict", None)
         )
         if model_modified:
-            print(f"[RayWorker {self.local_rank}] Model modified by SamplerManager (e.g. baked weights). Clearing reload params.")
-            self.reload_params = None
+             print(f"[RayWorker {self.local_rank}] Model modified by SamplerManager (e.g. baked weights).")
+             # OPTIMIZATION: Do not clear reload_params blindly.
+             # self.reload_params = None
         return result
 
 

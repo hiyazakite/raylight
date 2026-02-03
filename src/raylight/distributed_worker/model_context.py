@@ -43,8 +43,9 @@ class ModelContext(ABC):
     Each format (GGUF, Safetensors, FSDP) implements format-specific behavior.
     """
     
-    def __init__(self, use_mmap: bool = True):
+    def __init__(self, use_mmap: bool = True, cache_in_ram: bool = True):
         self.use_mmap = use_mmap
+        self.cache_in_ram = cache_in_ram
     
     # ─── Abstract Methods (format-specific) ──────────────────
     
@@ -131,21 +132,24 @@ class ModelContext(ABC):
         metadata = {}
         
         # 1. Check cache
-        cached = state_cache.get(state.cache_key)
-        if cached is not None:
-            print(f"[ModelContext] Cache Hit: {os.path.basename(state.cache_key)}")
-            
-            # Handle structured CachedState
-            if isinstance(cached, CachedState):
-                sd = cached.state_dict
-                metadata = cached.metadata
-                if cached.checksum:
-                    verify_model_checksum(sd, cached.checksum, metadata, context_tag="ModelContext")
-            else:
-                 # Should not happen if cache is strictly typed
-                 print(f"[ModelContext] Warning: Invalid cache entry type: {type(cached)}")
-                 return None, {}
-        else:
+        cached = None
+        if self.cache_in_ram:
+            cached = state_cache.get(state.cache_key)
+            if cached is not None:
+                print(f"[ModelContext] Cache Hit: {os.path.basename(state.cache_key)}")
+                
+                # Handle structured CachedState
+                if isinstance(cached, CachedState):
+                    sd = cached.state_dict
+                    metadata = cached.metadata
+                    if cached.checksum:
+                        verify_model_checksum(sd, cached.checksum, metadata, context_tag="ModelContext")
+                else:
+                     # Should not happen if cache is strictly typed
+                     print(f"[ModelContext] Warning: Invalid cache entry type: {type(cached)}")
+                     return None, {}
+        
+        if sd is None:
             # 2. Disk load (mmap or standard based on toggle)
             if self.use_mmap:
                 print(f"[ModelContext] Mmap Load: {os.path.basename(state.cache_key)}")
@@ -160,11 +164,13 @@ class ModelContext(ABC):
                 # Compute checksum
                 checksum = compute_model_checksum(sd, metadata)
                 
-                # Store as CachedState
-                cached_entry = CachedState(state_dict=sd, metadata=metadata, checksum=checksum)
-                state_cache.put(state.cache_key, cached_entry)
-                
-                print(f"[ModelContext] Cached model with checksum: {checksum}")
+                # Store as CachedState ONLY if caching enabled
+                if self.cache_in_ram:
+                    cached_entry = CachedState(state_dict=sd, metadata=metadata, checksum=checksum)
+                    state_cache.put(state.cache_key, cached_entry)
+                    print(f"[ModelContext] Cached model with checksum: {checksum}")
+                else:
+                    print(f"[ModelContext] Skipping RAM Cache (cache_in_ram=False)")
 
             else:
                 print(f"[ModelContext] Standard Load: {os.path.basename(state.cache_key)}")
@@ -185,13 +191,12 @@ class ModelContext(ABC):
         # 4. Instantiate model
         model = self.instantiate_model(sd_to_use, state, config, metadata=metadata)
         
-
         
         # Post-load setup
         reload_params = state.to_dict()
         if model is not None:
              model.unet_path = state.unet_path
-             if self.use_mmap:
+             if self.use_mmap and self.cache_in_ram:
                  model.mmap_cache = sd
 
         return model, reload_params
@@ -606,7 +611,8 @@ class FSDPContext(ModelContext):
         # But wait, original code set `worker.state_dict`.
         # To remain stateless, we should return it or attach to model.
         # Let's attach to model.
-        model.fsdp_state_dict = state_dict
+        # OPTIMIZATION: Do NOT attach state dict to model to prevent RAM leak.
+        # model.fsdp_state_dict = state_dict
         return model
     
     def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
@@ -874,7 +880,7 @@ def get_context(path: str, config: "WorkerConfig", model_type: str = "unet", mod
                 "GGUF quantization is incompatible with FSDP sharding. "
                 "Please use a standard Safetensors model or disable FSDP/Context Parallel to use GGUF."
             )
-        return FSDPContext(use_mmap=use_mmap)
+        return FSDPContext(use_mmap=use_mmap, cache_in_ram=False)
     if path.lower().endswith(".gguf"):
         return GGUFContext(use_mmap=use_mmap)
     return LazyTensorContext(use_mmap=use_mmap)
