@@ -45,6 +45,9 @@ def prepare_fsdp_model_for_sampling(work_model, config: "WorkerConfig", state_di
             # Restore inplace flag
             work_model.weight_inplace_update = prev_inplace
             
+            # Mark as consistently baked so we can detect this state later
+            work_model.is_fsdp_baked = True
+            
             # CRITICAL: Prevent FSDP wrapper from reloading stale state_dict over our baked weights
             if hasattr(work_model, "set_fsdp_state_dict"):
                 print(f"[RayWorker {config.local_rank}] FSDP: Clearing fsdp_state_dict to preserve baked weights.")
