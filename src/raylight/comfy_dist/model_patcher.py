@@ -8,6 +8,8 @@ import torch
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.utils import _free_storage
 from torch.distributed.tensor import DTensor
+from typing import cast
+import torch.nn as nn
 
 import comfy
 from comfy.patcher_extension import CallbacksMP
@@ -76,7 +78,8 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
     def config_fsdp(self, rank, device_mesh):
         self.rank = rank
         self.device_mesh = device_mesh
-        self.model.to("meta")
+        if self.model is not None:
+             self.model.to("meta")
 
     def set_fsdp_state_dict(self, sd):
         self.fsdp_state_dict = sd
@@ -124,7 +127,11 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
     def _load_list(self):
         loading = []
-        for n, m in self.model.named_modules():
+        if self.model is None:
+             return loading
+        
+        model = cast(nn.Module, self.model)
+        for n, m in model.named_modules():
             params = []
             skip = False
             for name, param in m.named_parameters(recurse=False):
@@ -139,6 +146,9 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         return loading
 
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
+        if self.model is None:
+            return
+
         with self.use_ejected():
             # If we are baking weights (force_patch_weights=True), we MUST NOT wrap FSDP yet.
             # We want to patch the original model first, THEN wrap it later.
@@ -222,13 +232,15 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
             if lowvram_counter > 0:
                 logging.info("loaded partially {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), patch_counter))
-                self.model.model_lowvram = True
+                if self.model is not None:
+                     self.model.model_lowvram = True
             else:
                 logging.info("loaded completely {} {} {}".format(lowvram_model_memory / (1024 * 1024), mem_counter / (1024 * 1024), full_load))
-                self.model.model_lowvram = False
-                if full_load:
-                    self.model.to(device_to)
-                    mem_counter = self.model_size()
+                if self.model is not None:
+                    self.model.model_lowvram = False
+                    if full_load:
+                        self.model.to(device_to)
+                        mem_counter = self.model_size()
 
             self.model.lowvram_patch_counter += patch_counter
             self.model.device = device_to
@@ -242,28 +254,35 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
 
     def cleanup(self):
         self.clean_hooks()
+        if self.model is None:
+             return
         if hasattr(self.model, "current_patcher"):
             self.model.current_patcher = None
         for callback in self.get_all_callbacks(CallbacksMP.ON_CLEANUP):
             callback(self)
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
+        if self.model is None:
+             return
+        
+        model = cast(nn.Module, self.model)
+        
         self.eject_model()
         if unpatch_weights:
             self.unpatch_hooks()
-            if self.model.model_lowvram:
-                for m in self.model.modules():
+            if model.model_lowvram:
+                for m in model.modules():
                     move_weight_functions(m, device_to)
                     wipe_lowvram_weight(m)
 
-                self.model.model_lowvram = False
-                self.model.lowvram_patch_counter = 0
+                model.model_lowvram = False
+                model.lowvram_patch_counter = 0
 
             keys = list(self.backup.keys())
 
             for k in keys:
                 bk = self.backup[k]
-                weight, _, _ = get_key_weight(self.model, k)
+                weight, _, _ = get_key_weight(model, k)
                 
                 # Handling DTensor (FSDP) unpatching
                 if isinstance(weight, DTensor):
@@ -273,35 +292,40 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                     continue
 
                 if bk.inplace_update:
-                    comfy.utils.copy_to_param(self.model, k, bk.weight)
+                    comfy.utils.copy_to_param(model, k, bk.weight)
                 else:
-                    comfy.utils.set_attr_param(self.model, k, bk.weight)
+                    comfy.utils.set_attr_param(model, k, bk.weight)
 
-            self.model.current_weight_patches_uuid = None
+            model.current_weight_patches_uuid = None
             self.backup.clear()
 
             if device_to is not None:
-                if next(self.model.parameters()).device == torch.device("meta"):
+                if next(model.parameters()).device == torch.device("meta"):
                     pass
                 else:
-                    self.model.to(device_to)
-                    self.model.device = device_to
-            self.model.model_loaded_weight_memory = 0
+                    model.to(device_to)
+                    model.device = device_to
+            model.model_loaded_weight_memory = 0
 
-            for m in self.model.modules():
+            for m in model.modules():
                 if hasattr(m, "comfy_patched_weights"):
                     del m.comfy_patched_weights
 
         keys = list(self.object_patches_backup.keys())
         for k in keys:
-            comfy.utils.set_attr(self.model, k, self.object_patches_backup[k])
+            comfy.utils.set_attr(model, k, self.object_patches_backup[k])
 
         self.object_patches_backup.clear()
 
     def release_memory(self):
         """Explicitly free distributed tensor storage."""
+        if self.model is None:
+             return
+        
+        model = cast(nn.Module, self.model)
+             
         self.detach(unpatch_all=False)
-        for m in self.model.modules():
+        for m in model.modules():
             for p in m.parameters(recurse=False):
                 if isinstance(p, DTensor):
                     try:

@@ -5,7 +5,7 @@ across different formats (GGUF, Safetensors, FSDP) with optional mmap caching.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, Any, Optional, TYPE_CHECKING
 import os
 
 import torch
@@ -177,7 +177,7 @@ class ModelContext(ABC):
                     state_cache.put(state.cache_key, cached_entry)
                     print(f"[ModelContext] Cached model with checksum: {checksum}")
                 else:
-                    print(f"[ModelContext] Skipping RAM Cache (cache_in_ram=False)")
+                    print("[ModelContext] Skipping RAM Cache (cache_in_ram=False)")
 
             else:
                 print(f"[ModelContext] Standard Load: {os.path.basename(state.cache_key)}")
@@ -501,7 +501,7 @@ class LazyTensorContext(ModelContext):
                 model.model.to(device)
             return False
     
-    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
+    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig") -> bool:
         """Pointer-swap offload: swap GPU tensors back to mmap refs (like GGUF)."""
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import swap_model_to_mmap
          
@@ -811,13 +811,6 @@ class VAEContext(LazyTensorContext):
                 first_stage.to("cpu")
                 
         return False
-            
-        # Force cleanup
-        from raylight.utils.common import cleanup_memory
-        cleanup_memory()
-        
-        mem_now = torch.cuda.memory_allocated(config.device) / 1e9
-        print(f"[VAEContext {config.local_rank}] Post-Offload VRAM: {mem_now:.2f}GB")
 
 class BNBContext(ModelContext):
     """Context for BitsAndBytes (4-bit) model loading."""
