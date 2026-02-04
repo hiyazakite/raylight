@@ -36,24 +36,7 @@ def prepare_fsdp_model_for_sampling(work_model, config: "WorkerConfig", state_di
             work_model.weight_inplace_update = True
             
             # force_patch_weights=True permanently modifies the weights in work_model.model
-            print(f"[RayWorker {config.local_rank}] Debug: Verifying weight patching...")
-            
-            # Debug: Sample a patched weight
-            debug_key = next(iter(work_model.patches.keys()))
-            from comfy.model_patcher import get_key_weight
-            try:
-                w_pre, _, _ = get_key_weight(work_model.model, debug_key)
-                print(f"[RayWorker {config.local_rank}] Pre-Patch {debug_key} sum: {w_pre.sum().item()}")
-            except Exception as e:
-                print(f"[RayWorker {config.local_rank}] Could not read pre-patch weight: {e}")
-
             work_model.load(device_to="cpu", force_patch_weights=True)
-
-            try:
-                w_post, _, _ = get_key_weight(work_model.model, debug_key)
-                print(f"[RayWorker {config.local_rank}] Post-Patch {debug_key} sum: {w_post.sum().item()}")
-            except Exception as e:
-                print(f"[RayWorker {config.local_rank}] Could not read post-patch weight: {e}")
             
             # Free memory: We don't need backups of the unbaked weights since we are committing to them
             if hasattr(work_model, "backup"):

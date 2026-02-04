@@ -590,11 +590,10 @@ class FSDPContext(ModelContext):
         model_patcher.LowVramPatch = LowVramPatch
         model_management.cleanup_models_gc = cleanup_models_gc
         
-        # JIT Loading: Wrap with LazySafetensor if not already (reusing logic from LazyTensors)
-        # This prevents the "huge RAM spike" by delaying materialization until key access
+        
         if self.use_mmap:
-            print("[FSDPContext] Wrapping state dict with LazySafetensors for JIT loading...")
-            sd = wrap_state_dict_lazy(sd)
+           print("[FSDPContext] Wrapping state dict with LazySafetensors for JIT loading...")
+           sd = wrap_state_dict_lazy(sd)
         
         # Inject SafetensorOps to handle zero-copy assignment
         # Unconditionally overwrite to ensure we use SafetensorLayer (like LazyTensorContext)
