@@ -31,7 +31,7 @@ class VaeManager:
         )
         
         # 3. Unified Load (Handles Caching & Instantiation)
-        vae_model, _ = ctx.load(state, config, state_cache)
+        vae_model = ctx.load(state, config, state_cache)
         
         # 5. Monkey patch decode optimizations
         vae_model.decode_tiled_1d = types.MethodType(decode_tiled_1d, vae_model)

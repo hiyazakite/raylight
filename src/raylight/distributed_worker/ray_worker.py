@@ -54,7 +54,6 @@ class RayWorker:
         self.model_type = None
         self.state_dict = None
         self.overwrite_cast_dtype = None
-        self.reload_params = None
         
         # Create Immutable Config
         self.config = WorkerConfig(
@@ -234,7 +233,13 @@ class RayWorker:
         from raylight.distributed_worker.model_context import get_context
         unet_path = getattr(self.model, "unet_path", "")
         ctx = get_context(unet_path, self.config)
-        ctx.offload(self.model, self.lora_manager, self.state_cache, self.config)  # type: ignore[arg-type]
+        is_destroyed = ctx.offload(self.model, self.lora_manager, self.state_cache, self.config)
+        if is_destroyed:
+            print(f"[RayWorker {self.local_rank}] Model offload resulted in destruction. Clearing reference.")
+            self.model = None
+        else:
+             # Soft offload, keep reference but mark current device as cpu (done by context)
+             pass  # type: ignore[arg-type]
         
         # Clear references
         # self.model = None  <-- DISABLED to enable Hot-Load (Soft Offload)
@@ -316,32 +321,32 @@ class RayWorker:
 
 
 
-    def _load_via_context(self, unet_path, model_options, dequant_dtype=None, patch_dtype=None):
+    def _load_via_context(self, unet_path, model_options, dequant_dtype=None, patch_dtype=None, force_reload=False):
         """Unified internal loader that leverages ModelContext abstraction."""
         from raylight.distributed_worker.model_context import get_context, ModelState
         
-        # Idempotency Check
-        rp = getattr(self, "reload_params", None)
-        if (self.model is not None and 
-            rp is not None and 
-            rp.get("unet_path") == unet_path and
-            rp.get("dequant_dtype") == dequant_dtype and
-            rp.get("patch_dtype") == patch_dtype):
-            print(f"[RayWorker {self.local_rank}] Idempotent Load: {os.path.basename(unet_path)} already loaded.")
-            return
-
         state = ModelState(unet_path, model_options, dequant_dtype, patch_dtype)
+        
+        # Check if we can skip load (Idempotency)
+        # We compare the requested 'state' against the current model's 'load_config'
+        current_config = getattr(self.model, "load_config", None)
+        
+        if self.model is not None and current_config == state:
+             # Exact match of configuration
+             if not force_reload:
+                 print(f"[RayWorker {self.local_rank}] Idempotent Load: {os.path.basename(unet_path)} already loaded.")
+                 return
+
         ctx = get_context(unet_path, self.config, model_options=model_options)
 
         # OPTIMIZATION: Clear existing model before loading new one to prevent memory spike (2x weights)
         if self.model is not None:
             print(f"[RayWorker {self.local_rank}] Clearing previous model to free memory before reload...")
             self.model = None
-            from raylight.utils.common import cleanup_memory
             cleanup_memory()
         
         # FUNCTIONAL LOAD: Update references from return values
-        self.model, self.reload_params = ctx.load(state, self.config, self.state_cache)
+        self.model = ctx.load(state, self.config, self.state_cache)
         
         # Format flags and coordinating refs
         self.is_gguf = unet_path.lower().endswith(".gguf") or dequant_dtype is not None
@@ -391,9 +396,8 @@ class RayWorker:
 
     def init_gguf_from_ref(self, ref, metadata, reload_params=None):
         print(f"[RayWorker {self.local_rank}] Initializing GGUF from Shared Reference (Follower Mode)...")
-        if reload_params:
-             self.reload_params = reload_params
-             
+        # reload_params arg used for initial load config, but not stored as self.reload_params anymore
+        
         self.gguf_metadata = metadata
         self.is_gguf = True
         
@@ -433,8 +437,27 @@ class RayWorker:
             current_hash != config_hash):
             
             print(f"[RayWorker {self.local_rank}] Model is FSDP-baked and LoRA config changed ({current_hash} -> {config_hash}). Forcing base reload.")
-            self.reload_params = None
             
+            # Manual Reload Logic because we can't rely on 'reload_params=None' anymore
+            # AND we don't have the explicit args here, we must use the attached config.
+            state = getattr(self.model, "load_config", None)
+            if state:
+                # Clear old
+                self.model = None
+                cleanup_memory()
+                
+                # Load new
+                from raylight.distributed_worker.model_context import get_context
+                ctx = get_context(state.unet_path, self.config, model_options=state.model_options)
+                self.model = ctx.load(state, self.config, self.state_cache)
+                
+                # CRITICAL: Since we reloaded a fresh model, we must reset LoraManager's tracking
+                # state so it knows to re-apply patches even if the hash hasn't changed.
+                self.lora_manager.clear_tracking()
+            else:
+                raise RuntimeError("Cannot force reload FSDP model: Missing load_config state.")
+            self.lora_manager.clear_tracking() # Inserted line
+
         self.reload_model_if_needed()
         return self.lora_manager.reapply_loras_for_config(
             self.model, 
@@ -502,9 +525,12 @@ class RayWorker:
         # FIX: Ensure GGUF config is propagated during full reload
         dequant_dtype = None
         patch_dtype = None
-        if hasattr(self, "reload_params") and self.reload_params:
-             dequant_dtype = self.reload_params.get("dequant_dtype")
-             patch_dtype = self.reload_params.get("patch_dtype")
+        
+        # Try to get dtypes from existing model config if available
+        if self.model is not None and hasattr(self.model, "load_config"):
+             dequant_dtype = self.model.load_config.dequant_dtype
+             patch_dtype = self.model.load_config.patch_dtype
+             
         # Also check model_options if passed explicitly
         if isinstance(model_options, dict):
              if "dequant_dtype" in model_options: dequant_dtype = model_options["dequant_dtype"]
@@ -527,23 +553,29 @@ class RayWorker:
         from raylight.distributed_worker.model_context import get_context
         target_device = load_device if load_device is not None else self.device
         
-        # Check logic delegated to context, but we need to pass current state
-        if hasattr(self, 'reload_params') and self.reload_params:
-            unet_path = self.reload_params.get("unet_path", "")
-            ctx = get_context(unet_path, self.config)
-            
-            # Context returns updated model/params if reload happened
-            self.model, self.reload_params = ctx.reload_if_needed(
-                self.model, 
-                target_device, 
-                self.reload_params, 
-                self.config, 
-                self.state_cache
-            )
+        if self.model is not None:
+             # Use attached config to get context
+             config_state = getattr(self.model, "load_config", None)
+             path = config_state.unet_path if config_state else getattr(self.model, "unet_path", "unknown")
+             opts = config_state.model_options if config_state else None
+             
+             ctx = get_context(path, self.config, model_options=opts)
+             
+             # Context checks if migration is needed
+             self.model = ctx.reload_if_needed(
+                 self.model, 
+                 target_device, 
+                 self.config, 
+                 self.state_cache
+             )
+
         elif hasattr(self, 'base_sd_ref') and self.base_sd_ref is not None:
-            self.load_unet_from_state_dict(self.base_sd_ref, model_options={})
+             # Fallback for state_dict based loading
+             print(f"[RayWorker] Reloading from base_sd_ref...")
+             self.load_unet_from_state_dict(self.base_sd_ref, model_options={})
         else:
-            raise RuntimeError("Model offloaded but no reload source available!")
+            # No model loaded
+            pass
 
 
     def kill(self):

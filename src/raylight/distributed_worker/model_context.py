@@ -69,8 +69,13 @@ class ModelContext(ABC):
         """Fast VRAM transfer for soft-reloaded models."""
         pass
     
-    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
-        """Standard offload: Move weights to CPU and release tracking."""
+    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig") -> bool:
+        """Standard offload: Move weights to CPU and release tracking.
+        
+        Returns:
+            bool: True if the model object was destroyed/invalidated (Hard Offload).
+                  False if the model object persists (Soft Offload).
+        """
         print(f"[{self.__class__.__name__}] Standard Offload: Releasing VRAM...")
         
         # Share the common offload cleanup logic
@@ -78,6 +83,8 @@ class ModelContext(ABC):
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            
+        return False
 
     def _common_offload_cleanup(self, model: Any, lora_manager: Optional["LoraManager"], config: "WorkerConfig"):
         """Shared post-offload cleanup for all model formats."""
@@ -119,7 +126,7 @@ class ModelContext(ABC):
     
     # ─── Shared Logic ────────────────────────────────────────
 
-    def load(self, state: ModelState, config: "WorkerConfig", state_cache: Any) -> Tuple[Any, Dict[str, Any]]:
+    def load(self, state: ModelState, config: "WorkerConfig", state_cache: Any) -> Any:
         """Unified model loading logic.
         
         1. Check cache for existing state dict.
@@ -193,42 +200,37 @@ class ModelContext(ABC):
         
         
         # Post-load setup
-        reload_params = state.to_dict()
         if model is not None:
              model.unet_path = state.unet_path
+             model.load_config = state
              if self.use_mmap and self.cache_in_ram:
                  model.mmap_cache = sd
 
-        return model, reload_params
+        return model
     
 
     
-    def reload_if_needed(self, model: Any, target_device: torch.device, reload_params: Dict[str, Any], config: "WorkerConfig", state_cache: Any) -> Tuple[Any, Dict[str, Any]]:
+    def reload_if_needed(self, model: Any, target_device: torch.device, config: "WorkerConfig", state_cache: Any) -> Any:
         """Shared reload logic - checks device and triggers appropriate reload.
         
         Returns:
-            (model, reload_params) - potentially new model instance if full reload
+            model - potentially new model instance if full reload
         """
         current = getattr(model, "current_device", None) if model else None
         
         if model is not None and str(current) == str(target_device):
             print(f"[ModelContext] Already on {target_device}, skipping reload.")
-            return model, reload_params
+            return model
         
         if model is not None:
             # Soft reload - model object exists but on wrong device
             print(f"[ModelContext] Hot-loading to {target_device}...")
+            # Use attached load_config if needed (though hot_load doesn't rely on it usually)
+            reload_params = model.load_config.to_dict() if hasattr(model, "load_config") else {}
             self.hot_load(model, target_device, reload_params, state_cache)
-            return model, reload_params
+            return model
         else:
-            # Full reload - model is None
-            if not reload_params:
-                 raise RuntimeError("Cannot reload model: No reload_params found.")
-            
-            print(f"[ModelContext] Full reload to {target_device}...")
-            state = ModelState(**reload_params)
-            new_model, new_params = self.load(state, config, state_cache)
-            return new_model, new_params
+             raise RuntimeError("Cannot reload model: Model is None (Lost context).")
 
 
 class GGUFContext(ModelContext):
@@ -345,6 +347,8 @@ class GGUFContext(ModelContext):
             # 3. Shared cleanup
             self._common_offload_cleanup(model, lora_manager, config)
             print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload Complete.")
+            
+        return False
     
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
         if model is None:
@@ -532,6 +536,8 @@ class LazyTensorContext(ModelContext):
                 torch.cuda.empty_cache()
             
             print(f"[LazyTensorContext {config.local_rank}] Soft-Offload Complete.")
+            
+        return False
 
     
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
@@ -637,6 +643,8 @@ class FSDPContext(ModelContext):
         # 4. Final VRAM flush
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            
+        return True
     
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
         """
@@ -744,11 +752,12 @@ class VAEContext(LazyTensorContext):
                 vae_model.first_stage_model.to(device)
             return False
 
-    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
+    def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig") -> bool:
         """Zero-copy soft-offload for VAE."""
         
         if model is None:
-            return
+            return False
+        
         
         mmap_cache = getattr(model, "mmap_cache", None)
         first_stage = getattr(model, "first_stage_model", None)
@@ -801,8 +810,8 @@ class VAEContext(LazyTensorContext):
             print(f"[VAEContext {config.local_rank}] VAE Offload: No mmap cache, using standard offload...")
             if first_stage:
                 first_stage.to("cpu")
-            if hasattr(model, "mmap_cache"):
-                model.mmap_cache = None
+                
+        return False
             
         # Force cleanup
         from raylight.utils.common import cleanup_memory
