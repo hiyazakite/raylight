@@ -155,9 +155,9 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             load_completely = []
             loading.sort(reverse=True)
             for x in loading:
-                n = x[1]
-                m = x[2]
-                params = x[3]
+                n = x[2]
+                m = x[3]
+                params = x[4]
                 module_mem = x[0]
 
                 weight_key = "{}.weight".format(n)
