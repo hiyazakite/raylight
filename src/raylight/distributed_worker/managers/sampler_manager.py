@@ -126,6 +126,27 @@ class SamplerManager:
                  print(f"[RayWorker {config.local_rank}] Mmap Cache Len: {len(model.mmap_cache) if model.mmap_cache else 0}")
              
              with torch.no_grad():
+                 # Correctly initialize CompactFusion step counter
+                 try:
+                     from raylight.distributed_modules.compact.main import compact_set_step, compact_config, compact_reset
+                     config = compact_config()
+                     if config is not None and config.enabled:
+                         compact_reset() # Ensure cache is clean for new generation
+                         compact_set_step(0) # custom_sampler usually implies 0 start unless specified usually, but sigmas handle it. 
+                         # Actually Comfy's sample_custom doesn't pass step to callback straightforwardly in all versions, 
+                         # but let's assume standard behavior.
+                 except (ImportError, NameError, AttributeError):
+                     pass
+
+                 def compact_callback(step, x0, x, total_steps):
+                    try:
+                        from raylight.distributed_modules.compact.main import compact_set_step, compact_config
+                        config = compact_config()
+                        if config is not None and config.enabled:
+                            compact_set_step(step)
+                    except (ImportError, NameError, AttributeError):
+                        pass
+
                  samples = comfy.sample.sample_custom(
                          work_model,
                          noise,
@@ -133,12 +154,13 @@ class SamplerManager:
                          sampler,
                          sigmas,
                          positive,
-                     negative,
-                     final_samples,
-                     noise_mask=noise_mask,
-                     disable_pbar=disable_pbar,
-                     seed=noise_seed,
-                 )
+                         negative,
+                      final_samples,
+                      noise_mask=noise_mask,
+                      disable_pbar=disable_pbar,
+                      seed=noise_seed,
+                      callback=compact_callback,
+                  )
                  out = work_latent.copy()
                  out["samples"] = samples
 
@@ -193,6 +215,24 @@ class SamplerManager:
 
             # 4. Sampling
             with torch.no_grad():
+                # Correctly initialize CompactFusion step counter
+                try:
+                    from raylight.distributed_modules.compact.main import compact_set_step, compact_config
+                    config = compact_config()
+                    if config is not None and config.enabled:
+                        compact_set_step(start_step if start_step is not None else 0)
+                except (ImportError, NameError, AttributeError):
+                    pass
+
+                def compact_callback(step, x0, x, total_steps):
+                    try:
+                        from raylight.distributed_modules.compact.main import compact_set_step, compact_config
+                        config = compact_config()
+                        if config is not None and config.enabled:
+                            compact_set_step(step)
+                    except (ImportError, NameError, AttributeError):
+                        pass
+                
                 if sigmas is None:
                     samples = comfy.sample.sample(
                         work_model,
@@ -212,6 +252,7 @@ class SamplerManager:
                         noise_mask=noise_mask,
                         disable_pbar=disable_pbar,
                         seed=seed,
+                        callback=compact_callback,
                    )
                 else:
                      samples = comfy.sample.sample_custom(
@@ -226,8 +267,8 @@ class SamplerManager:
                         noise_mask=noise_mask,
                         disable_pbar=disable_pbar,
                         seed=seed,
+                        callback=compact_callback,
                     )
-                
             out = work_latent.copy()
             out["samples"] = samples
 
