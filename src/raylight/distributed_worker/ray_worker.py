@@ -774,8 +774,17 @@ def make_ray_actor_fn(
         gpu_actors = []
 
         for local_rank in range(world_size):
+            # Prepare runtime_env for backend config
+            init_runtime_env = {}
+            if "attention_backend" in parallel_dict:
+                init_runtime_env["env_vars"] = {"RAYLIGHT_ATTN_BACKEND": parallel_dict["attention_backend"]}
+
             gpu_actors.append(
-                gpu_actor.options(num_gpus=1, name=f"RayWorker:{local_rank}").remote(
+                gpu_actor.options(
+                    num_gpus=1, 
+                    name=f"RayWorker:{local_rank}",
+                    runtime_env=init_runtime_env
+                ).remote(
                     local_rank=local_rank,
                     device_id=0,
                     parallel_dict=parallel_dict,

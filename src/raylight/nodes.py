@@ -142,6 +142,10 @@ class RayInitializer:
                     [member.name for member in AttnType],
                     {"default": "TORCH"},
                 ),
+                "attention_backend": (
+                    ["STANDARD", "COMPACT"],
+                    {"default": "STANDARD"},
+                ),
                 "ray_object_store_gb": ("FLOAT", {
                     "default": 0.0,
                     "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
@@ -193,6 +197,7 @@ class RayInitializer:
         skip_comm_test: bool = True,
         use_mmap: bool = True,
         mmap_cache_size: int = 2,
+        attention_backend: str = "STANDARD",
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # THIS IS PYTORCH DIST ADDRESS
@@ -250,7 +255,9 @@ class RayInitializer:
                 self.parallel_dict["ulysses_degree"] = ulysses_degree
                 self.parallel_dict["ring_degree"] = ring_degree
                 self.parallel_dict["cfg_degree"] = cfg_degree
+                self.parallel_dict["cfg_degree"] = cfg_degree
                 self.parallel_dict["sync_ulysses"] = sync_ulysses
+                self.parallel_dict["attention_backend"] = attention_backend
 
             if FSDP:
                 self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
