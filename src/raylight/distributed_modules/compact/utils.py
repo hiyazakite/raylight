@@ -148,11 +148,16 @@ class CompactCache:
             self.delta_base[key] = None
 
     # @Profiler.prof_func("compact.CompactCache.get_base")
-    def get_base(self, key):
+    def get_base(self, key, expected_shape: tuple = None):
         base = self.base.get(key, None)
         if self.quantize:
             if base is not None:
                 base = dequantize_int8(*base)
+        # If shape changed (e.g., different batch size or seq len), return None
+        # This triggers warmup behavior instead of crashing on shape mismatch
+        if base is not None and expected_shape is not None:
+            if base.shape != expected_shape:
+                return None
         return base
 
     # @Profiler.prof_func("compact.CompactCache.get_delta_base") 
