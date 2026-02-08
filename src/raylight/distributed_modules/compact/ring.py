@@ -181,10 +181,10 @@ def _compact_ring_fwd(
     compress_type_v = compact_config().compress_func(mod_idx, current_iter)
     # assert compact_config().error_feedback, "error feedback must be enabled"
     
-    k_shape_id = str(list(k.shape)).replace(" ", "")
-    v_shape_id = str(list(v.shape)).replace(" ", "")
-    k_my_cache_key = f"{mod_idx}-{comm.rank%comm.world_size}-{k_shape_id}-k"
-    v_my_cache_key = f"{mod_idx}-{comm.rank%comm.world_size}-{v_shape_id}-v"
+    # Cache keys match reference implementation (no shape in key)
+    # Shape mismatches are handled gracefully in get_base by returning None
+    k_my_cache_key = f"{mod_idx}-{comm.rank%comm.world_size}-k"
+    v_my_cache_key = f"{mod_idx}-{comm.rank%comm.world_size}-v"
     original_k_shape = k.shape 
     original_v_shape = v.shape
     k_to_send = compact_compress(k_my_cache_key, k, compress_type_k, update_cache=True)
@@ -198,8 +198,8 @@ def _compact_ring_fwd(
         
         if step != 0:
             recv_rank = (comm.rank - step) % comm.world_size
-            k_recv_cache_key = f"{mod_idx}-{recv_rank}-{k_shape_id}-k"
-            v_recv_cache_key = f"{mod_idx}-{recv_rank}-{v_shape_id}-v"
+            k_recv_cache_key = f"{mod_idx}-{recv_rank}-k"
+            v_recv_cache_key = f"{mod_idx}-{recv_rank}-v"
             k = compact_decompress(
                 k_recv_cache_key, k_to_send, compress_type_k, original_k_shape, update_cache=True
             )

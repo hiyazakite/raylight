@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Any, TYPE_CHECKING
 from raylight.utils.memory import monitor_memory
 from raylight.utils.common import Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
+import time
 
 if TYPE_CHECKING:
     from raylight.distributed_worker.worker_config import WorkerConfig
@@ -138,7 +139,21 @@ class SamplerManager:
                  except (ImportError, NameError, AttributeError):
                      pass
 
-                 def compact_callback(step, x0, x, total_steps):
+                 except (ImportError, NameError, AttributeError):
+                     pass
+
+                 # Stats + Compact Callback
+                 last_step_time = time.perf_counter()
+                 
+                 def sampling_callback(step, x0, x, total_steps):
+                    nonlocal last_step_time
+                    current_time = time.perf_counter()
+                    duration = current_time - last_step_time
+                    last_step_time = current_time
+                    
+                    # Record step time (approximate, excludes callback overhead for next step)
+                    # Step timing available via duration variable if needed
+                    
                     try:
                         from raylight.distributed_modules.compact.main import compact_set_step, compact_config
                         config = compact_config()
@@ -159,7 +174,7 @@ class SamplerManager:
                       noise_mask=noise_mask,
                       disable_pbar=disable_pbar,
                       seed=noise_seed,
-                      callback=compact_callback,
+                      callback=sampling_callback,
                   )
                  out = work_latent.copy()
                  out["samples"] = samples
@@ -223,8 +238,18 @@ class SamplerManager:
                         compact_set_step(start_step if start_step is not None else 0)
                 except (ImportError, NameError, AttributeError):
                     pass
+                
+                # Stats + Compact Callback
+                last_step_time = time.perf_counter()
 
-                def compact_callback(step, x0, x, total_steps):
+                def sampling_callback(step, x0, x, total_steps):
+                    nonlocal last_step_time
+                    current_time = time.perf_counter()
+                    duration = current_time - last_step_time
+                    last_step_time = current_time
+                    # Step timing is now logged inline if needed
+                    pass
+
                     try:
                         from raylight.distributed_modules.compact.main import compact_set_step, compact_config
                         config = compact_config()
@@ -252,23 +277,23 @@ class SamplerManager:
                         noise_mask=noise_mask,
                         disable_pbar=disable_pbar,
                         seed=seed,
-                        callback=compact_callback,
+                        callback=sampling_callback,
                    )
                 else:
-                     samples = comfy.sample.sample_custom(
-                        work_model,
-                        noise,
-                        cfg,
-                        sampler_obj,
-                        sigmas,
-                        positive,
-                        negative,
-                        final_samples,
-                        noise_mask=noise_mask,
-                        disable_pbar=disable_pbar,
-                        seed=seed,
-                        callback=compact_callback,
-                    )
+                         samples = comfy.sample.sample_custom(
+                            work_model,
+                            noise,
+                            cfg,
+                            sampler_obj,
+                            sigmas,
+                            positive,
+                            negative,
+                            final_samples,
+                            noise_mask=noise_mask,
+                            disable_pbar=disable_pbar,
+                            seed=seed,
+                            callback=sampling_callback,
+                        )
             out = work_latent.copy()
             out["samples"] = samples
 

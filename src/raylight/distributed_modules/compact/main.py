@@ -132,8 +132,14 @@ def _decompress_fn(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, shape:
 def _compact_compress_fastpath(cache_key, x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, update_cache: bool, rank: int):
     assert compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2
     assert _config.compress_residual == 1
-    # Base should be (N, C) now
-    base = _cache.get_base(cache_key) 
+    # Base should be (N, C) now - returns None if shape mismatch or cache miss
+    base = _cache.get_base(cache_key, expected_shape=x.shape) 
+    
+    # If no base (cache miss or shape mismatch), fall back to warmup behavior
+    if base is None:
+        if update_cache:
+            _cache.put(cache_key, x, None)
+        return x  # Return uncompressed tensor (warmup behavior)
     
     fastpath_func = binary_quant_fastpath if compress_type == COMPACT_COMPRESS_TYPE.BINARY else int2_quant_fastpath
     try:
@@ -232,7 +238,11 @@ def compact_compress(
                         compress_residual=_config.compress_residual,
                     )
             elif _config.compress_residual == 1:
-                base = _cache.get_base(cache_key)
+                base = _cache.get_base(cache_key, expected_shape=x.shape)
+                if base is None:
+                    # Shape changed - fall back to warmup
+                    cond_cache_put(cache_key, x, None)
+                    return x.view(original_shape)
                 delta = x - base
                 compressed = _compress_fn(delta, compress_type, rank)
                 recv_delta = _decompress_fn(compressed, compress_type, x.shape, rank)
@@ -249,7 +259,11 @@ def compact_compress(
                         compress_residual=_config.compress_residual,
                     )
             elif _config.compress_residual == 2:
-                base = _cache.get_base(cache_key)
+                base = _cache.get_base(cache_key, expected_shape=x.shape)
+                if base is None:
+                    # Shape changed - fall back to warmup
+                    cond_cache_put(cache_key, x, None)
+                    return x.view(original_shape)
                 delta_base = _cache.get_delta_base(cache_key)
                 delta_delta = x - base - delta_base
                 compressed = _compress_fn(delta_delta, compress_type, rank)
@@ -310,7 +324,7 @@ def _compact_decompress_fastpath(cache_key, compressed: torch.Tensor, compress_t
     scale_u_nk = scale_u_flat.view(N, rank)
     scale_v_ck = scale_v_flat.view(C, rank)
 
-    base_nc = _cache.get_base(cache_key)
+    base_nc = _cache.get_base(cache_key, expected_shape=(N, C))
 
     fastpath_func = binary_dequant_fastpath if compress_type == COMPACT_COMPRESS_TYPE.BINARY else int2_dequant_fastpath
     # Updated function call signature and return value

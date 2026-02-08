@@ -25,6 +25,13 @@ from .distributed_worker.ray_worker import (
 from .comfy_dist.utils import cancellable_get
 from raylight.utils.memory import monitor_memory
 
+
+        
+try:
+    import server
+except ImportError:
+    server = None
+
 # Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
 # since in FSDPModelPatcher mode, ray cannot pickle None type cause by getattr
 def _monkey():
@@ -142,6 +149,10 @@ class RayInitializer:
                     [member.name for member in AttnType],
                     {"default": "TORCH"},
                 ),
+                "use_kitchen": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable FP8 weight quantization using ComfyUI-Kitchen for reduced VRAM."
+                }),
                 "attention_backend": (
                     ["STANDARD", "COMPACT"],
                     {"default": "STANDARD"},
@@ -198,6 +209,7 @@ class RayInitializer:
         use_mmap: bool = True,
         mmap_cache_size: int = 2,
         attention_backend: str = "STANDARD",
+        use_kitchen: bool = False,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # THIS IS PYTORCH DIST ADDRESS
@@ -257,7 +269,10 @@ class RayInitializer:
                 self.parallel_dict["cfg_degree"] = cfg_degree
                 self.parallel_dict["cfg_degree"] = cfg_degree
                 self.parallel_dict["sync_ulysses"] = sync_ulysses
+                self.parallel_dict["sync_ulysses"] = sync_ulysses
                 self.parallel_dict["attention_backend"] = attention_backend
+
+            self.parallel_dict["use_kitchen"] = use_kitchen
 
             if FSDP:
                 self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
@@ -404,6 +419,10 @@ class RayInitializerAdvanced(RayInitializer):
                     ],
                     {"default": "TORCH"},
                 ),
+                "use_kitchen": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable FP8 weight quantization using ComfyUI-Kitchen for reduced VRAM."
+                }),
             },
             "optional": {
                 "gpu_indices": ("STRING", {
@@ -466,8 +485,9 @@ class RayUNETLoader:
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype):
         with monitor_memory("RayUNETLoader.load_ray_unet"):
-            ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
-            parallel_dict: Any = parallel_dict
+            ray_actors, gpu_actors_fn = ensure_fresh_actors(ray_actors_init)
+            gpu_actors = ray_actors["workers"]
+            parallel_dict = ray_actors["parallel_dict"]
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
@@ -487,8 +507,21 @@ class RayUNETLoader:
         loaded_futures = []
         patched_futures = []
 
-        # Unified Parallel Loading: All workers load simultaneously
-        # For FSDP, Safetensors, and GGUF: uses ModelContext with zero-copy mmap
+        # Unified Parallel Loading: All workers load simultaneously (Standard)
+        # OR Sequentially (Kitchen / Low RAM mode)
+        
+        # Check for Kitchen FP8 Quantization which is memory intensive (RAM spike during conversion)
+        use_kitchen = parallel_dict.get("use_kitchen", False)
+        
+        if use_kitchen:
+            # Reverting sequential loading.
+            # With streaming quantization in fsdp.py, the peak RAM usage is per-block
+            # (e.g. 500MB) instead of full-model (24GB).
+            # Parallel loading (4x 500MB) is perfectly safe and much faster.
+            pass
+
+        # PARALLEL LOADING (Fast)
+        # Uses ModelContext with zero-copy mmap for optimal speed
         print(f"[Raylight] Parallel Load ({'FSDP' if parallel_dict['is_fsdp'] else 'Standard'}): Creating lazy wrappers...")
         for actor in gpu_actors:
             loaded_futures.append(
@@ -1190,3 +1223,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
     "RayOffloadModel": "Offload Model (Ray)",
 }
+
+
+
+

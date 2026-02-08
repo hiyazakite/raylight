@@ -26,6 +26,7 @@ from raylight.distributed_worker.managers.vae_manager import VaeManager
 from raylight.distributed_worker.managers.sampler_manager import SamplerManager
 
 
+
 # Developer reminder, Checking model parameter outside ray actor is very expensive (e.g Comfy main thread)
 # the model need to be serialized, send to object store and can cause OOM !, so setter and getter is the pattern !
 
@@ -68,6 +69,8 @@ class RayWorker:
         self.lora_manager = LoraManager() # Stateless
         self.vae_manager = VaeManager() # Stateless
         self.sampler_manager = SamplerManager() # Stateless initialization
+        
+
         
         # LRU cache for mmap'd state dicts (replaces worker_mmap_cache)
         from raylight.utils.cache import LRUStateCache
@@ -166,9 +169,12 @@ class RayWorker:
                 ring_degree=self.ring_degree,
                 ulysses_degree=self.ulysses_degree
             )
+
             print(
                 f"Parallel Degree: Ulysses={self.ulysses_degree}, Ring={self.ring_degree}, CFG={self.cfg_degree}"
             )
+
+
 
     def get_meta_model(self):
         if self.model is None or not hasattr(self.model, "model") or self.model.model is None:
@@ -377,8 +383,8 @@ class RayWorker:
             
             # FSDP Specific: Link the lazy state dict to the patcher
             if self.parallel_dict.get("is_fsdp"):
-                 # Note: model_context.load() already attaches fsdp_state_dict to the model returned.
-                 # We only need to set it if we have an explicit override in self.state_dict.
+                    # Note: model_context.load() already attaches fsdp_state_dict to the model returned.
+                    # We only need to set it if we have an explicit override in self.state_dict.
                 if self.state_dict is not None:
                     self.set_state_dict()
                 
@@ -396,13 +402,17 @@ class RayWorker:
 
     def init_gguf_from_ref(self, ref, metadata, reload_params=None):
         print(f"[RayWorker {self.local_rank}] Initializing GGUF from Shared Reference (Follower Mode)...")
-        # reload_params arg used for initial load config, but not stored as self.reload_params anymore
+        # Initialize empty model structure
+        self.model = ref 
         
         self.gguf_metadata = metadata
         self.is_gguf = True
         
         if reload_params is not None:
              print(f"[RayWorker {self.local_rank}] GGUF Optimization: Using Unified Parallel Disk Loading (Mmap)...")
+             if self.parallel_dict["is_fsdp"] is True:
+                raise ValueError("FSDP Sharding for GGUF is not supported")
+            
              self._load_via_context(
                  reload_params["unet_path"],
                  reload_params["model_options"],
@@ -503,10 +513,6 @@ class RayWorker:
                          state_dict.get("patch_dtype")
                      )
                      return
-
-
-
-
 
         from raylight.distributed_worker.model_context import get_context, ModelState
         is_gguf = getattr(self, "is_gguf", False)
@@ -633,6 +639,7 @@ class RayWorker:
         )
 
 
+
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
     def custom_sampler(
@@ -652,12 +659,14 @@ class RayWorker:
             add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image,
             state_dict=getattr(self, "state_dict", None)
         )
+
         if model_modified:
             print(f"[RayWorker {self.local_rank}] Model modified by SamplerManager (e.g. baked weights).")
             # OPTIMIZATION: Do not clear reload_params blindly. 
             # We now handle "Dirty Baked State" safety via is_fsdp_baked flag in reapply_loras_for_config.
             # self.reload_params = None 
         return result
+
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
@@ -686,6 +695,7 @@ class RayWorker:
             force_full_denoise, sigmas,
              state_dict=getattr(self, "state_dict", None)
         )
+                 
         if model_modified:
              print(f"[RayWorker {self.local_rank}] Model modified by SamplerManager (e.g. baked weights).")
              # OPTIMIZATION: Do not clear reload_params blindly.
@@ -776,8 +786,16 @@ def make_ray_actor_fn(
         for local_rank in range(world_size):
             # Prepare runtime_env for backend config
             init_runtime_env = {}
+            env_vars = {}
+            
             if "attention_backend" in parallel_dict:
-                init_runtime_env["env_vars"] = {"RAYLIGHT_ATTN_BACKEND": parallel_dict["attention_backend"]}
+                env_vars["RAYLIGHT_ATTN_BACKEND"] = parallel_dict["attention_backend"]
+            
+            if parallel_dict.get("use_kitchen"):
+                env_vars["RAYLIGHT_ENABLE_KITCHEN"] = "1"
+
+            if env_vars:
+                init_runtime_env["env_vars"] = env_vars
 
             gpu_actors.append(
                 gpu_actor.options(
@@ -791,6 +809,7 @@ def make_ray_actor_fn(
                 )
             )
         ray_actors["workers"] = gpu_actors
+        ray_actors["parallel_dict"] = parallel_dict
         
         # Parallel initialization check (faster startup)
         # Instead of waiting sequentially, we fire all check tasks and wait for them in parallel
