@@ -485,9 +485,7 @@ class RayUNETLoader:
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype):
         with monitor_memory("RayUNETLoader.load_ray_unet"):
-            ray_actors, gpu_actors_fn = ensure_fresh_actors(ray_actors_init)
-            gpu_actors = ray_actors["workers"]
-            parallel_dict = ray_actors["parallel_dict"]
+            ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
