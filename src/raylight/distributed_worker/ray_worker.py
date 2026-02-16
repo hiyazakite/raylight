@@ -212,7 +212,6 @@ class RayWorker:
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)
 
-    # Legacy debug_memory_leaks removed
 
 
     def model_function_runner_get_values(self, fn, *args, **kwargs):
@@ -389,6 +388,11 @@ class RayWorker:
                     self.set_state_dict()
                 
             self.is_model_loaded = True
+
+            # Explicitly mark as baked for LoRA reloading logic
+            if self.parallel_dict.get("is_fsdp") and self.model is not None:
+                self.model.is_fsdp_baked = True
+
             return True
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
@@ -443,7 +447,7 @@ class RayWorker:
         current_hash = getattr(self.lora_manager, "_current_lora_config_hash", None)
         
         if (self.model is not None and 
-            getattr(self.model, "is_fsdp_baked", False) and 
+            (getattr(self.model, "is_fsdp_baked", False) or self.parallel_dict.get("is_fsdp")) and 
             current_hash != config_hash):
             
             print(f"[RayWorker {self.local_rank}] Model is FSDP-baked and LoRA config changed ({current_hash} -> {config_hash}). Forcing base reload.")
@@ -793,6 +797,15 @@ def make_ray_actor_fn(
             
             if parallel_dict.get("use_kitchen"):
                 env_vars["RAYLIGHT_ENABLE_KITCHEN"] = "1"
+            
+            if parallel_dict.get("kv_cache_quant_enable"):
+                env_vars["RAYLIGHT_COMPACT_QUANTIZED_CACHE"] = "1"
+                if "kv_cache_quant_bits" in parallel_dict:
+                    env_vars["RAYLIGHT_COMPACT_CACHE_QUANT_BITS"] = str(parallel_dict["kv_cache_quant_bits"])
+            if "delta_compression" in parallel_dict:
+                env_vars["RAYLIGHT_DELTA_COMPRESSION"] = str(parallel_dict["delta_compression"])
+            if "compact_warmup_steps" in parallel_dict:
+                env_vars["RAYLIGHT_COMPACT_WARMUP_STEPS"] = str(parallel_dict["compact_warmup_steps"])
 
             if env_vars:
                 init_runtime_env["env_vars"] = env_vars

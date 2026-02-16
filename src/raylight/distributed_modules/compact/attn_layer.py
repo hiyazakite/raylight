@@ -10,10 +10,9 @@ except ImportError:
 
 from yunchang.comm.all_to_all import SeqAllToAll4D
 
-from xfuser.logger import init_logger
+import logging
 
-
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 ATTN_LAYER_IDX = 0 # COMPACT
 class xFuserLongContextAttention(LongContextAttention):
@@ -52,7 +51,7 @@ class xFuserLongContextAttention(LongContextAttention):
                 f"ring_impl_type: {ring_impl_type} do not support SP kv cache."
             )
         
-        from xfuser.core.long_ctx_attention.ring import xdit_ring_flash_attn_func
+        # from xfuser.core.long_ctx_attention.ring import xdit_ring_flash_attn_func
         """
         COMPACT ATTN
         """
@@ -61,7 +60,8 @@ class xFuserLongContextAttention(LongContextAttention):
         if compact_config().enabled:
             self.ring_attn_fn = compact_fwd
         else:
-            self.ring_attn_fn = xdit_ring_flash_attn_func
+            # self.ring_attn_fn = xdit_ring_flash_attn_func
+            raise NotImplementedError("Standard xFuser ring attention not available without xfuser package")
         self.idx = None # NOTE: assign idx in forward
 
     @torch.compiler.disable
@@ -83,6 +83,7 @@ class xFuserLongContextAttention(LongContextAttention):
         deterministic=False,
         return_attn_probs=False,
         joint_strategy="none",
+        mask=None,
     ) -> Tensor:
         """forward
 
@@ -207,7 +208,8 @@ class xFuserLongContextAttention(LongContextAttention):
                 joint_tensor_value=joint_tensor_value,
                 joint_strategy=joint_strategy,
                 mod_idx=self.idx,
-                current_iter=compact_get_step()
+                current_iter=compact_get_step(),
+                mask=mask,
             )
         else:
             out = self.ring_attn_fn(

@@ -12,6 +12,9 @@ import torch
 
 from raylight.utils.checksum import compute_model_checksum, verify_model_checksum
 from raylight.utils.cache import CachedState
+from raylight.distributed_modules.fsdp_utils import prefetch_state_dict
+from concurrent.futures import ThreadPoolExecutor
+
 
 if TYPE_CHECKING:
     from .worker_config import WorkerConfig
@@ -60,7 +63,7 @@ class ModelContext(ABC):
         pass
     
     @abstractmethod
-    def instantiate_model(self, sd: Dict[str, torch.Tensor], state: ModelState, config: "WorkerConfig", metadata: Any = None) -> Any:
+    def instantiate_model(self, sd: Dict[str, torch.Tensor], state: ModelState, config: "WorkerConfig", metadata: Any = None, **kwargs) -> Any:
         """Create ModelPatcher from state dict."""
         pass
     
@@ -257,7 +260,7 @@ class GGUFContext(ModelContext):
         # GGUF library always uses mmap internally
         return self.load_state_dict_mmap(state, config)
     
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None, **kwargs):
         from raylight.expansion.comfyui_gguf.ops import GGMLOps
         from raylight.expansion.comfyui_gguf.nodes import GGUFModelPatcher
         import comfy.sd
@@ -416,7 +419,7 @@ class LazyTensorContext(ModelContext):
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path)
     
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None, **kwargs):
         """Instantiate model with lazy state dict (zero-copy until load)."""
         import comfy.sd
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
@@ -576,8 +579,76 @@ class FSDPContext(ModelContext):
     def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig") -> Dict:
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path)
+
+    def load(self, state: ModelState, config: "WorkerConfig", state_cache: Any) -> Any:
+        """Override load to implement prefetch optimization for Safetensors."""
+        is_safetensors = state.unet_path.lower().endswith(".safetensors")
+        
+        # Check cache logic duplicated from base (allow Base load to handle cache hits)
+        if self.cache_in_ram and state_cache.get(state.cache_key) is not None:
+             return super().load(state, config, state_cache)
+             
+        if is_safetensors and not self.use_mmap: 
+             print(f"[FSDPContext] Prefetch Optimization Active for {os.path.basename(state.unet_path)}")
+             
+             # 1. Start Background Load
+             executor = ThreadPoolExecutor(max_workers=1)
+             future = executor.submit(prefetch_state_dict, state.unet_path)
+             
+             # 2. Fast Header Read (Dummy SD)
+             from safetensors import safe_open
+             dummy_sd = {}
+             try:
+                 with safe_open(state.unet_path, framework="pt") as f:
+                     for k in f.keys():
+                         t_slice = f.get_slice(k)
+                         shape = t_slice.get_shape()
+                         dummy_sd[k] = torch.empty(shape, dtype=torch.float16, device="meta")
+             except Exception as e:
+                 print(f"[FSDPContext] Header read failed: {e}. Fallback to sync load.")
+                 executor.shutdown(wait=False)
+                 return super().load(state, config, state_cache)
+
+             # 3. Instantiate with dummy_sd (Wrapping FSDP on CPU)
+             try:
+                 model = self.instantiate_model(dummy_sd, state, config, metadata=None, load_weights=False)
+                 
+                 # 4. Finalize
+                 print("[FSDPContext] FSDP Wrapping done. Waiting for weights...")
+                 real_sd = future.result()
+                 
+                 print("[FSDPContext] Weights loaded. Loading into FSDP model...")
+                 
+                 # Process keys to match model structure (strip prefixes)
+                 from comfy import model_detection
+                 diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(real_sd)
+                 import comfy.utils
+                 temp_sd = comfy.utils.state_dict_prefix_replace(
+                    real_sd, {diffusion_model_prefix: ""}, filter_keys=True
+                 )
+                 if len(temp_sd) > 0:
+                     real_sd = temp_sd
+                 
+                 model.load_model_weights(real_sd, "")
+                 
+                 # Shutdown executor
+                 executor.shutdown(wait=False)
+                 
+                 # Post-load setup
+                 if model is not None:
+                     model.unet_path = state.unet_path
+                     model.load_config = state
+                     
+                 return model
+
+             except Exception as e:
+                 print(f"[FSDPContext] Prefetch/Wrap failed: {e}. Fallback to sync load.")
+                 executor.shutdown(wait=False)
+                 return super().load(state, config, state_cache)
+        
+        return super().load(state, config, state_cache)
     
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None, load_weights: bool = True, **kwargs):
         from raylight.comfy_dist.sd import fsdp_load_diffusion_model_stat_dict
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
         from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
@@ -605,7 +676,9 @@ class FSDPContext(ModelContext):
             config.local_rank,
             getattr(config, "device_mesh", None), # Relying on device_mesh being in config
             config.parallel_dict.get("fsdp_cpu_offload", False),
-            model_options=model_options
+            model_options=model_options,
+            metadata=metadata,
+            load_weights=load_weights
         )
         
         if model is None:
@@ -618,6 +691,9 @@ class FSDPContext(ModelContext):
         # Let's attach to model.
         # OPTIMIZATION: Do NOT attach state dict to model to prevent RAM leak.
         # model.fsdp_state_dict = state_dict
+        
+        # Mark as baked so RayWorker knows to reload on LoRA change
+        model.is_fsdp_baked = True
         return model
     
     def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
@@ -660,7 +736,7 @@ class VAEContext(LazyTensorContext):
         """VAE: No prefix stripping needed (unlike UNET)."""
         return sd
         
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None, **kwargs):
         """Instantiate VAE model using comfy.sd.VAE (Standard ComfyUI path)."""
         import comfy.sd
         import comfy.utils
@@ -822,7 +898,7 @@ class BNBContext(ModelContext):
     def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Dict:
          return self.load_state_dict_standard(state, config)
 
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None):
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None, **kwargs):
         unet_path = state.unet_path
         
         if config.is_fsdp:

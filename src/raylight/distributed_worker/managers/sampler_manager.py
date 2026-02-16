@@ -47,7 +47,6 @@ class SamplerManager:
         if config.is_fsdp:
             from raylight.comfy_dist.fsdp_utils import prepare_fsdp_model_for_sampling
             model_was_modified = prepare_fsdp_model_for_sampling(work_model, config, state_dict)
-
         disable_pbar = comfy.utils.PROGRESS_BAR_ENABLED
         if config.local_rank == 0:
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
@@ -90,7 +89,23 @@ class SamplerManager:
             
             # We yield the setup results along with the work_latent dict 
             # so the caller can update it with samples
-            yield (work_model, latent_image, noise_mask, disable_pbar, work_latent, model_was_modified)
+            try:
+                yield (work_model, latent_image, noise_mask, disable_pbar, work_latent, model_was_modified)
+            finally:
+                # 2. Cleanup after sampling
+                # This runs whether sampling succeeded or failed
+                if config.is_fsdp:
+                    # For FSDP, especially if offloading is disabled, we need to aggressively
+                    # clean up activations/buffers that might hang around.
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    try:
+                        # Clear CompactFusion/Cache if present
+                        from raylight.distributed_modules.compact.main import compact_reset
+                        compact_reset()
+                    except:
+                        pass
 
 
     @patch_temp_fix_ck_ops
@@ -130,8 +145,8 @@ class SamplerManager:
                  # Correctly initialize CompactFusion step counter
                  try:
                      from raylight.distributed_modules.compact.main import compact_set_step, compact_config, compact_reset
-                     config = compact_config()
-                     if config is not None and config.enabled:
+                     compact_cfg = compact_config()
+                     if compact_cfg is not None and compact_cfg.enabled:
                          compact_reset() # Ensure cache is clean for new generation
                          compact_set_step(0) # custom_sampler usually implies 0 start unless specified usually, but sigmas handle it. 
                          # Actually Comfy's sample_custom doesn't pass step to callback straightforwardly in all versions, 
@@ -139,8 +154,7 @@ class SamplerManager:
                  except (ImportError, NameError, AttributeError):
                      pass
 
-                 except (ImportError, NameError, AttributeError):
-                     pass
+
 
                  # Stats + Compact Callback
                  last_step_time = time.perf_counter()
@@ -148,7 +162,7 @@ class SamplerManager:
                  def sampling_callback(step, x0, x, total_steps):
                     nonlocal last_step_time
                     current_time = time.perf_counter()
-                    duration = current_time - last_step_time
+
                     last_step_time = current_time
                     
                     # Record step time (approximate, excludes callback overhead for next step)
@@ -156,8 +170,8 @@ class SamplerManager:
                     
                     try:
                         from raylight.distributed_modules.compact.main import compact_set_step, compact_config
-                        config = compact_config()
-                        if config is not None and config.enabled:
+                        compact_cfg = compact_config()
+                        if compact_cfg is not None and compact_cfg.enabled:
                             compact_set_step(step)
                     except (ImportError, NameError, AttributeError):
                         pass
@@ -177,7 +191,8 @@ class SamplerManager:
                       callback=sampling_callback,
                   )
                  out = work_latent.copy()
-                 out["samples"] = samples
+                 out["samples"] = samples.cpu()
+                 del samples # Drop GPU reference immediately
 
         return out, model_modified
 
@@ -233,8 +248,8 @@ class SamplerManager:
                 # Correctly initialize CompactFusion step counter
                 try:
                     from raylight.distributed_modules.compact.main import compact_set_step, compact_config
-                    config = compact_config()
-                    if config is not None and config.enabled:
+                    compact_cfg = compact_config()
+                    if compact_cfg is not None and compact_cfg.enabled:
                         compact_set_step(start_step if start_step is not None else 0)
                 except (ImportError, NameError, AttributeError):
                     pass
@@ -245,15 +260,15 @@ class SamplerManager:
                 def sampling_callback(step, x0, x, total_steps):
                     nonlocal last_step_time
                     current_time = time.perf_counter()
-                    duration = current_time - last_step_time
+
                     last_step_time = current_time
                     # Step timing is now logged inline if needed
                     pass
 
                     try:
                         from raylight.distributed_modules.compact.main import compact_set_step, compact_config
-                        config = compact_config()
-                        if config is not None and config.enabled:
+                        compact_cfg = compact_config()
+                        if compact_cfg is not None and compact_cfg.enabled:
                             compact_set_step(step)
                     except (ImportError, NameError, AttributeError):
                         pass
@@ -295,6 +310,7 @@ class SamplerManager:
                             callback=sampling_callback,
                         )
             out = work_latent.copy()
-            out["samples"] = samples
+            out["samples"] = samples.cpu()
+            del samples # Drop GPU reference immediately
 
         return (out,), model_modified

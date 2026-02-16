@@ -160,6 +160,28 @@ class RayInitializer:
                 "ray_object_store_gb": ("FLOAT", {
                     "default": 0.0,
                     "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
+                "kv_cache_quant_enable": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable KV cache quantization for CompactFusion."
+                }),
+                "kv_cache_quant_bits": ("INT", {
+                    "default": 8,
+                    "min": 4,
+                    "max": 8,
+                    "step": 4, # Only allow 4 or 8
+                    "tooltip": "Bit-width for KV cache quantization. Supports 4 or 8 bits."
+                }),
+                "delta_compression": (
+                    ["BINARY", "INT2", "INT4", "IDENTITY", "SPARSE"],
+                    {"default": "BINARY",
+                     "tooltip": "Compression type for delta updates (CompactFusion). BINARY (INT1) is fastest/smallest."}
+                ),
+                "compact_warmup_steps": ("INT", {
+                    "default": 1,
+                    "min": 0,
+                    "max": 100,
+                    "tooltip": "Number of warmup steps before compression starts (CompactFusion). 1 is recommended by paper, but higher values (e.g. 5) are safer."
+                }),
             },
             "optional": {
                 "gpu_indices": ("STRING", {
@@ -194,22 +216,26 @@ class RayInitializer:
         ray_cluster_address: str,
         ray_cluster_namespace: str,
         GPU: int,
-        ulysses_degree: int,
-        ring_degree: int ,
-        cfg_degree: int,
-        sync_ulysses: bool,
-        FSDP: bool,
-        FSDP_CPU_OFFLOAD: bool,
-        XFuser_attention: int,
+        ulysses_degree: int = 1,
+        ring_degree: int = 1,
+        cfg_degree: int = 1,
+        sync_ulysses: bool = False,
+        FSDP: bool = False,
+        FSDP_CPU_OFFLOAD: bool = False,
+        XFuser_attention: str = "TORCH",
+        use_kitchen: bool = False,
+        attention_backend: str = "STANDARD",
         ray_object_store_gb: float = 0.0,
         ray_dashboard_address: str = "None",
         torch_dist_address: str = "None",
         gpu_indices: str = "",
         skip_comm_test: bool = True,
         use_mmap: bool = True,
-        mmap_cache_size: int = 2,
-        attention_backend: str = "STANDARD",
-        use_kitchen: bool = False,
+        mmap_cache_size: int = 4,
+        kv_cache_quant_enable: bool = False,
+        kv_cache_quant_bits: int = 8,
+        delta_compression: str = "BINARY",
+        compact_warmup_steps: int = 1,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # THIS IS PYTORCH DIST ADDRESS
@@ -273,6 +299,12 @@ class RayInitializer:
                 self.parallel_dict["attention_backend"] = attention_backend
 
             self.parallel_dict["use_kitchen"] = use_kitchen
+            
+            # KV Cache Quantization
+            self.parallel_dict["kv_cache_quant_enable"] = kv_cache_quant_enable
+            self.parallel_dict["kv_cache_quant_bits"] = kv_cache_quant_bits
+            self.parallel_dict["delta_compression"] = delta_compression
+            self.parallel_dict["compact_warmup_steps"] = compact_warmup_steps
 
             if FSDP:
                 self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
@@ -423,6 +455,22 @@ class RayInitializerAdvanced(RayInitializer):
                     "default": False,
                     "tooltip": "Enable FP8 weight quantization using ComfyUI-Kitchen for reduced VRAM."
                 }),
+                "kv_cache_quant_enable": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable KV cache quantization for CompactFusion."
+                }),
+                "kv_cache_quant_bits": ("INT", {
+                    "default": 8,
+                    "min": 4,
+                    "max": 8,
+                    "step": 4,
+                    "tooltip": "Bit-width for KV cache quantization. Supports 4 or 8 bits."
+                }),
+                "delta_compression": (
+                    ["BINARY", "INT2", "INT4", "IDENTITY", "SPARSE"],
+                    {"default": "BINARY",
+                     "tooltip": "Compression type for delta updates (CompactFusion). BINARY (INT1) is fastest/smallest."}
+                ),
             },
             "optional": {
                 "gpu_indices": ("STRING", {

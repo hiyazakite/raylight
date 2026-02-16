@@ -33,7 +33,7 @@ def load_lora_for_models(model, lora, strength_model):
     return new_modelpatcher
 
 
-def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={}, metadata=None):
+def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, model_options={}, metadata=None, load_weights=True):
     dtype = model_options.get("dtype", None)
     diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
     temp_sd = comfy.utils.state_dict_prefix_replace(
@@ -131,7 +131,10 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
         model_config.optimizations["fp8"] = True
 
     model = model_config.get_model(new_sd, "")
-    model.load_model_weights(new_sd, "")
+    if load_weights:
+        model.load_model_weights(new_sd, "")
+    else:
+         print("[FSDP] Skipping initial weight load (Prefetch Optimization)")
     left_over = sd.keys()
     if len(left_over) > 0:
         logging.info("left over keys in diffusion model: {}".format(left_over))

@@ -37,7 +37,7 @@ def slowpath_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, ran
     Returns:
         A compressed tensor.
     """
-    assert x.dtype == torch.half, f"x.dtype: {x.dtype}"
+    assert x.dtype in [torch.half, torch.bfloat16, torch.float32], f"x.dtype: {x.dtype}"
     assert x.dim() == 2
     N, C = x.shape
 
@@ -60,6 +60,11 @@ def slowpath_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, ran
         assert u.size(1) == v.size(0) and u.dtype == torch.half and v.dtype == torch.half
         # contiguous() is necessary for later cat
         comp_list = [u.contiguous(), v.contiguous()]
+    elif compress_type == COMPACT_COMPRESS_TYPE.INT4:
+        q, scale, min_v = quantize_int4(x)
+        assert q.dtype == torch.uint8
+        assert scale.dtype == torch.half and min_v.dtype == torch.half
+        comp_list = [q.view(torch.half).contiguous(), scale.contiguous(), min_v.contiguous()]
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_Q:
         assert rank is not None and rank >= 1, "Rank must be provided for LOW_RANK_Q compression"
         u, v, _ = subspace_iter(x, rank, 2)
@@ -119,6 +124,12 @@ def slowpath_decompress(x: torch.Tensor, shape: tuple, compress_type: COMPACT_CO
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK:
         assert rank is not None and rank >= 1, "Rank must be provided for LOW_RANK decompression"
         split_size = [N * rank, rank * C] # Correct shape for u(N,K) and v(K,C)
+    elif compress_type == COMPACT_COMPRESS_TYPE.INT4:
+        # Packed q is (N//2, C) uint8 -> N*C//2 bytes -> N*C//4 halfs
+        q_len = N * C // 4
+        scale_len = C # (1, C)
+        min_len = C   # (1, C)
+        split_size = [q_len, scale_len, min_len]
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_Q:
         assert rank is not None and rank >= 1, "Rank must be provided for LOW_RANK_Q decompression"
         # layout: q_u, scale_u, min_u, q_v, scale_v, min_v
@@ -152,6 +163,12 @@ def slowpath_decompress(x: torch.Tensor, shape: tuple, compress_type: COMPACT_CO
         u = split_list[0].view(N, rank) # Reshape to (N, K)
         v = split_list[1].view(rank, C) # Reshape to (K, C)
         return torch.matmul(u, v)
+    elif compress_type == COMPACT_COMPRESS_TYPE.INT4:
+        q_half = split_list[0]
+        q = q_half.view(torch.uint8).view(N // 2, C)
+        scale = split_list[1].view(1, C)
+        min_v = split_list[2].view(1, C)
+        return dequantize_int4(q, scale, min_v)
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_Q:
         q_u = split_list[0].view(torch.uint8).view(N//2, rank)
         scale_u = split_list[1].view(1, rank)

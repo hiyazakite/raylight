@@ -177,6 +177,7 @@ def usp_dit_forward(
                 if add is not None:
                     img += add
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+    torch.cuda.current_stream().synchronize()
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
     txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
     img = img[:, :img_orig_size, :]
@@ -224,6 +225,7 @@ def usp_dit_forward(
                     img[:, txt.shape[1]:, ...] += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+    torch.cuda.current_stream().synchronize()
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
     img = img[:, :img_orig_size, :]
     # ======================== ADD SEQUENCE PARALLEL ========================= #

@@ -45,6 +45,7 @@ class CompactConfig:
         check_consist: bool = False,
         fastpath: bool = False,
         quantized_cache: bool = False,
+        cache_quant_bits: int | None = None,
         delta_decay_factor: float | None = None
     ):
         """
@@ -73,6 +74,7 @@ class CompactConfig:
         self.fastpath = fastpath
         # Cache behavior flags
         self.quantized_cache = quantized_cache
+        self.cache_quant_bits = None
         # Updated attributes
         self.delta_decay_factor = delta_decay_factor
         
@@ -94,7 +96,18 @@ class CompactConfig:
         if self.fastpath:
             assert ef, "Fastpath requires error feedback enabled."
             assert not simulate, "Fastpath does not support simulation."
+            assert not simulate, "Fastpath does not support simulation."
         
+        if self.quantized_cache:
+            if cache_quant_bits is None:
+                 # Default to 8-bit for backward compatibility/safety if not specified
+                 self.cache_quant_bits = 8
+            else:
+                 self.cache_quant_bits = cache_quant_bits
+            assert self.cache_quant_bits in [4, 8], "Only 4-bit and 8-bit cache quantization are supported."
+        else:
+            self.cache_quant_bits = None
+
         if self.override_with_patch_gather_fwd:
             assert self.enabled, "Compact must be enabled if override_with_patch_gather_fwd is True"
             assert self.patch_gather_fwd_config is not None, "patch_gather_fwd_config must be set if override_with_patch_gather_fwd is True"
@@ -116,24 +129,28 @@ class CompactConfig:
             return compress_type.name
         return str(compress_type)
 
-from raylight.distributed_modules.compact.compress_quantize import quantize_int8, dequantize_int8
+from raylight.distributed_modules.compact.compress_quantize import quantize_int8, dequantize_int8, quantize_int4, dequantize_int4
 from raylight.distributed_modules.compact.compress_lowrank import subspace_iter
 
 
 class CompactCache:
-    def __init__(self, quantize=False):
+    def __init__(self, quantize=False, quant_bits=8):
         self.quantize = quantize
+        self.quant_bits = quant_bits
         self.base = {}
         self.delta_base = {}
         if quantize:
-            assert ALLOW_DEPRECATED
+            assert ALLOW_DEPRECATED or quant_bits in [4, 8]
         self.passed_count = 0
 
     # @Profiler.prof_func("compact.CompactCache.put")
     def put(self, key, base, delta_base):
         # Quantize base if needed
         if self.quantize:
-            base = quantize_int8(base)
+            if self.quant_bits == 8:
+                base = quantize_int8(base)
+            elif self.quant_bits == 4:
+                base = quantize_int4(base)
         self.base[key] = base
         # from raylight.distributed_modules.compact.main import compact_get_step
         # from raylight.distributed_modules.collector.collector import collect
@@ -148,15 +165,21 @@ class CompactCache:
             self.delta_base[key] = None
 
     # @Profiler.prof_func("compact.CompactCache.get_base")
-    def get_base(self, key, expected_shape: tuple = None):
+    def get_base(self, key, expected_shape: tuple = None, expected_dtype: torch.dtype = None):
         base = self.base.get(key, None)
         if self.quantize:
             if base is not None:
-                base = dequantize_int8(*base)
-        # If shape changed (e.g., different batch size or seq len), return None
-        # This triggers warmup behavior instead of crashing on shape mismatch
-        if base is not None and expected_shape is not None:
-            if base.shape != expected_shape:
+                if self.quant_bits == 8:
+                    base = dequantize_int8(*base)
+                elif self.quant_bits == 4:
+                    base = dequantize_int4(*base)
+        
+        if base is not None:
+            # Check shape
+            if expected_shape is not None and base.shape != expected_shape:
+                return None
+            # Check dtype
+            if expected_dtype is not None and base.dtype != expected_dtype:
                 return None
         return base
 
