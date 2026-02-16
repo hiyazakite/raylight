@@ -25,7 +25,8 @@ def quantize_1bit(
             - scale_u: Rank-k factor U (FP16), shape (N, K or N, 1 if rank=-1)
             - scale_v: Rank-k factor V (FP16), shape (K, C or 1, C if rank=-1)
     """
-    assert input_tensor.dtype == torch.half, "Input tensor must be FP16"
+    if input_tensor.dtype != torch.half:
+        input_tensor = input_tensor.to(torch.half)
     assert input_tensor.ndim == 2, "Input tensor must be 2D"
     N, C = input_tensor.shape
     assert C % 8 == 0, "Channel dimension C must be divisible by 8 for packing"
@@ -441,7 +442,8 @@ def quantize_int8(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
         - zero_point: The zero point tensor (one per channel), dtype torch.int16.
     """
     assert input_tensor.dim() == 2, f"Input tensor must be 2D, but got {input_tensor.dim()} dimensions."
-    assert input_tensor.dtype == torch.half, "Input tensor must be FP16"
+    if input_tensor.dtype != torch.half:
+        input_tensor = input_tensor.to(torch.half)
     # Define quantization range for INT8
     qmin = -128
     qmax = 127
@@ -541,7 +543,8 @@ def _quantize_int4(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
         - min_val: The minimum value tensor (one per channel C), shape (1, C), dtype float16.
     """
     assert input_tensor.dim() == 2, f"Input tensor must be 2D, but got {input_tensor.dim()} dimensions."
-    assert input_tensor.dtype == torch.half, "Input tensor must be FP16"
+    if input_tensor.dtype != torch.half:
+        input_tensor = input_tensor.to(torch.half)
     N, C = input_tensor.shape
     assert N % 2 == 0, f"Dimension N (0) size must be even for INT4 packing, got {N}"
 
@@ -664,7 +667,8 @@ def quantize_int2(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
         - tok_scale: Token-wise scale factor (dtype float16), shape (N, 1).
     """
     assert input_tensor.dim() == 2, "Input tensor must be 2D"
-    assert input_tensor.dtype == torch.half, "Input tensor must be FP16"
+    if input_tensor.dtype != torch.half:
+        input_tensor = input_tensor.to(torch.half)
     N, C = input_tensor.shape
     assert C % 4 == 0, f"Dimension C must be divisible by 4 for INT2 packing, got {C}"
     

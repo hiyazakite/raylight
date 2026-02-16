@@ -43,6 +43,7 @@ def compact_init(config: CompactConfig):
     # Initialize cache using flags from the provided config
     _cache = CompactCache(
         quantize=config.quantized_cache,
+        quant_bits=config.cache_quant_bits,
     )
     global _step
     _step = None
@@ -96,6 +97,7 @@ def compact_reset():
     global _cache
     _cache = CompactCache(
         quantize=_config.quantized_cache, 
+        quant_bits=_config.cache_quant_bits,
     )
     from raylight.distributed_modules.compact.stats import stats_clear
     stats_clear()
@@ -133,7 +135,7 @@ def _compact_compress_fastpath(cache_key, x: torch.Tensor, compress_type: COMPAC
     assert compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2
     assert _config.compress_residual == 1
     # Base should be (N, C) now - returns None if shape mismatch or cache miss
-    base = _cache.get_base(cache_key, expected_shape=x.shape) 
+    base = _cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype) 
     
     # If no base (cache miss or shape mismatch), fall back to warmup behavior
     if base is None:
@@ -221,7 +223,7 @@ def compact_compress(
                     cond_cache_put(cache_key, x, x - base)
         return x.view(original_shape)
     else:
-        if _config.fastpath:
+        if _config.fastpath and (compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2):
             compressed = _compact_compress_fastpath(cache_key, x, compress_type, update_cache, rank)
         else:
             if _config.compress_residual == 0:
@@ -238,7 +240,7 @@ def compact_compress(
                         compress_residual=_config.compress_residual,
                     )
             elif _config.compress_residual == 1:
-                base = _cache.get_base(cache_key, expected_shape=x.shape)
+                base = _cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype)
                 if base is None:
                     # Shape changed - fall back to warmup
                     cond_cache_put(cache_key, x, None)
@@ -259,7 +261,7 @@ def compact_compress(
                         compress_residual=_config.compress_residual,
                     )
             elif _config.compress_residual == 2:
-                base = _cache.get_base(cache_key, expected_shape=x.shape)
+                base = _cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype)
                 if base is None:
                     # Shape changed - fall back to warmup
                     cond_cache_put(cache_key, x, None)
@@ -386,7 +388,19 @@ def compact_decompress(
                     cond_cache_put(cache_key, val, val - base)
         return val.view(original_shape)
     else:
-        if _config.fastpath:
+        
+        N, C = shape
+        if compressed.numel() == N * C:
+             # This is uncompressed fallback (warmup behavior)
+             val = compressed.view(original_shape)
+             # Must flatten for cache quantization if > 2D
+             cache_val = val
+             if cache_val.ndim > 2:
+                 cache_val = cache_val.flatten(0, -2)
+             cond_cache_put(cache_key, cache_val, None)
+             return val
+
+        if _config.fastpath and (compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2):
             reconstructed = _compact_decompress_fastpath(cache_key, compressed, compress_type, shape, update_cache, rank)
         else:
             if _config.compress_residual == 0:

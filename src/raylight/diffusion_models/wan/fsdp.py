@@ -3,7 +3,7 @@ from raylight.distributed_modules.utils import align_model_to_cuda
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
 
 
-def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
+def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload, patcher=None):
     diffusion_model = model.diffusion_model
     # Shard only the blocks, since other modules have different dtype
 

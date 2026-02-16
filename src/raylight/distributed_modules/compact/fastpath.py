@@ -136,7 +136,7 @@ def binary_quant_fastpath(
     # Assertions
     assert rank >= 1 or rank == -1, "Rank must be >= 1 or -1"
     assert x_tensor_nc.dtype in [torch.half, torch.bfloat16]
-    assert base_tensor_nc.dtype in [torch.half, torch.bfloat16]
+    assert base_tensor_nc.dtype == x_tensor_nc.dtype, f"Base dtype {base_tensor_nc.dtype} must match x dtype {x_tensor_nc.dtype}"
     assert x_tensor_nc.ndim == 2 and base_tensor_nc.ndim == 2
     assert x_tensor_nc.shape == base_tensor_nc.shape
 
@@ -162,7 +162,7 @@ def binary_quant_fastpath(
             # scale_u_output_nk = torch.ones((N_ROWS, 1), device=x_tensor_nc.device, dtype=torch.half) # Shape (N, 1)
             
             scale_u_output_nk = torch.mean(tensor_to_quantize_abs_nc, dim=1, keepdim=True) # Shape (N, 1)
-            scale_u_output_nk = (scale_u_output_nk / scale_u_output_nk.mean(dim=0, keepdim=True)).to(torch.half)
+            scale_u_output_nk = (scale_u_output_nk / (scale_u_output_nk.mean(dim=0, keepdim=True) + 1e-6)).to(torch.half)
             scale_v_output_ck = mean_scale_c.unsqueeze(1).contiguous().to(torch.half) # Shape (C, 1)
         effective_rank = 1 # Kernel needs rank >= 1 for its loop
     else: # rank >= 1
@@ -386,7 +386,7 @@ def binary_dequant_fastpath(
     # Assertions
     assert packed.dtype == torch.uint8
     assert scale_u_nk.dtype == torch.half and scale_v_ck.dtype == torch.half
-    assert base_nc.dtype == torch.half
+    assert base_nc.dtype in [torch.half, torch.bfloat16]
     assert packed.ndim == 2 and scale_u_nk.ndim == 2 and scale_v_ck.ndim == 2 and base_nc.ndim == 2
 
     packed = packed.contiguous()
@@ -597,12 +597,8 @@ def int2_quant_fastpath(
     # Assertions
     assert rank == -1, "INT2 fastpath only supports channel/token scales (rank=-1 equivalent)" # Enforce rank=-1
     assert x_tensor_nc.dtype in [torch.half, torch.bfloat16]
-    assert base_tensor_nc.dtype in [torch.half, torch.bfloat16]
+    assert base_tensor_nc.dtype == x_tensor_nc.dtype
     assert x_tensor_nc.ndim == 2 and base_tensor_nc.ndim == 2
-    if x_tensor_nc.shape != base_tensor_nc.shape:
-        msg = f"[CompactFusion] Shape Mismatch! x: {x_tensor_nc.shape}, base: {base_tensor_nc.shape}"
-        print(msg) # Print just in case
-        raise AssertionError(msg)
     assert x_tensor_nc.shape == base_tensor_nc.shape
     # Assert is_cuda removed for potential future CPU compatibility if needed
     # assert x_tensor_nc.is_cuda and base_tensor_nc.is_cuda
@@ -616,15 +612,15 @@ def int2_quant_fastpath(
 
     # --- Scale Calculation (Based on Delta, matches quantize_int2) ---
     with Profiler.scope("compact.quant.calc_scale_int2"):
-        # Calculate delta directly in half precision (or bfloat16)
+        # Calculate delta directly in half precision
         delta_half = x_tensor_nc - base_tensor_nc 
-        abs_delta = torch.abs(delta_half) # Now working with half/bfloat16 precision
-        chan_scale_1c = torch.mean(abs_delta, dim=0, keepdim=True) # Shape (1, C), half/bf16
-        tok_scale_n1 = torch.mean(abs_delta, dim=1, keepdim=True)  # Shape (N, 1), half/bf16
+        abs_delta = torch.abs(delta_half) # Now working with half precision
+        chan_scale_1c = torch.mean(abs_delta, dim=0, keepdim=True) # Shape (1, C), half
+        tok_scale_n1 = torch.mean(abs_delta, dim=1, keepdim=True)  # Shape (N, 1), half
         # Normalize tok_scale
         tok_mean = tok_scale_n1.mean()
         tok_scale_n1 = tok_scale_n1 / (tok_mean + 1e-6)
-        # Scales are converted to half precision to match kernel expectations
+        # Scales are already half precision
         chan_scale_1c_half = chan_scale_1c.contiguous().to(torch.half)
         tok_scale_n1_half = tok_scale_n1.contiguous().to(torch.half)
 
@@ -763,7 +759,7 @@ def int2_dequant_fastpath(
     # Assertions
     assert packed.dtype == torch.uint8
     assert scale_u_nk.dtype == torch.half and scale_v_ck.dtype == torch.half
-    assert base_nc.dtype == torch.half
+    assert base_nc.dtype in [torch.half, torch.bfloat16]
     assert packed.ndim == 2 and scale_u_nk.ndim == 2 and scale_v_ck.ndim == 2 and base_nc.ndim == 2
 
     # Check K=1 for INT2 scales

@@ -25,38 +25,40 @@ def prepare_fsdp_model_for_sampling(work_model, config: "WorkerConfig", state_di
                 work_model.set_fsdp_state_dict(state_dict)
 
     # CRITICAL FOR FSDP: Bake LoRAs into weights before wrapping!
-    # Since 'use_orig_params=True' is not supported in this torch version, FSDP flattens params
-    # which breaks standard ComfyUI soft-patching (hooks). We must hard-patch (bake) first.
-    if hasattr(work_model, "patches") and work_model.patches:
-            print(f"[RayWorker {config.local_rank}] FSDP: Baking {len(work_model.patches)} patches into weights before sharding...")
-            model_was_modified = True
+    # [OPTIMIZATION] We now do this in a streaming fashion inside the FSDP sharding loop
+    # to avoid the massive RAM spike of duplicating the model.
+    # See `fsdp.py` for the implementation.
+    
+    # if hasattr(work_model, "patches") and work_model.patches:
+    #         print(f"[RayWorker {config.local_rank}] FSDP: Baking {len(work_model.patches)} patches into weights before sharding...")
+    #         model_was_modified = True
             
-            # Force in-place update so the underlying model instance (which FSDP wraps) is modified
-            prev_inplace = work_model.weight_inplace_update
-            work_model.weight_inplace_update = True
+    #         # Force in-place update so the underlying model instance (which FSDP wraps) is modified
+    #         prev_inplace = work_model.weight_inplace_update
+    #         work_model.weight_inplace_update = True
             
-            # force_patch_weights=True permanently modifies the weights in work_model.model
-            work_model.load(device_to="cpu", force_patch_weights=True)
+    #         # force_patch_weights=True permanently modifies the weights in work_model.model
+    #         work_model.load(device_to="cpu", force_patch_weights=True)
             
-            # Free memory: We don't need backups of the unbaked weights since we are committing to them
-            if hasattr(work_model, "backup"):
-                work_model.backup.clear()
+    #         # Free memory: We don't need backups of the unbaked weights since we are committing to them
+    #         if hasattr(work_model, "backup"):
+    #             work_model.backup.clear()
 
-            # Restore inplace flag
-            work_model.weight_inplace_update = prev_inplace
+    #         # Restore inplace flag
+    #         work_model.weight_inplace_update = prev_inplace
             
-            # Mark as consistently baked so we can detect this state later
-            work_model.is_fsdp_baked = True
+    #         # Mark as consistently baked so we can detect this state later
+    #         work_model.is_fsdp_baked = True
             
-            # CRITICAL: Prevent FSDP wrapper from reloading stale state_dict over our baked weights
-            if hasattr(work_model, "set_fsdp_state_dict"):
-                print(f"[RayWorker {config.local_rank}] FSDP: Clearing fsdp_state_dict to preserve baked weights.")
-                work_model.set_fsdp_state_dict(None)
+    #         # CRITICAL: Prevent FSDP wrapper from reloading stale state_dict over our baked weights
+    #         if hasattr(work_model, "set_fsdp_state_dict"):
+    #             print(f"[RayWorker {config.local_rank}] FSDP: Clearing fsdp_state_dict to preserve baked weights.")
+    #             work_model.set_fsdp_state_dict(None)
             
-            # Clear patches to prevent double application or tracking issues
-            work_model.patches.clear()
-            if hasattr(work_model, "patches_uuid"):
-                work_model.patches_uuid = uuid.uuid4()
+    #         # Clear patches to prevent double application or tracking issues
+    #         work_model.patches.clear()
+    #         if hasattr(work_model, "patches_uuid"):
+    #             work_model.patches_uuid = uuid.uuid4()
     
     work_model.patch_fsdp()
     
