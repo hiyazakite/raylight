@@ -5,7 +5,6 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
-import comfy
 from comfy.ldm.lightricks.model import apply_rotary_emb
 from ..utils import pad_to_world_size
 attn_type = xfuser_attn.get_attn_type()
@@ -191,11 +190,22 @@ def usp_dit_forward(
     merged_args.update(additional_args)
 
     # Prepare timestep and context
-    timestep, embedded_timestep = self._prepare_timestep(timestep, batch_size, input_dtype, **merged_args)
+    res_timestep = self._prepare_timestep(timestep, batch_size, input_dtype, **merged_args)
+    timestep, embedded_timestep = res_timestep[:2]
+    if len(res_timestep) > 2:
+        merged_args["prompt_timestep"] = res_timestep[2]
     context, attention_mask = self._prepare_context(context, batch_size, x, attention_mask)
 
     # Prepare attention mask
     attention_mask = self._prepare_attention_mask(attention_mask, input_dtype)
+
+    # Build self-attention mask BEFORE padding and chunking x
+    if hasattr(self, "_build_guide_self_attention_mask"):
+        self_attention_mask = self._build_guide_self_attention_mask(
+            x, transformer_options, merged_args
+        )
+    else:
+        self_attention_mask = None
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     # 1. Pad inputs to world size
@@ -225,7 +235,7 @@ def usp_dit_forward(
     # Process transformer blocks
     # torch.cuda.reset_peak_memory_stats() # Optional: reset to see peaks during blocks specifically
     x = self._process_transformer_blocks(
-        x, context, attention_mask, timestep, pe, transformer_options=transformer_options, **merged_args
+        x, context, attention_mask, timestep, pe, transformer_options=transformer_options, self_attention_mask=self_attention_mask, **merged_args
     )
     print(f"[RayWorker {sp_rank}] Blocks complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1024**2:.1f}MB")
     
@@ -257,5 +267,16 @@ def usp_cross_attn_forward(
         q = apply_rotary_emb(q, pe)
         k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
 
-    out = xfuser_optimized_attention(q, k, v, self.heads)
+    out = xfuser_optimized_attention(q, k, v, self.heads, mask=mask)
+
+    # Apply per-head gating if enabled (LTX-specific)
+    if getattr(self, "to_gate_logits", None) is not None:
+        gate_logits = self.to_gate_logits(x)  # (B, T, H)
+        b, t, _ = out.shape
+        # self.heads and self.dim_head should be available on the patched module
+        out = out.view(b, t, self.heads, self.dim_head)
+        gates = 2.0 * torch.sigmoid(gate_logits)  # zero-init -> identity
+        out = out * gates.unsqueeze(-1)
+        out = out.view(b, t, self.heads * self.dim_head)
+
     return self.to_out(out)

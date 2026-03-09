@@ -8,7 +8,6 @@ from raylight.distributed_modules.compact.utils import (
 from raylight.distributed_modules.compact.prof import Profiler
 # from xfuser.modules.base_module import BaseModule
 from raylight.distributed_modules.compact.stats import stats_log, stats_hello
-import os
 from raylight.distributed_modules.compact.slowpath import slowpath_compress, slowpath_decompress, sim_compress
 from raylight.distributed_modules.compact.patchpara.df_cache import AllGatherCache
 from raylight.distributed_modules.compact.utils import ALLOW_DEPRECATED
@@ -57,20 +56,23 @@ def compact_init(config: CompactConfig):
 def compact_hello():
     if dist.get_rank() == 0:
         print("--- 🐳  Compact initialized ---")
-        print(f"🟦  Compact enabled" if _config.enabled else "🟫  Compact disabled")
-        if _config.enabled:
-            if not _config.override_with_patch_gather_fwd:
-                print(f"🟦  Fastpath" if _config.fastpath else "🟫  No fastpath")
-                print(f"🟦  Simulate compress" if _config.simulate_compress else "🟫  No simulate compress")
-                print(f"🟦  Stats log" if _config.log_compress_stats else "🟫  No stats log")
-                print(f"🟦  Check consistency" if _config.check_cache_consistency else "🟫  No check consistency")
-            else:
-                print(f"🟧  Overrided to Patch Para")
-                patch_config = _config.patch_gather_fwd_config
-                print(f"🟨  Using DistriFusion" if patch_config.async_comm else "🟫  Sync patch para")
-                print(f"🟨  Using Compact" if patch_config.use_compact else "🟫  No compression")
+        if _config is None:
+             print("🟫  Compact not initialized")
+        else:
+            print(f"🟦  Compact enabled" if _config.enabled else "🟫  Compact disabled")
+            if _config.enabled:
+                if not _config.override_with_patch_gather_fwd:
+                    print(f"🟦  Fastpath" if _config.fastpath else "🟫  No fastpath")
+                    print(f"🟦  Simulate compress" if _config.simulate_compress else "🟫  No simulate compress")
+                    print(f"🟦  Stats log" if _config.log_compress_stats else "🟫  No stats log")
+                    print(f"🟦  Check consistency" if _config.check_cache_consistency else "🟫  No check consistency")
+                else:
+                    print(f"🟧  Overrided to Patch Para")
+                    patch_config = _config.patch_gather_fwd_config
+                    print(f"🟨  Using DistriFusion" if patch_config.async_comm else "🟫  Sync patch para")
+                    print(f"🟨  Using Compact" if patch_config.use_compact else "🟫  No compression")
         print("------------------------------")
-        if _config.log_compress_stats and _config.enabled:
+        if _config and _config.log_compress_stats and _config.enabled:
             stats_hello()
 
 def compact_config():
@@ -95,9 +97,11 @@ def allgather_cache():
 
 def compact_reset():
     global _cache
+    if _config is None:
+        return
     _cache = CompactCache(
         quantize=_config.quantized_cache, 
-        quant_bits=_config.cache_quant_bits,
+        quant_bits=(_config.cache_quant_bits if _config.cache_quant_bits is not None else 8),
     )
     from raylight.distributed_modules.compact.stats import stats_clear
     stats_clear()
@@ -118,18 +122,18 @@ def compact_get_current_cache_key():
 
 @Profiler.prof_func("compact._compress_fn")
 def _compress_fn(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, rank: int):
-    if _config.simulate_compress:
+    if _config and _config.simulate_compress:
         # NOTE: if simulation enabled, directly return the simulated compress-then-decompress result
-        return sim_compress(x, compress_type, _config.sparse_ratio, rank)
+        return sim_compress(x, compress_type, (_config.sparse_ratio if _config.sparse_ratio is not None else 0), rank)
 
-    return slowpath_compress(x, compress_type, rank=rank, sparse_ratio=_config.sparse_ratio)
+    return slowpath_compress(x, compress_type, rank=rank, sparse_ratio=(_config.sparse_ratio if _config and _config.sparse_ratio is not None else 0))
 
             
 @Profiler.prof_func("compact._decompress_fn")
 def _decompress_fn(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, shape: tuple, rank: int):
-    if _config.simulate_compress:
+    if _config and _config.simulate_compress:
         return x.view(shape)  # no need for further decompression
-    return slowpath_decompress(x, shape, compress_type, rank=rank, sparse_ratio=_config.sparse_ratio)
+    return slowpath_decompress(x, shape, compress_type, rank=rank, sparse_ratio=(_config.sparse_ratio if _config and _config.sparse_ratio is not None else 0))
 
 def _compact_compress_fastpath(cache_key, x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, update_cache: bool, rank: int):
     assert compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2
@@ -188,9 +192,9 @@ def compact_compress(
     update_cache: bool = False,
 ):
     global _current_cache_key
-    _current_cache_key = cache_key
     assert x.is_contiguous()
-    assert _config.enabled
+    if not _config or not _config.enabled:
+        return x
     original_shape = x.shape
     if len(x.shape) >= 4:
         x = x.view(-1, x.shape[-2] * x.shape[-1])
@@ -293,7 +297,9 @@ def compact_compress(
     raise RuntimeError("should not reach here")
 
 def _decay_delta_base(delta_base):
-    return delta_base * _config.delta_decay_factor
+    if _config:
+        return delta_base * _config.delta_decay_factor
+    return delta_base
 
 
 def _compact_decompress_fastpath(cache_key, compressed: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, shape: tuple, update_cache: bool, rank: int):
@@ -351,6 +357,8 @@ def compact_decompress(
 ):
     global _current_cache_key
     _current_cache_key = cache_key
+    if not _config or not _config.enabled:
+        return compressed
     assert _config.enabled
     original_shape = shape
     if len(shape) >= 4:
@@ -429,7 +437,7 @@ def compact_all_gather(
     group=None,
 ):
     # raise NotImplementedError("Compact all gather is inconsistent with ring impl.")
-    assert _config.enabled
+    assert _config and _config.enabled
     rank = dist.get_rank(group)
     my_key = f"{tag}-{rank}"
     to_send = compact_compress(

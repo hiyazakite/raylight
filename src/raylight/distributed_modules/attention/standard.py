@@ -1,6 +1,6 @@
 from typing import Callable
 from yunchang.kernels import AttnType
-from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+from raylight.distributed_modules.compact.attn_layer import xFuserLongContextAttention
 from .interface import AttentionBackend
 from ..sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 
@@ -73,18 +73,20 @@ class StandardAttentionBackend(AttentionBackend):
                     joint_tensor_query=join_q.transpose(1, 2),
                     joint_tensor_key=join_k.transpose(1, 2),
                     joint_tensor_value=join_v.transpose(1, 2),
-                ).transpose(1, 2)
+                    mask=mask,
+                )
             else:
                 out = xfuser_attn(
                     None,
                     q.transpose(1, 2),
                     k.transpose(1, 2),
                     v.transpose(1, 2),
-                ).transpose(1, 2)
+                    mask=mask,
+                )
             
             if not skip_output_reshape:
                 out = (
-                    out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+                    out.reshape(b, -1, heads * dim_head)
                 )
             return out
 

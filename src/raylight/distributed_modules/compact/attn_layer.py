@@ -25,6 +25,7 @@ class xFuserLongContextAttention(LongContextAttention):
         ring_impl_type: str = "basic",
         use_pack_qkv: bool = False,
         use_kv_cache: bool = False,
+        use_sync: bool = False,
         attn_type: AttnType = AttnType.FA,
     ) -> None:
         """
@@ -40,6 +41,7 @@ class xFuserLongContextAttention(LongContextAttention):
             gather_idx=gather_idx,
             ring_impl_type=ring_impl_type,
             use_pack_qkv=use_pack_qkv,
+            use_sync=use_sync,
             attn_type = attn_type,
         )
         self.use_kv_cache = use_kv_cache
@@ -55,13 +57,8 @@ class xFuserLongContextAttention(LongContextAttention):
         """
         COMPACT ATTN
         """
-        from raylight.distributed_modules.compact.main import compact_config
         from raylight.distributed_modules.compact.ring import compact_fwd
-        if compact_config().enabled:
-            self.ring_attn_fn = compact_fwd
-        else:
-            # self.ring_attn_fn = xdit_ring_flash_attn_func
-            raise NotImplementedError("Standard xFuser ring attention not available without xfuser package")
+        self.ring_attn_fn = compact_fwd
         self.idx = None # NOTE: assign idx in forward
 
     @torch.compiler.disable
@@ -131,28 +128,31 @@ class xFuserLongContextAttention(LongContextAttention):
             ulysses_rank = torch.distributed.get_rank(self.ulysses_pg)
             attn_heads_per_ulysses_rank = (
                 joint_tensor_key.shape[-2] // ulysses_world_size
-            )
-            joint_tensor_key = joint_tensor_key[
-                ...,
-                attn_heads_per_ulysses_rank
-                * ulysses_rank : attn_heads_per_ulysses_rank
-                * (ulysses_rank + 1),
-                :,
-            ]
-            joint_tensor_value = joint_tensor_value[
-                ...,
-                attn_heads_per_ulysses_rank
-                * ulysses_rank : attn_heads_per_ulysses_rank
-                * (ulysses_rank + 1),
-                :,
-            ]
+            ) if joint_tensor_key is not None else 0
+            
+            if joint_tensor_key is not None:
+                joint_tensor_key = joint_tensor_key[
+                    ...,
+                    attn_heads_per_ulysses_rank
+                    * ulysses_rank : attn_heads_per_ulysses_rank
+                    * (ulysses_rank + 1),
+                    :,
+                ]
+            if joint_tensor_value is not None:
+                joint_tensor_value = joint_tensor_value[
+                    ...,
+                    attn_heads_per_ulysses_rank
+                    * ulysses_rank : attn_heads_per_ulysses_rank
+                    * (ulysses_rank + 1),
+                    :,
+                ]
         from raylight.distributed_modules.compact.prof import Profiler
         # 3 X (bs, seq_len/N, head_cnt, head_size) -> 3 X (bs, seq_len, head_cnt/N, head_size)
         # scatter 2, gather 1
         with Profiler.instance().scope("ulysses.all2all"):
             if self.use_pack_qkv:
                 # (3*bs, seq_len/N, head_cnt, head_size)
-                qkv = torch.cat([query, key, value]).continous()
+                qkv = torch.cat([query, key, value]).contiguous()
                 # (3*bs, seq_len, head_cnt/N, head_size)
                 qkv = SeqAllToAll4D.apply(
                     self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx
@@ -189,7 +189,8 @@ class xFuserLongContextAttention(LongContextAttention):
         # collect(key_layer, "k", compact_get_step(), self.idx)
         # collect(value_layer, "v", compact_get_step(), self.idx)
         
-        if compact_config().enabled:
+        config = compact_config()
+        if config and config.enabled:
             # assert not self.use_kv_cache
             out = self.ring_attn_fn(
                 query_layer,
@@ -228,6 +229,7 @@ class xFuserLongContextAttention(LongContextAttention):
                 joint_tensor_key=joint_tensor_key,
                 joint_tensor_value=joint_tensor_value,
                 joint_strategy=joint_strategy,
+                mask=mask, # Pass mask here too!
             )
 
         if type(out) == tuple:

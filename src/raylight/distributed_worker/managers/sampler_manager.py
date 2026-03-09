@@ -191,7 +191,7 @@ class SamplerManager:
                       callback=sampling_callback,
                   )
                  out = work_latent.copy()
-                 out["samples"] = samples.cpu()
+                 out["samples"] = samples.to("cpu")
                  del samples # Drop GPU reference immediately
 
         return out, model_modified
@@ -310,7 +310,7 @@ class SamplerManager:
                             callback=sampling_callback,
                         )
             out = work_latent.copy()
-            out["samples"] = samples.cpu()
+            out["samples"] = samples.to("cpu")
             del samples # Drop GPU reference immediately
 
         return (out,), model_modified

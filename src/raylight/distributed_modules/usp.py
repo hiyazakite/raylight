@@ -294,6 +294,14 @@ if hasattr(model_base, "LTXAV"):
             block.audio_to_video_attn.forward = types.MethodType(usp_cross_attn_forward, block.audio_to_video_attn)
             block.video_to_audio_attn.forward = types.MethodType(usp_cross_attn_forward, block.video_to_audio_attn)
 
+        # Patch Embedding Connectors (LTXAV-specific)
+        if hasattr(model, "video_embeddings_connector"):
+            for block in model.video_embeddings_connector.transformer_1d_blocks:
+                block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
+        if hasattr(model, "audio_embeddings_connector"):
+            for block in model.audio_embeddings_connector.transformer_1d_blocks:
+                block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
+
         model._forward = types.MethodType(usp_dit_forward, model)
 
 if hasattr(model_base, "LTXV"):

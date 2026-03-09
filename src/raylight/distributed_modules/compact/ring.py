@@ -3,17 +3,13 @@ NOTE: code from yunchang
 """
 
 import torch
-import torch.distributed as dist
+
+
 
 from yunchang.ring.utils import RingComm, update_out_and_lse
 
 
-from yunchang import LongContextAttention
-from yunchang.kernels import AttnType
-from yunchang.hybrid.utils import RING_IMPL_DICT
-from yunchang.kernels import select_flash_attn_impl
-from yunchang.comm.all_to_all import SeqAllToAll4D
-from torch import Tensor
+
 
 from raylight.distributed_modules.compact.utils import COMPACT_COMPRESS_TYPE
 from raylight.distributed_modules.compact.main import (
@@ -30,7 +26,6 @@ try:
 except ImportError:
     flash_attn = None
     _flash_attn_forward = None
-    from yunchang.kernels.attention import pytorch_attn_forward
 
 
 def compact_fwd(
@@ -56,13 +51,15 @@ def compact_fwd(
     """
     Compact ring attention forward pass.
     """
-    gather = compact_config().override_with_patch_gather_fwd
+    config = compact_config()
+    gather = config.override_with_patch_gather_fwd if config else False
     
     if gather:
         from raylight.distributed_modules.compact.patchpara.fwd import patch_gather_fwd
         return patch_gather_fwd(
             q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_attn_probs,
-            deterministic, attn_layer, group, joint_tensor_key, joint_tensor_value, joint_strategy, mod_idx, current_iter
+            deterministic, attn_layer, group, joint_tensor_key, joint_tensor_value, joint_strategy, mod_idx, current_iter,
+            mask=mask
         )
     else:
         return _compact_ring_fwd(
@@ -155,17 +152,8 @@ def compact_attn_forward(
     # We should use manual causal mask if mask is present.
     
     if mask is not None and causal:
-        # Create causal mask for the block
-        L, S = q.size(-2), k.size(-2)
-        causal_mask = torch.ones(L, S, device=q.device, dtype=torch.bool).tril()
-        # Broadcast to proper shape
-        # mask is (B, ..., S)
-        # Combine? 
-        # For simplicity, if mask is present, we assume it handles what's needed or we ignore causal?
-        # No, Ring causal is structural.
-        # Let's hope SDPA handles is_causal + attn_mask (supported in Torch 2.0+ usually?)
-        # Actually checking docs: "is_causal=True is incompatible with attn_mask".
         pass
+        
         
     # Fallback to simple SDPA without is_causal if mask is present (assuming mask handles it or not needed?)
     # But `causal` here means "Lower Triangular".
@@ -177,7 +165,8 @@ def compact_attn_forward(
     op_causal = causal
     op_mask = mask
     
-    if causal and mask is not None:
+    if causal and op_mask is not None:
+        assert isinstance(op_mask, torch.Tensor)
         op_causal = False
         # Merge causal mask into op_mask
         L, S = q.size(-2), k.size(-2)
@@ -296,7 +285,7 @@ def _compact_ring_fwd(
         pass
     else:
         raise ValueError(
-            f"joint_tensor_key and joint_tensor_value should be None or not None simultaneously."
+            "joint_tensor_key and joint_tensor_value should be None or not None simultaneously."
         )
     if attn_layer is not None:
         # XXX: we dont need KV Cache in ring
@@ -318,9 +307,13 @@ def _compact_ring_fwd(
     out = None
     lse = None
 
-    compress_type_k = compact_config().compress_func(mod_idx, current_iter)
-    compress_type_v = compact_config().compress_func(mod_idx, current_iter)
-    # assert compact_config().error_feedback, "error feedback must be enabled"
+    config = compact_config()
+    if config:
+        compress_type_k = config.compress_func(mod_idx, current_iter)
+        compress_type_v = config.compress_func(mod_idx, current_iter)
+    else:
+        compress_type_k = COMPACT_COMPRESS_TYPE.IDENTITY
+        compress_type_v = COMPACT_COMPRESS_TYPE.IDENTITY
     
     # Cache keys match reference implementation (no shape in key)
     # Shape mismatches are handled gracefully in get_base by returning None
@@ -332,9 +325,11 @@ def _compact_ring_fwd(
     v_to_send = compact_compress(v_my_cache_key, v, compress_type_v, update_cache=True)
     
     for step in range(comm.world_size):
+        buf_k: torch.Tensor = torch.empty(0)
+        buf_v: torch.Tensor = torch.empty(0)
         if step + 1 != comm.world_size:
-            buf_k: torch.Tensor = comm.send_recv(k_to_send)
-            buf_v: torch.Tensor = comm.send_recv(v_to_send)
+            buf_k = comm.send_recv(k_to_send)
+            buf_v = comm.send_recv(v_to_send)
             comm.commit()
         
         if step != 0:
@@ -352,12 +347,14 @@ def _compact_ring_fwd(
 
         if is_joint and joint_strategy == "rear":
             if step + 1 == comm.world_size:
+                assert joint_tensor_key is not None and joint_tensor_value is not None
                 key_to_use = torch.cat([k, joint_tensor_key], dim=1)
                 value_to_use = torch.cat([v, joint_tensor_value], dim=1)
             else:
                 key_to_use, value_to_use = k, v
         elif is_joint and joint_strategy == "front":
             if step == 0:
+                assert joint_tensor_key is not None and joint_tensor_value is not None
                 key_to_use = torch.cat([joint_tensor_key, k], dim=1)
                 value_to_use = torch.cat([joint_tensor_value, v], dim=1)
             else:
@@ -374,21 +371,33 @@ def _compact_ring_fwd(
                 value_to_use = value_to_use.to(q.dtype)
 
             # Calculate mask slice for the current K block
+            # mask handling
             mask_slice = None
             if mask is not None:
-                seq_len = k.shape[1]
+                # mask: [B, 1, 1, seq_len] or [B, 1, seq_len, seq_len]
+                # Handle broadcastable masks (singleton dimensions)
+                q_len = q.shape[1]
+                k_len_block = k.shape[1] # Length of the current K block
+                
+                # Calculate global start/end for the current K block
                 recv_rank = (comm.rank - step) % comm.world_size
-                start = recv_rank * seq_len
-                end = start + seq_len
-                # Assume mask is (B, ..., S_global) -> slice last dim
-                if mask.shape[-1] >= end:
-                    mask_slice = mask[..., start:end]
-                else: 
-                     # Handle edge case or assume mask is already local? 
-                     # If mask is local (S_local), then no slice needed?
-                     # But Ring requires Global consistency. Assume Global Mask.
-                     mask_slice = mask
-
+                # Since Ring rotates K, we need to know which global chunk we are looking at.
+                # seq_len_local = k_len_block (assuming all chunks equal size)
+                k_start = recv_rank * k_len_block
+                
+                # Slicing:
+                # If mask is [B, 1, 1, S_global], we slice dim 3.
+                # If mask is [B, 1, S_global, S_global], we slice dim 2 (Q) and dim 3 (K).
+                # Note: Q is ALWAYS local in our Ring implementation (only K rotates).
+                # So Q index is always [sp_rank * q_len : (sp_rank + 1) * q_len].
+                from xfuser.core.distributed import get_sequence_parallel_rank
+                sp_rank = get_sequence_parallel_rank()
+                q_start = sp_rank * q_len
+                
+                q_idx = slice(q_start, q_start + q_len) if mask.shape[2] > 1 else slice(None)
+                k_idx = slice(k_start, k_start + k_len_block) if mask.shape[3] > 1 else slice(None)
+                
+                mask_slice = mask[:, :, q_idx, k_idx]
 
             if mask is not None or flash_attn is None:
                 # Use custom manual attention if mask is present or FlashAttn unavailable
@@ -403,7 +412,26 @@ def _compact_ring_fwd(
                     mask=mask_slice
                 )
             else:
-                if flash_attn.__version__ <= "2.6.3": 
+                assert _flash_attn_forward is not None
+                v_str = getattr(flash_attn, "__version__", "0.0.0")
+                
+                # Robust version check for flash_attn signature
+                # 2.7.0+ changed signature to use separate window_size params and return 4 values
+                use_legacy = False
+                if v_str == "0.0.0":
+                    use_legacy = False # Assume modern if version unknown
+                else:
+                    try:
+                        v_parts = [int(p) for p in v_str.split('.') if p.isdigit()]
+                        if v_parts and v_parts[0] < 2:
+                            use_legacy = True
+                        elif v_parts and v_parts[0] == 2 and len(v_parts) > 1 and v_parts[1] <= 6:
+                            # 2.6.3 and below
+                            use_legacy = True
+                    except Exception:
+                        use_legacy = False
+
+                if use_legacy: 
                     block_out, _, _, _, _, block_lse, _, _ = _flash_attn_forward(
                         q,
                         key_to_use,
@@ -438,8 +466,16 @@ def _compact_ring_fwd(
             k_to_send = buf_k 
             v_to_send = buf_v
     
+    if out is None:
+        out = torch.zeros_like(q)
+    if lse is None:
+        # (bs, head, seq, 1) or (bs, head, block_seq)
+        lse = torch.zeros(q.shape[0], q.shape[2], q.shape[1], 1, device=q.device, dtype=torch.float32)
+
     out = out.to(q.dtype)
     lse = lse.squeeze(dim=-1).transpose(1, 2)
-    if compact_config().check_cache_consistency:
-        compact_cache().check_consistency(group=process_group)
+    if config and config.check_cache_consistency:
+        cache = compact_cache()
+        if cache:
+            cache.check_consistency(group=process_group)
     return out, lse, None

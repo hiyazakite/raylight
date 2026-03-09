@@ -2,6 +2,7 @@ from raylight.distributed_modules.compact.main import compact_config
 from raylight.distributed_modules.compact.prof import Profiler
 import torch
 import torch.distributed as dist
+from raylight.distributed_modules.compact.utils import COMPACT_COMPRESS_TYPE
 
 # Import necessary components for DistriFusion
 from raylight.distributed_modules.compact.patchpara.df_cache import AllGatherCache, DummyHandle
@@ -13,8 +14,8 @@ try:
 except ImportError:
     flash_attn = None
     _flash_attn_forward = None
-    from yunchang.kernels.attention import pytorch_attn_forward
 
+from raylight.distributed_modules.compact.ring import compact_attn_forward
 _buffers = {}
 @Profiler.prof_func("patch_gather_fwd.gather_patch_fwd")
 def patch_gather_fwd(
@@ -35,6 +36,7 @@ def patch_gather_fwd(
     joint_strategy="none",
     mod_idx=None,
     current_iter=None,
+    mask=None,
 ):
     """
     Attention forward pass using all_gather for K/V tensors (no compression).
@@ -43,8 +45,11 @@ def patch_gather_fwd(
     assert alibi_slopes is None, "Alibi slopes not supported in this basic gather impl."
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-    assert compact_config().override_with_patch_gather_fwd, "Patch gather fwd is not enabled"
-    config: PatchConfig = compact_config().patch_gather_fwd_config
+    config_obj = compact_config()
+    override = config_obj.override_with_patch_gather_fwd if config_obj else False
+    assert override, "Patch gather fwd is not enabled"
+    config: PatchConfig = config_obj.patch_gather_fwd_config if config_obj else None
+    assert config is not None, "patch_gather_fwd_config is required"
     assert mod_idx is not None, "mod_idx is required for caching"
     assert current_iter is not None, "current_iter is required for async logic"
 
@@ -72,6 +77,7 @@ def patch_gather_fwd(
     world_size = dist.get_world_size(process_group)
     rank = dist.get_rank(process_group)
     
+    cache = None
     if config.async_comm:
         from raylight.distributed_modules.compact.main import allgather_cache
         cache = allgather_cache()
@@ -86,8 +92,8 @@ def patch_gather_fwd(
     # --- Communication Step (Sync or Async) ---
     if config.use_compact:
         from raylight.distributed_modules.compact.main import compact_all_gather
-        comp_type_k = compact_config().compress_func(mod_idx, current_iter)
-        comp_type_v = compact_config().compress_func(mod_idx, current_iter)
+        comp_type_k = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
+        comp_type_v = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
         k_list_for_computation = compact_all_gather(
             f"{mod_idx}-k",
             k,
@@ -129,8 +135,9 @@ def patch_gather_fwd(
                 dist.all_gather(v_list, v, group=process_group)
 
                 # Store results with a dummy handle for the *next* step to wait on (no-op)
-                cache.put(k_cache_key, DummyHandle(), k_list, k)
-                cache.put(v_cache_key, DummyHandle(), v_list, v)
+                if cache is not None:
+                    cache.put(k_cache_key, DummyHandle(), k_list, k)
+                    cache.put(v_cache_key, DummyHandle(), v_list, v)
 
                 # Use current results for computation in this warmup step
                 k_list_for_computation = k_list
@@ -139,7 +146,7 @@ def patch_gather_fwd(
             else:
                 # --- Async Phase (Wait Previous + Launch Current) --- #
                 # Wait for and get results from the *previous* step's async gather
-                if not cache.contains(k_cache_key) or not cache.contains(v_cache_key):
+                if cache is None or not cache.contains(k_cache_key) or not cache.contains(v_cache_key):
                         # Should be populated by the last warmup step or previous async step
                         raise RuntimeError(f"DistriFusion cache miss for key {k_cache_key} or {v_cache_key} at iter {current_iter}. Check async_warmup steps.")
 
@@ -167,8 +174,9 @@ def patch_gather_fwd(
                 v_handle = dist.all_gather(next_v_list, v, group=process_group, async_op=True)
 
                 # Store the handle and receive buffers for the next step
-                cache.put(k_cache_key, k_handle, next_k_list, k)
-                cache.put(v_cache_key, v_handle, next_v_list, v)
+                if cache is not None:
+                    cache.put(k_cache_key, k_handle, next_k_list, k)
+                    cache.put(v_cache_key, v_handle, next_v_list, v)
                 # --- End Async Phase --- #
     # --- End Communication Step --- #
 
@@ -191,8 +199,18 @@ def patch_gather_fwd(
 
     # Perform attention with potentially augmented global K and V
     # with Profiler.scope("compact.gather.attention"): # Profile the computation
-    if flash_attn is None:
+        out, lse = compact_attn_forward(
+            q,
+            key_to_use, # Use potentially augmented K
+            value_to_use, # Use potentially augmented V
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            mask=mask,
+        )
+    elif flash_attn is None:
         # Use PyTorch attention if flash_attn not available
+        from yunchang.kernels.attention import pytorch_attn_forward
         out, lse = pytorch_attn_forward(
             q,
             key_to_use, # Use potentially augmented K
