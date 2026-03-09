@@ -961,18 +961,16 @@ class RayVAEDecodeDistributed:
         # Causal VAE output formula: (Latent_T - 1) * compression + 1
         if isinstance(temporal_compression, (int, float)) and temporal_compression > 1:
             total_output_frames = (total_frames - 1) * temporal_compression + 1
-            overlap_latent_frames = 1 # 1 frame overlap is sufficient for continuity in causal VAE
         else:
             total_output_frames = total_frames
-            overlap_latent_frames = 0
             
         # Calculate Master Output Shape (B, T, H, W, C)
         # We assume Batch=1 for video usually, but we handle standard (B, T, H, W, C) structure 
         # or (T, H, W, C) if squeezed. ComfyUI usually expects (TotalFrames, H, W, 3) for video batch.
         H_out = latents.shape[3] * spatial_compression
         W_out = latents.shape[4] * spatial_compression
-        # Final shape: (TotalFrames, Height, Width, 3)
-        master_shape = (total_output_frames, H_out, W_out, 3)
+        # Final shape: (Batch, TotalFrames, Height, Width, 3)
+        master_shape = (latents.shape[0], total_output_frames, H_out, W_out, 3)
         
         # 3. Create Shared Memory File (Pre-allocation)
         mmap_path = f"/dev/shm/raylight_vae_out_{uuid.uuid4().hex}.bin"
@@ -1019,10 +1017,22 @@ class RayVAEDecodeDistributed:
                 discard_latent_frames = start - context_start
                 
                 # Calculate Output Offset due to temporal compression
-                # shard index 'start' corresponds to video frame:
-                start_video_frame = start * temporal_compression
-                if temporal_compression == 1:
-                     start_video_frame = start
+                # For causal VAEs, the first shard starts at frame 0.
+                # Subsequent shards start at shard_index * frames_per_shard.
+                # But because they share 1 frame of context, we need to align the output properly.
+                if isinstance(temporal_compression, (int, float)) and temporal_compression > 1:
+                    # Causal VAE: Frame 0 in latents -> Frame 0 in video
+                    # Frame 1 in latents -> Frame (1)*comp in video? No.
+                    # Formula: output_frame = latent_frame * comp
+                    # But the first shard (start=0) starts at 0.
+                    # Shard 1 (start=N) starts at video frame (N * comp).
+                    # Actually, the formula (total_frames - 1) * comp + 1 suggests:
+                    # latent 0 -> video 0
+                    # latent 1 -> video comp
+                    # latent 2 -> video 2*comp
+                    start_video_frame = start * temporal_compression
+                else:
+                    start_video_frame = start
                 
                 print(f"[RayVAEDecode] Shard {i}: Latents {context_start} to {end} (discard {discard_latent_frames}) -> Video Frame {start_video_frame}")
                 
@@ -1044,7 +1054,6 @@ class RayVAEDecodeDistributed:
             
             # 5. Gather Results (Stats Only)
             remaining = list(futures)
-            futures_count = len(futures)
             received_count = 0
             
             while remaining:
@@ -1081,21 +1090,21 @@ class RayVAEDecodeDistributed:
                         
                         # Write to mmap manually
                         start = shard_index * frames_per_shard
-                        start_video_frame = start * temporal_compression
-                        s_len = shard_data.shape[0]
-                        end_video_frame = start_video_frame + s_len
+                        start_video_frame = start * temporal_compression if (isinstance(temporal_compression, (int, float)) and temporal_compression > 1) else start
+                        
+                        # shard_data is [Batch, T, H, W, 3] from worker
+                        s_len = shard_data.shape[1]
                         
                         # Handle truncation if needed
-                        if end_video_frame > total_output_frames:
+                        if start_video_frame + s_len > total_output_frames:
                             s_len = max(0, total_output_frames - start_video_frame)
-                            shard_data = shard_data[:s_len]
-                            end_video_frame = start_video_frame + s_len
+                            shard_data = shard_data[:, :s_len]
                         
                         if s_len > 0:
                             # Use Any cast for results that linter misinterprets
                             shard_data_any: Any = shard_data
                             full_image_any: Any = full_image
-                            full_image_any[start_video_frame:end_video_frame] = shard_data_any.to(torch.float32)
+                            full_image_any[:, start_video_frame : start_video_frame + s_len] = shard_data_any.to(torch.float32)
 
                         del shard_data
 
@@ -1115,7 +1124,17 @@ class RayVAEDecodeDistributed:
                 cancellable_get(release_futures)
                 print("[RayVAEDecode] VAE released from all workers.")
 
-            return (full_image,)
+            # 8. Return result
+            # ComfyUI's downstream video nodes expect (Time, H, W, 3) 
+            # while our internal master_shape is (Batch, Time, H, W, 3).
+            # Squeeze batch dimension if Batch=1 for compatibility.
+            if full_image.shape[0] == 1:
+                return (full_image.squeeze(0),)
+            else:
+                # If Batch > 1, we return 5D. 
+                # Note: Most ComfyUI image nodes expect (Batch, H, W, 3).
+                # For video Batch > 1, standard nodes might fail anyway without flattening.
+                return (full_image,)
             
         except Exception as e:
             # Cleanup on failure

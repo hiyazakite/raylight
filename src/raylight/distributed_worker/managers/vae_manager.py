@@ -163,6 +163,7 @@ class VaeManager:
             print(f"[RayWorker {config.local_rank}] VAE self.device={self.vae_model.device}, latents device={latents_to_decode.device}")
     
             # 3. Decode
+            # ComfyUI's decode_tiled returns [B, T, H, W, C] for 3D or [B, H, W, C] for 2D
             images = self.vae_model.decode_tiled(
                 latents_to_decode,
                 tile_x=tile_size // compression,
@@ -173,6 +174,7 @@ class VaeManager:
             )
             print(f"[RayWorker {config.local_rank}] decode_tiled complete. Shape: {images.shape}")
             
+            # Post-processing: discard warmup
             # 4. Post-Process (Shape Fix + Warmup Discard)
             images = self._post_process_images(images, discard_latent_frames, config.local_rank, shard_index)
             
@@ -234,26 +236,25 @@ class VaeManager:
         if torch.isnan(images).any():
             print(f"[RayWorker {local_rank}] CRITICAL: VAE output STILL contains NaNs even in float32!")
         
-        # Shape normalization
-        if len(images.shape) == 5:
-            # [B, T, H, W, C] -> [B*T, H, W, C]
-            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
-        elif len(images.shape) == 4:
-            # Already [T, H, W, C]
-            pass
-        else:
-            # Fallback for unexpected shapes
-            while len(images.shape) > 4 and images.shape[0] == 1:
-                images = images.squeeze(0)
-            if len(images.shape) == 3: # H, W, C -> 1, H, W, C
-                images = images.unsqueeze(0)
+        # Shape normalization: ensure [Batch, Time, Height, Width, Channels]
+        # input is typically [B, H, W, C] or [B, T, H, W, C] (after movedim)
+        if len(images.shape) == 4:
+            # [B, H, W, C] -> Insert Time dimension: [B, 1, H, W, C]
+            images = images.unsqueeze(1)
             
-        # Discard warmup frames
+        # Discard warmup frames (temporal sharding logic)
         if discard_latent_frames > 0 and self.vae_model is not None:
-            temporal_compression = self.vae_model.temporal_compression_decode() or 8
+            # Fallback to 1 for 2D VAEs to avoid massive over-discarding
+            temporal_compression = self.vae_model.temporal_compression_decode() or 1
             discard_video_frames = discard_latent_frames * temporal_compression
-            print(f"[RayWorker {local_rank}] Discarding {discard_video_frames} redundant warmup frames")
-            images = images[discard_video_frames:]
+            
+            if images.shape[1] > discard_video_frames:
+                print(f"[RayWorker {local_rank}] Discarding {discard_video_frames} redundant warmup frames per batch element")
+                images = images[:, discard_video_frames:]
+            else:
+                # This can happen if we are at the very beginning of a 2D batch shard and context was requested?
+                # Or for LTX if shard_frames was 1 and discard was 1.
+                print(f"[RayWorker {local_rank}] WARNING: discard_video_frames ({discard_video_frames}) >= T ({images.shape[1]}).")
             
         return images
 
@@ -266,24 +267,39 @@ class VaeManager:
         
         if mmap_path and mmap_shape:
             # Fast Path: Direct write to shared memory
-            print(f"[RayWorker {local_rank}] Writing directly to shared mmap: {mmap_path} (offset={output_offset})...")
+            print(f"[RayWorker {local_rank}] Writing directly to shared mmap: {mmap_path} (offset={output_offset}, shape={images.shape})...")
             
             # Calculate total elements
             num_elements = 1
             for dim in mmap_shape: num_elements *= dim
             
             # Map the shared file (assumed float32 output)
+            # mmap_shape is typically [TotalFrames, H, W, 3] or [Batch, TotalFrames, H, W, 3]
             out_buffer = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(mmap_shape)
             
             # Calculate write length with safety clipping
-            write_len = images.shape[0]
-            if output_offset + write_len > out_buffer.shape[0]:
-                 write_len = out_buffer.shape[0] - output_offset
-                 images = images[:write_len]
-
-            # Write data
-            # Optimization: implicit cast via copy_ avoids VRAM spike
-            out_buffer[output_offset : output_offset + write_len].copy_(images, non_blocking=True)
+            shard_frames = images.shape[1]
+            
+            if len(mmap_shape) == 5:
+                # [Batch, T, H, W, C]
+                if output_offset + shard_frames > out_buffer.shape[1]:
+                    shard_frames = max(0, out_buffer.shape[1] - output_offset)
+                    images = images[:, :shard_frames]
+                
+                if shard_frames > 0:
+                    out_buffer[:, output_offset : output_offset + shard_frames].copy_(images.to(torch.float32), non_blocking=True)
+            else:
+                # [TotalFrames, H, W, C] - Flattened batch (traditional ComfyUI)
+                flat_images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+                write_len = flat_images.shape[0]
+                
+                if output_offset + write_len > out_buffer.shape[0]:
+                    write_len = max(0, out_buffer.shape[0] - output_offset)
+                    flat_images = flat_images[:write_len]
+                
+                if write_len > 0:
+                    out_buffer[output_offset : output_offset + write_len].copy_(flat_images.to(torch.float32), non_blocking=True)
+            
             torch.cuda.synchronize() # Ensure copy completes before we return/cleanup
             
             # Return metadata only
