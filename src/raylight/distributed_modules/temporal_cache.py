@@ -37,6 +37,13 @@ class DenoisingStepTracker:
         self.cache_hit_count = 0
         self.cache_miss_count = 0
 
+    def log_stats(self):
+        """Log summary of hits and misses for the current session."""
+        total = self.cache_hit_count + self.cache_miss_count
+        if total > 0:
+            hit_rate = (self.cache_hit_count / total) * 100
+            print(f"[TemporalCache] Session Stats: Hits={self.cache_hit_count}, Misses={self.cache_miss_count}, Hit Rate={hit_rate:.1f}%")
+
     def should_cache(self, skip_interval: int = 1, start_pct: float = 0.1, end_pct: float = 0.9):
         """Determine if current step should use cached attention.
         
@@ -74,6 +81,11 @@ class CachedAttentionWrapper:
         self.cached_step = -1
         
     def __call__(self, x, context=None, **kwargs):
+        # If caching is disabled, just run the original forward and ensure cache is clear
+        if not self.config.get("enabled", True):
+            self.cache = None
+            return self.original_forward(x, context=context, **kwargs)
+
         # Determine if this is a self-attention call.
         is_self_attn = context is None or context is x
         
@@ -90,6 +102,7 @@ class CachedAttentionWrapper:
         
         if use_cache:
             self.tracker.cache_hit_count += 1
+            logger.debug(f"[TemporalCache] Hit: {self.name} at step {self.tracker.current_step}")
             return self.cache
             
         # Cache miss - compute and store
@@ -97,6 +110,7 @@ class CachedAttentionWrapper:
         
         if is_self_attn:
             self.tracker.cache_miss_count += 1
+            logger.debug(f"[TemporalCache] Miss: {self.name} at step {self.tracker.current_step}")
             self.cache = out
             self.cached_step = self.tracker.current_step
             
@@ -114,6 +128,11 @@ class FluxCachedAttentionHandler:
         self.cache = {}
         
     def __call__(self, q, k, v, pe, mask=None, transformer_options={}):
+        # If caching is disabled, just run the original attention and ensure cache is clear
+        if not self.config.get("enabled", True):
+            self.cache.clear()
+            return self.original_attention(q, k, v, pe, mask=mask, transformer_options=transformer_options)
+
         block_index = transformer_options.get("block_index")
         block_type = transformer_options.get("block_type", "unknown")
         
@@ -133,12 +152,14 @@ class FluxCachedAttentionHandler:
         
         if use_cache:
             self.tracker.cache_hit_count += 1
+            logger.debug(f"[FluxCache] Hit: {key} at step {self.tracker.current_step}")
             return self.cache[key]
             
         # Cache miss - compute and store
         out = self.original_attention(q, k, v, pe, mask=mask, transformer_options=transformer_options)
         
         self.tracker.cache_miss_count += 1
+        logger.debug(f"[FluxCache] Miss: {key} at step {self.tracker.current_step}")
         self.cache[key] = out
         return out
 
@@ -164,7 +185,11 @@ def apply_temporal_caching(model, config: dict):
     if model_type == "Flux":
         try:
             import comfy.ldm.flux.math as flux_math
-            if not hasattr(flux_math, "_temporal_cache_original_attention"):
+            if hasattr(flux_math, "_temporal_cache_original_attention"):
+                flux_math.attention.config = config
+                if not config.get("enabled", True):
+                    tracker.reset()
+            else:
                 flux_math._temporal_cache_original_attention = flux_math.attention
                 handler = FluxCachedAttentionHandler(flux_math._temporal_cache_original_attention, tracker, config)
                 flux_math.attention = handler
@@ -179,7 +204,12 @@ def apply_temporal_caching(model, config: dict):
         # Direct patching on known attention module types or methods
         if hasattr(module, "forward") and hasattr(module, "to_q") and hasattr(module, "to_k"):
             # This looks like a standard attention module (e.g. comfy/ldm/modules/attention.py)
-            if not hasattr(module, "_temporal_cache_original_forward"):
+            if hasattr(module, "_temporal_cache_original_forward"):
+                # Update existing wrapper's config
+                module.forward.config = config
+                if not config.get("enabled", True):
+                    tracker.reset()
+            else:
                 module._temporal_cache_original_forward = getattr(module, "forward")
                 wrapper = CachedAttentionWrapper(module._temporal_cache_original_forward, tracker, config, name=prefix)
                 module.forward = wrapper
@@ -199,5 +229,7 @@ def apply_temporal_caching(model, config: dict):
     patch_recursive(target)
     if patched_count > 0:
         print(f"[TemporalCache] Patched {patched_count} attention modules.")
+    elif model_type != "Flux":
+        print("[TemporalCache] Updated config for existing attention modules.")
     
     return tracker

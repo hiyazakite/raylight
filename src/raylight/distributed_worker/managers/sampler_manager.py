@@ -93,20 +93,24 @@ class SamplerManager:
                 yield (work_model, latent_image, noise_mask, disable_pbar, work_latent, model_was_modified)
             finally:
                 # 2. Cleanup after sampling
-                # This runs whether sampling succeeded or failed
-                if config.is_fsdp:
-                    # For FSDP, especially if offloading is disabled, we need to aggressively
-                    # clean up activations/buffers that might hang around.
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    try:
-                        # Clear CompactFusion/Cache if present
-                        from raylight.distributed_modules.compact.main import compact_reset
+                import gc
+                gc.collect()
+
+                try:
+                    from raylight.distributed_modules.compact.main import compact_config, compact_reset
+                    if compact_config() is not None:
+                        # Compact attention backend: reset the delta KV cache and step counter.
+                        # compact_reset() handles its own internal memory; no empty_cache needed.
                         compact_reset()
-                    except:
-                        pass
-                        
+                    else:
+                        # Standard attention backend: defragment GPU allocator to prevent
+                        # cross-run slowdown from fragmented ring attention buffers.
+                        torch.cuda.empty_cache()
+                except Exception:
+                    # Fallback: always defragment if compact state is unavailable
+                    torch.cuda.empty_cache()
+
+                if config.is_fsdp:
                     # Reset temporal cache tracker if present
                     if getattr(self, "temporal_cache_tracker", None) is not None:
                         self.temporal_cache_tracker.reset()  # type: ignore
@@ -200,6 +204,8 @@ class SamplerManager:
                       seed=noise_seed,
                       callback=sampling_callback,
                   )
+                 if getattr(self, "temporal_cache_tracker", None) is not None:
+                     self.temporal_cache_tracker.log_stats()
                  out = work_latent.copy()
                  out["samples"] = samples.to("cpu")
                  del samples # Drop GPU reference immediately
@@ -324,6 +330,9 @@ class SamplerManager:
                             seed=seed,
                             callback=sampling_callback,
                         )
+                
+                if getattr(self, "temporal_cache_tracker", None) is not None:
+                    self.temporal_cache_tracker.log_stats()
             out = work_latent.copy()
             out["samples"] = samples.to("cpu")
             del samples # Drop GPU reference immediately

@@ -2,6 +2,13 @@ import torch
 from raylight.distributed_modules.compact.prof import Profiler
 import torch.nn.functional as F # For normalization
 
+def _ensure_standard_tensor(x):
+    if x is None:
+        return None
+    if torch.is_tensor(x) and type(x) is not torch.Tensor:
+        return x.as_subclass(torch.Tensor)
+    return x
+
 def svd(input_tensor: torch.Tensor, rank: int):
     U, S, Vh = torch.linalg.svd(input_tensor.float(), full_matrices=False)
     # Create a diagonal matrix from S since S is 1d
@@ -13,7 +20,7 @@ def svd(input_tensor: torch.Tensor, rank: int):
 
 @Profiler.prof_func("compact.subspace_iter")
 @torch.compile
-def subspace_iter(
+def _subspace_iter_compiled(
     A: torch.Tensor, rank: int, num_iters: int = 10, init_q: torch.Tensor | None = None
 ):
     """
@@ -60,3 +67,13 @@ def subspace_iter(
     V = U.t() @ A  # Shape: (rank, n)
 
     return U.to(dtype), V.to(dtype), Q.to(dtype)
+
+def subspace_iter(
+    A: torch.Tensor, rank: int, num_iters: int = 10, init_q: torch.Tensor | None = None
+):
+    return _subspace_iter_compiled(
+        _ensure_standard_tensor(A),
+        rank,
+        num_iters,
+        _ensure_standard_tensor(init_q)
+    )

@@ -22,14 +22,14 @@ class RayDiTFastAttn:
     def apply_fast_attn(self, ray_actors, enable_caching, skip_interval, start_percent, end_percent):
         gpu_actors = ray_actors["workers"]
         
-        if enable_caching:
-            config = {
-                "skip_interval": skip_interval,
-                "start_percent": start_percent,
-                "end_percent": end_percent,
-            }
-            # Apply to all workers
-            ray.get([actor.apply_dit_fast_attn.remote(config) for actor in gpu_actors])
+        config = {
+            "enabled": enable_caching,
+            "skip_interval": skip_interval,
+            "start_percent": start_percent,
+            "end_percent": end_percent,
+        }
+        # Apply to all workers
+        ray.get([actor.apply_dit_fast_attn.remote(config) for actor in gpu_actors])
         
         return (ray_actors,)
 

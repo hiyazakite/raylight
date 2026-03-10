@@ -9,6 +9,13 @@ from raylight.distributed_modules.compact.compress_quantize import (
 # Import subspace iter for rank-1 scale approximation
 from raylight.distributed_modules.compact.compress_lowrank import subspace_iter
 
+def _ensure_standard_tensor(x):
+    if x is None:
+        return None
+    if torch.is_tensor(x) and type(x) is not torch.Tensor:
+        return x.as_subclass(torch.Tensor)
+    return x
+
 @triton.jit
 def _binary_quant_fastpath(
     # Input Pointers (Layout N, C)
@@ -140,8 +147,8 @@ def binary_quant_fastpath(
     assert x_tensor_nc.ndim == 2 and base_tensor_nc.ndim == 2
     assert x_tensor_nc.shape == base_tensor_nc.shape
 
-    x_tensor_nc = x_tensor_nc.contiguous()
-    base_tensor_nc = base_tensor_nc.contiguous()
+    x_tensor_nc = _ensure_standard_tensor(x_tensor_nc).contiguous()
+    base_tensor_nc = _ensure_standard_tensor(base_tensor_nc).contiguous()
 
     N_ROWS, C_COLS = x_tensor_nc.shape
     assert C_COLS % 8 == 0, "C_COLS must be divisible by 8 for packing output alignment"
@@ -243,6 +250,9 @@ def sim_binary_quant_fastpath(
     """
     assert rank >= 1 or rank == -1, "Rank must be >= 1 or -1"
 
+    x_tensor_nc = _ensure_standard_tensor(x_tensor_nc)
+    base_tensor_nc = _ensure_standard_tensor(base_tensor_nc)
+    
     N, C = x_tensor_nc.shape
     new_base_nc = None
 
@@ -464,6 +474,11 @@ def sim_binary_dequant_fastpath(
     assert scale_v_ck.shape == (C, effective_rank)
     assert base_nc.shape == (N, C)
 
+    packed_in_nc8 = _ensure_standard_tensor(packed_in_nc8)
+    scale_u_nk = _ensure_standard_tensor(scale_u_nk)
+    scale_v_ck = _ensure_standard_tensor(scale_v_ck)
+    base_nc = _ensure_standard_tensor(base_nc)
+    
     # --- Always use the slowpath dequantize_1bit for simulation consistency --- 
     # It handles rank=1 correctly when provided with appropriate rank-1 U/V scales.
     # slowpath dequantize_1bit expects u(N,K) and v(K,C).
@@ -603,8 +618,8 @@ def int2_quant_fastpath(
     # Assert is_cuda removed for potential future CPU compatibility if needed
     # assert x_tensor_nc.is_cuda and base_tensor_nc.is_cuda
 
-    x_tensor_nc = x_tensor_nc.contiguous()
-    base_tensor_nc = base_tensor_nc.contiguous()
+    x_tensor_nc = _ensure_standard_tensor(x_tensor_nc).contiguous()
+    base_tensor_nc = _ensure_standard_tensor(base_tensor_nc).contiguous()
 
     N_ROWS, C_COLS = x_tensor_nc.shape
     assert C_COLS % 4 == 0, "C_COLS must be divisible by 4 for packing output alignment"
@@ -768,10 +783,12 @@ def int2_dequant_fastpath(
     # Assert is_cuda removed
     # assert packed_in_nc4.is_cuda and scale_u_nk.is_cuda and scale_v_ck.is_cuda and base_nc.is_cuda
 
-    packed = packed.contiguous()
-    scale_u_nk = scale_u_nk.contiguous()
-    scale_v_ck = scale_v_ck.contiguous()
-    base_nc = base_nc.contiguous()
+    # assert packed_in_nc4.is_cuda and scale_u_nk.is_cuda and scale_v_ck.is_cuda and base_nc.is_cuda
+
+    packed = _ensure_standard_tensor(packed).contiguous()
+    scale_u_nk = _ensure_standard_tensor(scale_u_nk).contiguous()
+    scale_v_ck = _ensure_standard_tensor(scale_v_ck).contiguous()
+    base_nc = _ensure_standard_tensor(base_nc).contiguous()
 
     N_ROWS, C_COLS_4 = packed.shape
     C_COLS = C_COLS_4 * 4
