@@ -32,6 +32,25 @@ This document outlines the memory optimizations implemented to enable long-form 
 - Added `[RayWorker {sp_rank}] PE Generated. VRAM: ...` to track memory floor on every worker.
 - Added `[RayWorker {sp_rank}] Blocks complete. Peak VRAM: ...` to capture the maximum memory used during the most intensive part of the inference.
 - Added sequence-specific logging to identify exactly when and where optimizations are applied.
+- **All debug prints are gated behind `RAYLIGHT_DEBUG=1`** env var to avoid CUDA synchronization overhead from `torch.cuda.memory_allocated()` calls during normal execution.
+
+## 5. Positional Embedding Caching
+**Problem**: LTXAV computes 4 PE sets per denoising step (video + audio + 2 cross-modal). PEs depend only on spatial coords, frame_rate, and dtype — all constant during a single generation run.
+
+**Solution**:
+- `_prepare_pe_cached()` in `xdit_context_parallel.py` caches PEs keyed on `(coord_shapes, frame_rate, dtype)`.
+- Only the first step computes PEs; all subsequent steps reuse the cache.
+- **Result**: Eliminates ~4 PE computations per step for all steps after the first.
+
+## 6. Batched AdaLN Caching
+**Problem**: `get_ada_values` is called ~10× per block with the same `(table, timestep)` pair but different slice indices. Each call redundantly does `reshape` + `add` + `unbind`.
+
+**Solution**:
+- `caching_get_ada_values()` computes the full result once per `(table, timestep)` pair and caches it.
+- Subsequent calls with different `indices` return slices from the cache.
+- Cache is auto-cleared after each block's `forward()` to avoid stale references.
+- Applied via monkey-patching in `usp.py` during LTXAV injection.
+- **Result**: ~6 redundant computations/block × 48 blocks = ~288 eliminated kernel launches per step.
 
 ## Usage Note
 Ensure the `FFN Chunker` node in your workflow has `num_chunks` set to at least **16** for sequences over 512 frames. My logs will confirm if `Video FFN Chunking Active` is triggered.

@@ -21,7 +21,7 @@ class SamplerManager:
     Dependencies are injected at method call time via WorkerConfig and arguments.
     """
     def __init__(self):
-        pass
+        self.temporal_cache_tracker: Optional[Any] = None
 
     # _handle_fsdp_preparation extracted to raylight.comfy_dist.fsdp_utils
 
@@ -106,6 +106,10 @@ class SamplerManager:
                         compact_reset()
                     except:
                         pass
+                        
+                    # Reset temporal cache tracker if present
+                    if getattr(self, "temporal_cache_tracker", None) is not None:
+                        self.temporal_cache_tracker.reset()  # type: ignore
 
 
     @patch_temp_fix_ck_ops
@@ -175,6 +179,12 @@ class SamplerManager:
                             compact_set_step(step)
                     except (ImportError, NameError, AttributeError):
                         pass
+                        
+                    if getattr(self, "temporal_cache_tracker", None) is not None:
+                        # Use total_steps if available, else assume x0/sigmas give us progress
+                        if self.temporal_cache_tracker.total_steps < 0:  # type: ignore
+                            self.temporal_cache_tracker.total_steps = total_steps  # type: ignore
+                        self.temporal_cache_tracker.update(step)  # type: ignore
 
                  samples = comfy.sample.sample_custom(
                          work_model,
@@ -272,6 +282,11 @@ class SamplerManager:
                             compact_set_step(step)
                     except (ImportError, NameError, AttributeError):
                         pass
+
+                    if getattr(self, "temporal_cache_tracker", None) is not None:
+                        if self.temporal_cache_tracker.total_steps < 0:  # type: ignore
+                            self.temporal_cache_tracker.total_steps = total_steps  # type: ignore
+                        self.temporal_cache_tracker.update(step)  # type: ignore
                 
                 if sigmas is None:
                     samples = comfy.sample.sample(

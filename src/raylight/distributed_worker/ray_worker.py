@@ -324,6 +324,28 @@ class RayWorker:
         return info
 
 
+    def apply_dit_fast_attn(self, config: dict):
+        """Apply Temporal Attention Caching (DiTFastAttn) to the model.
+        
+        Wraps attention modules to reuse outputs across denoising timesteps.
+        """
+        if self.model is None:
+            print(f"[RayWorker {self.local_rank}] No model loaded, skipping DiTFastAttn.")
+            return False
+            
+        from raylight.distributed_modules.temporal_cache import apply_temporal_caching
+        
+        print(f"[RayWorker {self.local_rank}] Applying DiTFastAttn temporal caching with config: {config}")
+        
+        # Apply the monkey-patches and get the shared step tracker
+        tracker = apply_temporal_caching(self.model, config)
+        
+        # Store the tracker so the sampler manager can step it
+        self.sampler_manager.temporal_cache_tracker = tracker
+        
+        return True
+
+
 
 
     def _load_via_context(self, unet_path, model_options, dequant_dtype=None, patch_dtype=None, force_reload=False):
