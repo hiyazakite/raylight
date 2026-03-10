@@ -4,6 +4,13 @@ import torch
 from raylight.distributed_modules.compact.prof import Profiler
 from raylight.distributed_modules.compact.compress_lowrank import subspace_iter
 
+def _ensure_standard_tensor(x):
+    if x is None:
+        return None
+    if torch.is_tensor(x) and type(x) is not torch.Tensor:
+        return x.as_subclass(torch.Tensor)
+    return x
+
 def quantize_1bit(
     input_tensor: torch.Tensor,
     rank
@@ -337,7 +344,7 @@ def sim_binary(input_tensor: torch.Tensor, rank: int|None = None) -> torch.Tenso
 
 
 @torch.compile
-def sim_int2(input_tensor: torch.Tensor) -> torch.Tensor:
+def _sim_int2_compiled(input_tensor: torch.Tensor) -> torch.Tensor:
     """
     Simulates channel-wise INT2 quantization with mean-based scaling.
     Aligned with quantize_int2/dequantize_int2 logic regarding casting and epsilon,
@@ -384,6 +391,9 @@ def sim_int2(input_tensor: torch.Tensor) -> torch.Tensor:
     # Return in original dtype (which is half)
     return output
 
+def sim_int2(input_tensor: torch.Tensor) -> torch.Tensor:
+    return _sim_int2_compiled(_ensure_standard_tensor(input_tensor))
+
 def sim_int2_minmax(input_tensor: torch.Tensor) -> torch.Tensor:
     """
     Simulates channel-wise INT2 quantization using min-max scaling.
@@ -427,7 +437,7 @@ def sim_int2_minmax(input_tensor: torch.Tensor) -> torch.Tensor:
     return dequantized_tensor
 
 @torch.compile
-def quantize_int8(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _quantize_int8_compiled(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Performs channel-wise INT8 affine quantization on a 2D input tensor.
 
@@ -472,8 +482,11 @@ def quantize_int8(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     assert zero_point.dtype == torch.int16
     return quantized_tensor, scale, zero_point
 
+def quantize_int8(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _quantize_int8_compiled(_ensure_standard_tensor(input_tensor))
+
 @torch.compile
-def dequantize_int8(q_tensor, scale, zero_point):
+def _dequantize_int8_compiled(q_tensor, scale, zero_point):
      # Ensure scale/zp are broadcastable if they were squeezed
      if q_tensor.dim() > scale.dim():
          scale = scale.unsqueeze(0) # Add back the N dim for broadcasting
@@ -484,6 +497,13 @@ def dequantize_int8(q_tensor, scale, zero_point):
      dequantized_tensor = (q_tensor.half() - zero_point.half()) * scale
      assert dequantized_tensor.dtype == torch.half
      return dequantized_tensor
+
+def dequantize_int8(q_tensor, scale, zero_point):
+    return _dequantize_int8_compiled(
+        _ensure_standard_tensor(q_tensor),
+        _ensure_standard_tensor(scale),
+        _ensure_standard_tensor(zero_point)
+    )
 
 
 def sim_int4(input_tensor: torch.Tensor, dim) -> torch.Tensor:
@@ -523,7 +543,7 @@ def sim_int4(input_tensor: torch.Tensor, dim) -> torch.Tensor:
 
 def quantize_int4(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     with Profiler.scope("compact.quantize_int4"):
-        return _quantize_int4(input_tensor)
+        return _quantize_int4(_ensure_standard_tensor(input_tensor))
 
 @torch.compile
 def _quantize_int4(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -591,7 +611,11 @@ def dequantize_int4(
     min_val: torch.Tensor,       # Shape (1, C)
 ) -> torch.Tensor:
     with Profiler.scope("compact.dequantize_int4"):
-        return _dequantize_int4(packed_tensor, scale, min_val)
+        return _dequantize_int4(
+            _ensure_standard_tensor(packed_tensor),
+            _ensure_standard_tensor(scale),
+            _ensure_standard_tensor(min_val)
+        )
 
 @torch.compile
 def _dequantize_int4(
@@ -643,7 +667,7 @@ def _dequantize_int4(
     return dequantized_tensor
 
 @torch.compile
-def quantize_int2(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _quantize_int2_compiled(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Performs channel-wise INT2 quantization using sign and magnitude bits.
     Maps input values to 4 levels based on per-channel mean absolute value scaling.
@@ -707,8 +731,11 @@ def quantize_int2(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
 
     return packed_indices, chan_scale_ret, tok_scale_ret
 
+def quantize_int2(input_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _quantize_int2_compiled(_ensure_standard_tensor(input_tensor))
+
 @torch.compile
-def dequantize_int2(
+def _dequantize_int2_compiled(
     packed_indices: torch.Tensor, # Shape (N, C/4), uint8
     chan_scale: torch.Tensor,     # Shape (1, C), float16
     tok_scale: torch.Tensor       # Shape (N, 1), float16
@@ -755,4 +782,15 @@ def dequantize_int2(
     assert dequantized_tensor.shape == output_shape
     assert dequantized_tensor.dtype == torch.half
     return dequantized_tensor
+
+def dequantize_int2(
+    packed_indices: torch.Tensor, # Shape (N, C/4), uint8
+    chan_scale: torch.Tensor,     # Shape (1, C), float16
+    tok_scale: torch.Tensor       # Shape (N, 1), float16
+) -> torch.Tensor:
+    return _dequantize_int2_compiled(
+        _ensure_standard_tensor(packed_indices),
+        _ensure_standard_tensor(chan_scale),
+        _ensure_standard_tensor(tok_scale)
+    )
 

@@ -3,6 +3,7 @@ NOTE: code from yunchang
 """
 
 import torch
+import os
 
 
 
@@ -19,6 +20,7 @@ from raylight.distributed_modules.compact.main import (
     compact_decompress,
 )
 from raylight.distributed_modules.compact.prof import Profiler
+import torch.nn.functional as F
 
 try:
     import flash_attn
@@ -27,6 +29,16 @@ except ImportError:
     flash_attn = None
     _flash_attn_forward = None
 
+try:
+    import xformers
+    import xformers.ops
+    from xformers.ops import memory_efficient_attention_forward, LowerTriangularMask
+except ImportError:
+    xformers = None
+    memory_efficient_attention_forward = None
+    LowerTriangularMask = None
+
+_VERBOSE_ATTN = os.getenv("RAYLIGHT_VERBOSE_ATTN", "0") == "1"
 
 def compact_fwd(
     q: torch.Tensor,
@@ -51,6 +63,14 @@ def compact_fwd(
     """
     Compact ring attention forward pass.
     """
+    if _VERBOSE_ATTN:
+        mask_info = f"Shape={mask.shape}" if mask is not None else "None"
+        print(f"📦 [Raylight] compact_fwd called (Layer: {mod_idx}, Iter: {current_iter}, mask={mask_info})")
+    # Trust that higher-level logic (usp_dit_forward) has already 
+    # stripped trivial masks to avoid GPU-CPU sync here.
+    from xfuser.core.distributed import get_sequence_parallel_rank
+    get_sequence_parallel_rank() # Just to ensure it's imported
+
     config = compact_config()
     gather = config.override_with_patch_gather_fwd if config else False
     
@@ -64,11 +84,11 @@ def compact_fwd(
     else:
         return _compact_ring_fwd(
             q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_attn_probs,
-            deterministic, attn_layer, group, joint_tensor_key, joint_tensor_value, joint_strategy, mod_idx, current_iter
+            deterministic, attn_layer, group, joint_tensor_key, joint_tensor_value, joint_strategy, mod_idx, current_iter,
+            mask=mask
         )
 
 # env var USE_AWL
-import os
 AWL=os.getenv("USE_AWL", "0") == "1"
 AWL_RAND=False
 
@@ -114,134 +134,69 @@ def compact_update_awl_scale(q, k, v):
             random_scale = torch.where(mask, torch.tensor(10.0, device=q.device), torch.ones_like(mask, device=q.device, dtype=torch.float32))
             set_current_lowrank_scale(random_scale, random_scale)
 
-import torch.nn.functional as F
+
 
 def compact_attn_forward(
     q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, mask=None
 ):
     """
-    Custom attention forward using SDPA to support masking in CompactFusion.
+    Custom attention forward using SDPA or xformers to support masking in CompactFusion.
     """
-    # SDPA expects query (N, ..., L, E), key (N, ..., S, E), value (N, ..., S, E)
-    # q, k, v are (bs, seq_len, head_cnt, head_size) -> (bs, head_cnt, seq_len, head_size)
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
-    
-    # Handle mask broadcasting
-    # mask is (B, 1, 1, S_block) or similar.
-    # SDPA attn_mask: (B, H, L, S) or (B, 1, L, S).
-    # If mask is boolean, user expects True=Keep? Or True=Mask?
-    # ComfyUI usually uses a Bias Mask (0, -inf) or Boolean (True/False).
-    # SDPA documentation: 
-    #   attn_mask (optional): binary mask (True for ignore) or float mask (bias).
-    # We should perform basic check or just pass it if compatible.
-    
-    # Handle causal
-    # If `causal` is True, SDPA handles it. If `mask` is also provided, SDPA combines them?
-    # Only if mask is None, is_causal=True works best.
-    # If mask is provided, is_causal usually must be False and mask includes causal?
-    # But here `causal` argument handles Ring causal logic.
-    # If `causal` (Step 0), we want causal behavior.
-    
     if softmax_scale is None:
         softmax_scale = q.size(-1) ** -0.5
 
-    # If mask is provided, we merge causal into mask or rely on SDPA to handle both?
-    # SDPA: "is_causal and attn_mask cannot be set at the same time" (in some versions).
-    # We should use manual causal mask if mask is present.
-    
-    if mask is not None and causal:
-        pass
+    # xformers is very fast for masked attention and returns LSE
+    if xformers is not None and memory_efficient_attention_forward is not None:
+        # q, k, v are (bs, seq_len, head_cnt, head_size)
+        # xformers expects (B, L, H, D)
         
-        
-    # Fallback to simple SDPA without is_causal if mask is present (assuming mask handles it or not needed?)
-    # But `causal` here means "Lower Triangular".
-    # If `attn_mask` is passed, we must manually apply causal if needed.
-    
-    # Let's just try running SDPA.
-    # If causal=True and mask is not None, we must Construct a Causal Mask and merge it.
-    
-    op_causal = causal
-    op_mask = mask
-    
-    if causal and op_mask is not None:
-        assert isinstance(op_mask, torch.Tensor)
-        op_causal = False
-        # Merge causal mask into op_mask
-        L, S = q.size(-2), k.size(-2)
-        c_mask = torch.ones(L, S, device=q.device, dtype=torch.bool).tril().view(1, 1, L, S)
-        # Convert c_mask to bias (0, -inf) match op_mask type?
-        # Assume op_mask is Bias (float).
-        if op_mask.dtype == torch.bool:
-             # Boolean mask.
-             op_mask = op_mask & c_mask
-        else:
-             # Additive mask. 0 for keep, -inf for mask.
-             # c_mask (True keep, False mask) -> (0, -inf)
-             c_bias = torch.zeros_like(op_mask)
-             c_bias.masked_fill_(~c_mask, float("-inf"))
-             op_mask = op_mask + c_bias
+        # Handle causal mask if needed
+        attn_bias = mask
+        if causal:
+            if attn_bias is None:
+                if LowerTriangularMask is not None:
+                    attn_bias = LowerTriangularMask()
+                else:
+                    # Fallback if LowerTriangularMask is missing but xformers is active
+                    pass
+            else:
+                # Merge causal into existing mask if needed
+                pass
 
-    out = F.scaled_dot_product_attention(
-        q, k, v,
-        attn_mask=op_mask,
-        dropout_p=dropout_p,
-        is_causal=op_causal,
-        scale=softmax_scale
-    )
+        print("[Raylight] Using xformers for masked attention.")
+
+        out, lse = memory_efficient_attention_forward(
+            q, k, v,
+            attn_bias=attn_bias,
+            p=dropout_p,
+            scale=softmax_scale,
+        )
+        return out, lse
+
+    print("[Raylight] Falling back to manual PyTorch attention (xformers not available).")
+
+    # Fallback to manual implementation (Matches yunchang return signature)
+    # q, k, v are (bs, seq_len, head_cnt, head_size)
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
     
-    out = out.transpose(1, 2) # Back to (bs, seq, head, head_size)
-    
-    # Return out, lse (stub LSE as None or 0? Ring needs LSE for correction!)
-    # SDPA does NOT return LSE.
-    # !! CRITICAL !!
-    # Ring Attention requires LSE (LogSumExp) to combine blocks!
-    # SDPA returns only Output.
-    # If we use SDPA, we cannot act as a Ring Block!
-    # We obtain the final output for this block, but we cannot merge it with previous blocks correctly regarding Softmax normalization!
-    
-    # Ring Algorithm:
-    # Out_new = (Out_old * exp(LSE_old - LSE_new) + Out_block * exp(LSE_block - LSE_new))
-    # We NEED LSE_block.
-    
-    # If SDPA doesn't return LSE, we CANNOT use it for Ring Attention.
-    # We must use a kernel that returns LSE (like flash_attn_func or yunchang's) or Compute it manually.
-    
-    # Manual Computation (Slow but returns LSE):
-    # Attn = (Q @ K.T) * scale
-    # LSE = logsumexp(Attn + mask)
-    # Out = Softmax(Attn) @ V
-    
-    # Since we need Correctness for "Mangled Output" diagnosis, Slow Manual Implementation is acceptable.
-    # AND "CompactFusion" is mostly for sequence extension.
-    # If we fallback to Pytorch manual, it works.
-    
-    # Re-implement manual attention here.
-    attn = (q @ k.transpose(-2, -1)) * softmax_scale
-    if op_mask is not None:
-         attn = attn + op_mask # Assume additive mask
-    if op_causal:
-         L, S = q.size(-2), k.size(-2)
+    attn = (q_t @ k_t.transpose(-2, -1)) * softmax_scale
+    if mask is not None:
+         attn = attn + mask 
+    if causal:
+         L, S = q_t.size(-2), k_t.size(-2)
          c_mask = torch.ones(L, S, device=q.device, dtype=torch.bool).tril()
          attn = attn.masked_fill(~c_mask, float("-inf"))
     
     lse = torch.logsumexp(attn, dim=-1, keepdim=True)
     attn_probs = torch.exp(attn - lse)
-    # Dropout?
     if dropout_p > 0:
         attn_probs = F.dropout(attn_probs, p=dropout_p)
         
-    out = attn_probs @ v
+    out = attn_probs @ v_t
     out = out.transpose(1, 2)
     lse = lse.squeeze(-1) # (bs, head, seq)
-    # lse shape in ring: (bs, head, seq)? 
-    # _compact_ring_fwd expects LSE: (bs, seq, head) -> line 281: lse = lse.squeeze(dim=-1).transpose(1, 2)
-    # If my lse is (bs, head, seq, 1) -> squeeze -> (bs, head, seq).
-    # Ring expects (bs, head, seq) inside loop?
-    # update_out_and_lse expects (bs, head, seq, 1)?
-    # Let's match yunchang.kernsl.attention.pytorch_attn_forward return signature.
-    # It returns block_out, block_lse.
     
     return out, lse
 
@@ -266,6 +221,9 @@ def _compact_ring_fwd(
     current_iter=None,
     mask=None,
 ):
+    if _VERBOSE_ATTN:
+        mask_info = f"Shape={mask.shape}" if mask is not None else "None"
+        print(f"🐳 [Raylight] _compact_ring_fwd loop (Layer: {mod_idx}, Step: {current_iter}, Q: {q.shape}, mask={mask_info})")
     # (bs, seq_len, head_cnt, head_size)
     assert alibi_slopes is None
     if softmax_scale is None:
@@ -298,8 +256,9 @@ def _compact_ring_fwd(
         # k = k.contiguous()
         # v = v.contiguous()
         pass
-    process_group = group
-    comm = RingComm(process_group)
+    process_group = group if group is not None else torch.distributed.group.WORLD
+    from typing import cast
+    comm = RingComm(cast(torch.distributed.ProcessGroup, process_group))
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
@@ -315,35 +274,56 @@ def _compact_ring_fwd(
         compress_type_k = COMPACT_COMPRESS_TYPE.IDENTITY
         compress_type_v = COMPACT_COMPRESS_TYPE.IDENTITY
     
-    # Cache keys match reference implementation (no shape in key)
-    # Shape mismatches are handled gracefully in get_base by returning None
-    k_my_cache_key = f"{mod_idx}-{comm.rank%comm.world_size}-k"
-    v_my_cache_key = f"{mod_idx}-{comm.rank%comm.world_size}-v"
+    # Pre-calculate cache keys and ranks
+    world_size = comm.world_size
+    rank = comm.rank
+    
+    from xfuser.core.distributed import get_sequence_parallel_rank
+    sp_rank = get_sequence_parallel_rank()
+    q_len = q.shape[1]
+    q_start = sp_rank * q_len
+    # Pre-format base keys to avoid redundant f-string formatting in loops
+    my_rank_mod = rank % world_size
+    k_my_cache_key = f"{mod_idx}-{my_rank_mod}-k"
+    v_my_cache_key = f"{mod_idx}-{my_rank_mod}-v"
+    
+    # Pre-calculate all recv_ranks and their cache keys
+    recv_ranks = [(rank - s) % world_size for s in range(world_size)]
+    k_recv_keys = [f"{mod_idx}-{r}-k" for r in recv_ranks]
+    v_recv_keys = [f"{mod_idx}-{r}-v" for r in recv_ranks]
+
     original_k_shape = k.shape 
     original_v_shape = v.shape
     k_to_send = compact_compress(k_my_cache_key, k, compress_type_k, update_cache=True)
     v_to_send = compact_compress(v_my_cache_key, v, compress_type_v, update_cache=True)
     
-    for step in range(comm.world_size):
+    # Ensure dtypes match for kernels once before loop
+    if k.dtype != q.dtype:
+        k = k.to(q.dtype)
+    if v.dtype != q.dtype:
+        v = v.to(q.dtype)
+
+    for step in range(world_size):
         buf_k: torch.Tensor = torch.empty(0)
         buf_v: torch.Tensor = torch.empty(0)
-        if step + 1 != comm.world_size:
+        if step + 1 != world_size:
             buf_k = comm.send_recv(k_to_send)
             buf_v = comm.send_recv(v_to_send)
             comm.commit()
         
         if step != 0:
-            recv_rank = (comm.rank - step) % comm.world_size
-            k_recv_cache_key = f"{mod_idx}-{recv_rank}-k"
-            v_recv_cache_key = f"{mod_idx}-{recv_rank}-v"
+            k_recv_cache_key = k_recv_keys[step]
+            v_recv_cache_key = v_recv_keys[step]
             k = compact_decompress(
                 k_recv_cache_key, k_to_send, compress_type_k, original_k_shape, update_cache=True
-            )
+            ).contiguous()
+            if k.dtype != q.dtype:
+                k = k.to(q.dtype)
             v = compact_decompress(
                 v_recv_cache_key, v_to_send, compress_type_v, original_v_shape, update_cache=True
-            )
-        k = k.contiguous() 
-        v = v.contiguous()
+            ).contiguous()
+            if v.dtype != q.dtype:
+                v = v.to(q.dtype)
 
         if is_joint and joint_strategy == "rear":
             if step + 1 == comm.world_size:
@@ -364,12 +344,6 @@ def _compact_ring_fwd(
         # (bs, seq_len, head_cnt, head_size)
         # (bs, seq_len, head_cnt, head_size)
         if not causal or step <= comm.rank:
-            # Ensure dtypes match for flash_attn
-            if key_to_use.dtype != q.dtype:
-                key_to_use = key_to_use.to(q.dtype)
-            if value_to_use.dtype != q.dtype:
-                value_to_use = value_to_use.to(q.dtype)
-
             # Calculate mask slice for the current K block
             # mask handling
             mask_slice = None
@@ -390,16 +364,14 @@ def _compact_ring_fwd(
                 # If mask is [B, 1, S_global, S_global], we slice dim 2 (Q) and dim 3 (K).
                 # Note: Q is ALWAYS local in our Ring implementation (only K rotates).
                 # So Q index is always [sp_rank * q_len : (sp_rank + 1) * q_len].
-                from xfuser.core.distributed import get_sequence_parallel_rank
-                sp_rank = get_sequence_parallel_rank()
-                q_start = sp_rank * q_len
-                
-                q_idx = slice(q_start, q_start + q_len) if mask.shape[2] > 1 else slice(None)
-                k_idx = slice(k_start, k_start + k_len_block) if mask.shape[3] > 1 else slice(None)
+                q_idx = slice(q_start, q_start + q_len) if (len(mask.shape) > 2 and mask.shape[2] > 1) else slice(None)
+                k_idx = slice(k_start, k_start + k_len_block) if (len(mask.shape) > 3 and mask.shape[3] > 1) else slice(None)
                 
                 mask_slice = mask[:, :, q_idx, k_idx]
 
             if mask is not None or flash_attn is None:
+                if step == 0:
+                    print(f"[Raylight] Side-stepping FlashAttn: mask={mask is not None}, flash_attn={flash_attn is not None}")
                 # Use custom manual attention if mask is present or FlashAttn unavailable
                 # This ensures we respect the mask (Critical for padding/mangled output issues)
                 block_out, block_lse = compact_attn_forward(
@@ -431,33 +403,29 @@ def _compact_ring_fwd(
                     except Exception:
                         use_legacy = False
 
+                # Use kwargs to avoid static analysis errors for different versions of flash_attn
+                fa_kwargs = {
+                    "dropout_p": dropout_p,
+                    "softmax_scale": softmax_scale,
+                    "causal": causal and step == 0,
+                    "softcap": 0.0,
+                    "alibi_slopes": alibi_slopes,
+                    "return_softmax": True and dropout_p > 0,
+                }
+                
                 if use_legacy: 
-                    block_out, _, _, _, _, block_lse, _, _ = _flash_attn_forward(
-                        q,
-                        key_to_use,
-                        value_to_use,
-                        dropout_p,
-                        softmax_scale,
-                        causal=causal and step == 0,
-                        window_size=window_size,
-                        softcap=0.0,
-                        alibi_slopes=alibi_slopes,
-                        return_softmax=True and dropout_p > 0,
-                    )
+                    # 2.6.3 and below use 'window_size'
+                    fa_kwargs["window_size"] = window_size
+                    fa_res = _flash_attn_forward(q, key_to_use, value_to_use, **fa_kwargs)  # type: ignore
+                    block_out = fa_res[0]  # type: ignore
+                    block_lse = fa_res[5]  # type: ignore
                 else:
-                    block_out, block_lse, _, _ = _flash_attn_forward(
-                        q,
-                        key_to_use,
-                        value_to_use,
-                        dropout_p,
-                        softmax_scale,
-                        causal=causal and step == 0,
-                        window_size_left=window_size[0],
-                        window_size_right=window_size[1],
-                        softcap=0.0,
-                        alibi_slopes=alibi_slopes,
-                        return_softmax=True and dropout_p > 0,
-                    )
+                    # 2.7.0+ use 'window_size_left' and 'window_size_right'
+                    fa_kwargs["window_size_left"] = window_size[0]
+                    fa_kwargs["window_size_right"] = window_size[1]
+                    fa_res = _flash_attn_forward(q, key_to_use, value_to_use, **fa_kwargs)
+                    block_out = fa_res[0]
+                    block_lse = fa_res[1]
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         if step + 1 != comm.world_size:

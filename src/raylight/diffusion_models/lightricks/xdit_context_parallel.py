@@ -200,6 +200,24 @@ def usp_dit_forward(
 
     # Prepare attention mask
     attention_mask = self._prepare_attention_mask(attention_mask, input_dtype)
+    
+    # Optimization: if attention_mask is trivial (all 0s), set to None to enable FlashAttention path.
+    # Cache the result keyed by shape+device — the mask content is constant across denoising steps
+    # for a given generation (same sequence lengths), so we only pay the GPU-CPU sync once.
+    if attention_mask is not None:
+        mask_cache_key = (attention_mask.shape, attention_mask.device)
+        cached_key = getattr(self, "_trivial_mask_cache_key", None)
+        if cached_key == mask_cache_key:
+            # Same shape/device as last check — reuse cached result
+            if self._trivial_mask_is_trivial:
+                attention_mask = None
+        else:
+            # New shape/device (new generation or first call) — recompute
+            is_trivial = not torch.any(attention_mask != 0).item()
+            self._trivial_mask_cache_key = mask_cache_key
+            self._trivial_mask_is_trivial = is_trivial
+            if is_trivial:
+                attention_mask = None
 
     # Build self-attention mask BEFORE padding and chunking x
     if hasattr(self, "_build_guide_self_attention_mask"):
@@ -269,7 +287,26 @@ def usp_cross_attn_forward(
         q = apply_rotary_emb(q, pe)
         k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
 
-    out = xfuser_optimized_attention(q, k, v, self.heads, mask=mask)
+    # Optimization: Only pass mask if it's not None and not trivial
+    # We check if it's None first as it's the fastest
+    if mask is not None:
+        # For LTX, masks are usually additive (0 for keep, -inf for mask)
+        # We can do a very quick check: if it's all zeros, it's an identity mask.
+        # However, to avoid frequent GPU-CPU syncs, we trust the top-level usp_dit_forward
+        # which already cleaned up the global attention_mask.
+        # But for self_attention_mask or others, we might want to check.
+        pass
+
+    # Pass metadata if available in transformer_options
+    mod_idx = transformer_options.get("block_index", None)
+    from raylight.distributed_modules.compact.main import compact_get_step
+    
+    out = xfuser_optimized_attention(
+        q, k, v, self.heads, 
+        mask=mask, 
+        mod_idx=mod_idx,
+        current_iter=compact_get_step()
+    )
 
     # Apply per-head gating if enabled (LTX-specific)
     if getattr(self, "to_gate_logits", None) is not None:

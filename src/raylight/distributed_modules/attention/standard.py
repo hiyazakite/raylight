@@ -20,7 +20,7 @@ class StandardAttentionBackend(AttentionBackend):
             ensure_hf_sm90_kernel()
 
         # Initialize the underlying xFuser attention class
-        xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn_enum, use_pack_qkv=False)
+        xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn_enum, use_pack_qkv=False, use_compact_ring=False)
 
         def _attention_xfuser_unmask(
                 q,
@@ -33,7 +33,8 @@ class StandardAttentionBackend(AttentionBackend):
                 mask=None,
                 attn_precision=None,
                 skip_reshape=False,
-                skip_output_reshape=False):
+                skip_output_reshape=False,
+                **kwargs):
 
             if skip_reshape:
                 b, _, _, dim_head = q.shape
@@ -74,6 +75,7 @@ class StandardAttentionBackend(AttentionBackend):
                     joint_tensor_key=join_k.transpose(1, 2),
                     joint_tensor_value=join_v.transpose(1, 2),
                     mask=mask,
+                    **kwargs
                 )
             else:
                 out = xfuser_attn(
@@ -82,6 +84,7 @@ class StandardAttentionBackend(AttentionBackend):
                     k.transpose(1, 2),
                     v.transpose(1, 2),
                     mask=mask,
+                    **kwargs
                 )
             
             if not skip_output_reshape:

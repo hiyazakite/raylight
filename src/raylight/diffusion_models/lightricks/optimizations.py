@@ -98,19 +98,24 @@ def patch_ada_caching(block):
 
     Also wraps forward() to clear the cache after each block execution so
     stale tensors are not retained between timesteps.
+
+    IMPORTANT: This function is called on every ON_LOAD callback (i.e. every
+    denoising step in lowvram mode). Both patches MUST be fully idempotent.
     """
-    if hasattr(block, "_original_get_ada_values"):
-        return  # Already patched
+    if not hasattr(block, "_original_get_ada_values"):
+        block._original_get_ada_values = block.get_ada_values
+        block.get_ada_values = lambda *args, **kwargs: _caching_get_ada_values(block, *args, **kwargs)
 
-    block._original_get_ada_values = block.get_ada_values
-    block.get_ada_values = lambda *args, **kwargs: _caching_get_ada_values(block, *args, **kwargs)
+    # Guard block.forward wrapping separately — if already wrapped, skip to
+    # avoid stacking clearing_forward closures on every denoising step.
+    if not hasattr(block, "_ada_cache_forward_patched"):
+        original_forward = block.forward
 
-    original_forward = block.forward
+        def clearing_forward(*args, **kwargs):
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                block._ada_cache = None
 
-    def clearing_forward(*args, **kwargs):
-        try:
-            return original_forward(*args, **kwargs)
-        finally:
-            block._ada_cache = None
-
-    block.forward = clearing_forward
+        block.forward = clearing_forward
+        block._ada_cache_forward_patched = True

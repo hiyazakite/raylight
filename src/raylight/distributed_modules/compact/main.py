@@ -14,6 +14,10 @@ from raylight.distributed_modules.compact.utils import ALLOW_DEPRECATED
 from raylight.distributed_modules.compact.fastpath import binary_quant_fastpath, binary_dequant_fastpath, int2_quant_fastpath, int2_dequant_fastpath
 
 _config = None
+_cache = None
+_step = None
+_allgather_cache = None
+_current_cache_key = None
 
 """
 COMPACT: Activation Compression with Delta Transmission and Error Feedback
@@ -103,8 +107,14 @@ def compact_reset():
         quantize=_config.quantized_cache, 
         quant_bits=(_config.cache_quant_bits if _config.cache_quant_bits is not None else 8),
     )
+    config = compact_config()
     from raylight.distributed_modules.compact.stats import stats_clear
     stats_clear()
+    try:
+        from raylight.distributed_modules.compact.prof import Profiler
+        Profiler.instance().reset()
+    except:
+        pass
     global _step
     _step = None
     if _config.override_with_patch_gather_fwd:
@@ -141,7 +151,6 @@ def _compact_compress_fastpath(cache_key, x: torch.Tensor, compress_type: COMPAC
     # Base should be (N, C) now - returns None if shape mismatch or cache miss
     base = _cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype) 
     
-    # If no base (cache miss or shape mismatch), fall back to warmup behavior
     if base is None:
         if update_cache:
             _cache.put(cache_key, x, None)

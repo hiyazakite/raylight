@@ -287,6 +287,13 @@ if hasattr(model_base, "LTXAV"):
         from ..diffusion_models.lightricks.optimizations import patch_ada_caching
 
         model = base_model.diffusion_model
+
+        # Guard: ON_LOAD fires every denoising step in lowvram mode.
+        # types.MethodType replaces (no closure stacking), but re-assigning
+        # 168+ methods per step is still pure overhead after the first inject.
+        if getattr(model, "_usp_injected", False):
+            return
+
         for block in model.transformer_blocks:
             block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
             block.audio_attn1.forward = types.MethodType(usp_cross_attn_forward, block.audio_attn1)
@@ -305,6 +312,7 @@ if hasattr(model_base, "LTXAV"):
                 block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
 
         model._forward = types.MethodType(usp_dit_forward, model)
+        model._usp_injected = True
 
 if hasattr(model_base, "LTXV"):
     @USPInjectRegistry.register(model_base.LTXV)
@@ -315,8 +323,13 @@ if hasattr(model_base, "LTXV"):
         )
 
         model = base_model.diffusion_model
+
+        if getattr(model, "_usp_injected", False):
+            return
+
         for block in model.transformer_blocks:
             block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
             block.attn2.forward = types.MethodType(usp_cross_attn_forward, block.attn2)
 
         model._forward = types.MethodType(usp_dit_forward, model)
+        model._usp_injected = True

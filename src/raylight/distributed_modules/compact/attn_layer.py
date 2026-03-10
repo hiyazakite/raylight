@@ -1,6 +1,5 @@
 import torch
 from torch import Tensor
-
 import torch.distributed
 from yunchang import LongContextAttention
 try:
@@ -27,6 +26,7 @@ class xFuserLongContextAttention(LongContextAttention):
         use_kv_cache: bool = False,
         use_sync: bool = False,
         attn_type: AttnType = AttnType.FA,
+        use_compact_ring: bool = True,
     ) -> None:
         """
         Arguments:
@@ -53,12 +53,26 @@ class xFuserLongContextAttention(LongContextAttention):
                 f"ring_impl_type: {ring_impl_type} do not support SP kv cache."
             )
         
-        # from xfuser.core.long_ctx_attention.ring import xdit_ring_flash_attn_func
         """
         COMPACT ATTN
         """
-        from raylight.distributed_modules.compact.ring import compact_fwd
-        self.ring_attn_fn = compact_fwd
+        # Ring backend is chosen by the attention backend that creates this object.
+        # StandardAttentionBackend passes use_compact_ring=False → xfuser ring.
+        # CompactFusion backend passes (or uses default) use_compact_ring=True → compact ring.
+        # Regardless, if a mask is present at forward time and the xfuser ring is
+        # active, we transparently divert to compact_fwd (see forward()).
+        if use_compact_ring:
+            from raylight.distributed_modules.compact.ring import compact_fwd
+            self.ring_attn_fn = compact_fwd
+        else:
+            try:
+                from xfuser.core.long_ctx_attention.ring import xdit_ring_flash_attn_func
+                self.ring_attn_fn = xdit_ring_flash_attn_func
+            except ImportError:
+                from raylight.distributed_modules.compact.ring import compact_fwd
+                logger.warning("[Raylight] Standard xfuser ring not found, falling back to compact ring")
+                self.ring_attn_fn = compact_fwd
+        
         self.idx = None # NOTE: assign idx in forward
 
     @torch.compiler.disable
@@ -81,6 +95,7 @@ class xFuserLongContextAttention(LongContextAttention):
         return_attn_probs=False,
         joint_strategy="none",
         mask=None,
+        **kwargs,
     ) -> Tensor:
         """forward
 
@@ -183,54 +198,56 @@ class xFuserLongContextAttention(LongContextAttention):
         Collector for Q, K, V, Layer/Step Specific
         """
         # from raylight.distributed_modules.compact.main import compact_config, compact_get_step
-        from raylight.distributed_modules.compact.main import compact_config, compact_get_step
+        from raylight.distributed_modules.compact.main import compact_get_step
         # from raylight.distributed_modules.collector.collector import collect
         # collect(query_layer, "q", compact_get_step(), self.idx)
         # collect(key_layer, "k", compact_get_step(), self.idx)
         # collect(value_layer, "v", compact_get_step(), self.idx)
         
-        config = compact_config()
-        if config and config.enabled:
-            # assert not self.use_kv_cache
-            out = self.ring_attn_fn(
-                query_layer,
-                key_layer,
-                value_layer,
-                dropout_p=dropout_p,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                alibi_slopes=alibi_slopes,
-                deterministic=deterministic,
-                return_attn_probs=return_attn_probs,
-                group=self.ring_pg,
-                attn_layer=attn if self.use_kv_cache else None,
-                joint_tensor_key=joint_tensor_key,
-                joint_tensor_value=joint_tensor_value,
-                joint_strategy=joint_strategy,
-                mod_idx=self.idx,
-                current_iter=compact_get_step(),
-                mask=mask,
-            )
-        else:
-            out = self.ring_attn_fn(
-                query_layer,
-                key_layer,
-                value_layer,
-                dropout_p=dropout_p,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                alibi_slopes=alibi_slopes,
-                deterministic=deterministic,
-                return_attn_probs=return_attn_probs,
-                group=self.ring_pg,
-                attn_layer=attn if self.use_kv_cache else None,
-                joint_tensor_key=joint_tensor_key,
-                joint_tensor_value=joint_tensor_value,
-                joint_strategy=joint_strategy,
-                mask=mask, # Pass mask here too!
-            )
+        # Build a common kwargs dict for the ring attention function
+        from raylight.distributed_modules.compact.ring import compact_fwd, _VERBOSE_ATTN
+        is_compact_ring = self.ring_attn_fn == compact_fwd
+
+        # If a mask is present and we are using the standard xfuser ring (which doesn't support masks),
+        # transparently fall back to compact_fwd for this call only.
+        # compact_fwd handles masks correctly by slicing them per ring step.
+        ring_fn = self.ring_attn_fn
+        if mask is not None and not is_compact_ring:
+            if _VERBOSE_ATTN:
+                print(f"[Raylight] ⚠️ Mask present but standard ring active — overriding to compact_fwd for mask support (Layer: {self.idx})")
+            ring_fn = compact_fwd
+            is_compact_ring = True
+
+        attn_kwargs = {
+            "dropout_p": dropout_p,
+            "softmax_scale": softmax_scale,
+            "causal": causal,
+            "window_size": window_size,
+            "alibi_slopes": alibi_slopes,
+            "deterministic": deterministic,
+            "return_attn_probs": return_attn_probs,
+            "group": self.ring_pg,
+            "attn_layer": attn if self.use_kv_cache else None,
+            "joint_tensor_key": joint_tensor_key,
+            "joint_tensor_value": joint_tensor_value,
+            "joint_strategy": joint_strategy,
+            # Note: mask is NOT included here — xfuser ring doesn't accept it.
+            # When mask is non-None and xfuser ring was active, we already diverted
+            # ring_fn to compact_fwd above (which does accept mask).
+        }
+
+        # Only pass compact-specific kwargs when using the compact ring backend
+        if is_compact_ring:
+            attn_kwargs["mod_idx"] = kwargs.get("mod_idx", self.idx)
+            attn_kwargs["current_iter"] = kwargs.get("current_iter", compact_get_step())
+            attn_kwargs["mask"] = mask  # compact_fwd supports mask; xfuser ring does not
+
+        out = ring_fn(
+            query_layer,
+            key_layer,
+            value_layer,
+            **attn_kwargs
+        )
 
         if type(out) == tuple:
             context_layer, _, _ = out

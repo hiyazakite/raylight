@@ -5,7 +5,7 @@ import functools
 class Profiler:
     def __init__(self):
         self.events = {}
-        self.enabled = True  # Track whether profiling is enabled
+        self.enabled = False  # Disabled by default to avoid stale event accumulation
 
     def enable(self):
         """Enable profiling - all subsequent start/stop calls will be recorded."""
