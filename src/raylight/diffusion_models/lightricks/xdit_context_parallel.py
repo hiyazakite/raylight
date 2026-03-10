@@ -7,6 +7,8 @@ from xfuser.core.distributed import (
 import raylight.distributed_modules.attention as xfuser_attn
 from comfy.ldm.lightricks.model import apply_rotary_emb
 from ..utils import pad_to_world_size
+from .optimizations import prepare_pe_cached, RAYLIGHT_DEBUG, logger
+
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
 xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
@@ -73,15 +75,15 @@ def sp_chunk_group(group, sp_world_size, sp_rank, dim):
 
 def sp_gather_group(group, orig_sizes, dim):
     if torch.is_tensor(group):
-        g = get_sp_group().all_gather(group.contiguous(), dim=dim)
+        g = torch.as_tensor(get_sp_group().all_gather(group.contiguous(), dim=dim))
         return g.narrow(dim, 0, orig_sizes)
 
     elif isinstance(group, (list, tuple)):
         out = []
         for g, o in zip(group, orig_sizes):
-            g = get_sp_group().all_gather(g.contiguous(), dim=dim)
-            g = g.narrow(dim, 0, o)
-            out.append(g)
+            g_out = torch.as_tensor(get_sp_group().all_gather(g.contiguous(), dim=dim))
+            g_out = g_out.narrow(dim, 0, o)
+            out.append(g_out)
         return type(group)(out)
 
     else:
@@ -222,22 +224,22 @@ def usp_dit_forward(
 
     # 3. Generate Positional Embeddings only for this worker's chunk
     # This avoids the massive peak memory of generating full PE (e.g. 50GB for 900 frames)
-    if isinstance(pixel_coords_chunk, (list, tuple)):
-        pc_shape = [tuple(p.shape) for p in pixel_coords_chunk]
-    else:
-        pc_shape = tuple(pixel_coords_chunk.shape)
-        
-    print(f"[RayWorker {sp_rank}] Generating PE for chunk: {pc_shape}")
-    pe = self._prepare_positional_embeddings(pixel_coords_chunk, frame_rate, input_dtype)
-    print(f"[RayWorker {sp_rank}] PE Generated. VRAM: {torch.cuda.memory_allocated()/1024**2:.1f}MB")
+    # PEs are cached across timesteps since coords and frame_rate don't change during generation
+    pe = prepare_pe_cached(self, pixel_coords_chunk, frame_rate, input_dtype)
+    if RAYLIGHT_DEBUG:
+        if isinstance(pixel_coords_chunk, (list, tuple)):
+            pc_shape = [tuple(p.shape) for p in pixel_coords_chunk]
+        else:
+            pc_shape = tuple(pixel_coords_chunk.shape)
+        logger.info("[RayWorker %d] PE Generated for chunk: %s. VRAM: %.1fMB", sp_rank, pc_shape, torch.cuda.memory_allocated()/1024**2)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # Process transformer blocks
-    # torch.cuda.reset_peak_memory_stats() # Optional: reset to see peaks during blocks specifically
     x = self._process_transformer_blocks(
         x, context, attention_mask, timestep, pe, transformer_options=transformer_options, self_attention_mask=self_attention_mask, **merged_args
     )
-    print(f"[RayWorker {sp_rank}] Blocks complete. Peak VRAM: {torch.cuda.max_memory_allocated()/1024**2:.1f}MB")
+    if RAYLIGHT_DEBUG:
+        logger.info("[RayWorker %d] Blocks complete. Peak VRAM: %.1fMB", sp_rank, torch.cuda.max_memory_allocated()/1024**2)
     
     x = sp_gather_group(x, x_orig, dim=1)
 

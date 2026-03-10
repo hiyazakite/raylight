@@ -282,8 +282,9 @@ if hasattr(model_base, "LTXAV"):
     def _inject_ltxvav(model_patcher, base_model, *args):
         from ..diffusion_models.lightricks.xdit_context_parallel import (
             usp_dit_forward,
-            usp_cross_attn_forward
+            usp_cross_attn_forward,
         )
+        from ..diffusion_models.lightricks.optimizations import patch_ada_caching
 
         model = base_model.diffusion_model
         for block in model.transformer_blocks:
@@ -293,6 +294,7 @@ if hasattr(model_base, "LTXAV"):
             block.audio_attn2.forward = types.MethodType(usp_cross_attn_forward, block.audio_attn2)
             block.audio_to_video_attn.forward = types.MethodType(usp_cross_attn_forward, block.audio_to_video_attn)
             block.video_to_audio_attn.forward = types.MethodType(usp_cross_attn_forward, block.video_to_audio_attn)
+            patch_ada_caching(block)
 
         # Patch Embedding Connectors (LTXAV-specific)
         if hasattr(model, "video_embeddings_connector"):
