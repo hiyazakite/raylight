@@ -5,29 +5,30 @@ import functools
 class Profiler:
     def __init__(self):
         self.events = {}
-        self.enabled = False  # Disabled by default to avoid stale event accumulation
+        self.enabled = False  # HARD DISABLED: Compact profiler is no longer used by request.
 
     def enable(self):
-        """Enable profiling - all subsequent start/stop calls will be recorded."""
-        self.enabled = True
+        """Enable profiling - DEACTIVATED by request."""
+        # self.enabled = True 
+        pass
 
     def disable(self):
-        """Disable profiling - all subsequent start/stop calls will be ignored."""
+        """Disable profiling."""
         self.enabled = False
 
     def start(self, name, stream=None, cpu=False):
         """
-        Start recording time for a named section. Supports multiple starts.
+        Start recording time for a named section. 
         No-op if profiling is disabled.
         """
-        # Skip if profiling is disabled
         if not self.enabled:
             return
 
         if name not in self.events:
-            self.events[name] = {'start': [], 'end': [], 'elapsed': 0.0, 'cpu': cpu}
-        assert len(self.events[name]['start']) == len(self.events[name]['end']), \
-            f"Cannot start '{name}' as there are more starts than stops"
+            self.events[name] = {'start': None, 'elapsed': 0.0, 'count': 0, 'cpu': cpu, 'pending': []}
+        
+        # We allow multiple pending events for the same name (nested or async)
+        # though standard usage is usually consecutive.
         
         if cpu:
             start_event = time.time()
@@ -38,20 +39,20 @@ class Profiler:
             else:
                 start_event.record()
         
-        self.events[name]['start'].append(start_event)
+        self.events[name]['pending'].append(start_event)
 
     def stop(self, name, stream=None, cpu=False):
         """
-        Stop recording time for a named section. Accumulates total time for multiple stops.
+        Stop recording time for a named section.
         No-op if profiling is disabled.
         """
-        # Skip if profiling is disabled
         if not self.enabled:
             return
 
-        assert name in self.events, f"No events recorded for '{name}'"
-        assert len(self.events[name]['start']) - 1 == len(self.events[name]['end']), \
-            f"Cannot stop '{name}' as there are more stops than starts"
+        if name not in self.events:
+            return
+        if not self.events[name]['pending']:
+            return
 
         if cpu:
             end_event = time.time()
@@ -62,33 +63,56 @@ class Profiler:
             else:
                 end_event.record()
         
-        self.events[name]['end'].append(end_event)
+        start_event = self.events[name]['pending'].pop()
+        
+        if cpu:
+            elapsed = (end_event - start_event) * 1000 # to ms
+            self.events[name]['elapsed'] += elapsed
+            self.events[name]['count'] += 1
+        else:
+            # For CUDA, we periodically synchronize to prevent event accumulation leaks
+            if 'cuda_pairs' not in self.events[name]:
+                self.events[name]['cuda_pairs'] = []
+            self.events[name]['cuda_pairs'].append((start_event, end_event))
+            
+            # Auto-sync every 50 events for this name to prevent memory bloat
+            if len(self.events[name]['cuda_pairs']) >= 50:
+                self._sync_event(name)
+
+    def _sync_event(self, name):
+        """Synchronize and accumulate CUDA events for a specific name."""
+        if name not in self.events or self.events[name]['cpu']:
+            return
+            
+        pairs = self.events[name].get('cuda_pairs', [])
+        if not pairs:
+            return
+            
+        # Optimize: Batch synchronization if possible (though cuda.Event.elapsed_time needs sync anyway)
+        torch.cuda.synchronize()
+        for start, end in pairs:
+            try:
+                self.events[name]['elapsed'] += start.elapsed_time(end)
+                self.events[name]['count'] += 1
+            except Exception:
+                pass # Event might be stale or destroyed
+        self.events[name]['cuda_pairs'] = []
 
     def elapsed_time(self, name):
         """
         Get the total accumulated time for a specific named section.
-        Syncs and stores the result, clearing start and end events after.
+        Syncs and stores the result.
         """
         if name not in self.events:
-            raise ValueError(f"No events recorded for '{name}'")
+            return 0.0, 0.0
         
-        # Check if CPU timing or CUDA event timing is used
-        cpu = self.events[name]['cpu']
-        total_time = self.events[name]['elapsed']
-        total_count = len(self.events[name]['start'])
-        # Accumulate new times
-        if cpu:
-            for start, end in zip(self.events[name]['start'], self.events[name]['end']):
-                total_time += (end - start) * 1000  # Convert seconds to ms
-        else:
-            torch.cuda.synchronize()
-            for start, end in zip(self.events[name]['start'], self.events[name]['end']):
-                total_time += start.elapsed_time(end)
+        # Flush pending CUDA events
+        if not self.events[name]['cpu']:
+            self._sync_event(name)
 
-        # Store the accumulated time and clear the events
-        self.events[name]['elapsed'] = total_time
-        self.events[name]['start'] = []
-        self.events[name]['end'] = []
+        total_time = self.events[name]['elapsed']
+        total_count = self.events[name]['count']
+        
         avg_time = total_time / total_count if total_count > 0 else 0
         return total_time, avg_time
 
@@ -98,7 +122,9 @@ class Profiler:
         """
         total_times = {}
         avg_times = {}
-        for name in self.events:
+        # Synchronize once for all CUDA events
+        torch.cuda.synchronize()
+        for name in list(self.events.keys()):
             total_times[name], avg_times[name] = self.elapsed_time(name)
         return total_times, avg_times
 
@@ -113,7 +139,12 @@ class Profiler:
         """
         Reset all stored events.
         """
-        self.sync()
+        # Explicitly destroy events to prevent memory leak
+        for name in self.events:
+            if 'cuda_pairs' in self.events[name]:
+                 # Explicitly delete pairs to ensure they aren't leaking
+                 self.events[name]['cuda_pairs'] = []
+            self.events[name]['pending'] = []
         self.events = {}
 
     _instance = None
@@ -144,27 +175,30 @@ class Profiler:
     def scope(name, stream=None, cpu=False):
         """
         Create a context manager for profiling a block of code.
-        Usage:
-        with CudaProfiler.scope('name', cpu=True):
-            # Code to profile
         """
         prof = Profiler.instance()
+        if not prof.enabled:
+            import contextlib
+            return contextlib.nullcontext()
         return prof.ProfileContext(prof, name, stream, cpu)
 
     @staticmethod
     def prof_func(name, cpu=False):
         """
         Decorator to profile a function using the CudaProfiler.
-        Logs the total execution time of the function.
         """
         def decorator(func):
+            prof = Profiler.instance()
+            if not prof.enabled:
+                return func
+                
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
                 # Start profiling
-                Profiler.instance().start(name, cpu=cpu)
+                prof.start(name, cpu=cpu)
                 result = func(*args, **kwargs)
                 # Stop profiling
-                Profiler.instance().stop(name, cpu=cpu)
+                prof.stop(name, cpu=cpu)
                 return result
             return wrapper
         return decorator

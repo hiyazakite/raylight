@@ -1,4 +1,4 @@
-from raylight.distributed_modules.compact.main import compact_config
+from raylight.distributed_modules.compact.context import compact_config
 from raylight.distributed_modules.compact.prof import Profiler
 import torch
 import torch.distributed as dist
@@ -17,6 +17,11 @@ except ImportError:
 
 from raylight.distributed_modules.compact.ring import compact_attn_forward
 _buffers = {}
+
+def clear_buffers():
+    global _buffers
+    _buffers = {}
+
 @Profiler.prof_func("patch_gather_fwd.gather_patch_fwd")
 def patch_gather_fwd(
     q: torch.Tensor,
@@ -37,6 +42,7 @@ def patch_gather_fwd(
     mod_idx=None,
     current_iter=None,
     mask=None,
+    key_suffix="",
 ):
     """
     Attention forward pass using all_gather for K/V tensors (no compression).
@@ -91,17 +97,17 @@ def patch_gather_fwd(
 
     # --- Communication Step (Sync or Async) ---
     if config.use_compact:
-        from raylight.distributed_modules.compact.main import compact_all_gather
+        from raylight.distributed_modules.compact.ops import compact_all_gather
         comp_type_k = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
         comp_type_v = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
         k_list_for_computation = compact_all_gather(
-            f"{mod_idx}-k",
+            f"{mod_idx}-k{key_suffix}",
             k,
             comp_type=comp_type_k,
             group=process_group,
         )
         v_list_for_computation = compact_all_gather(
-            f"{mod_idx}-v",
+            f"{mod_idx}-v{key_suffix}",
             v,
             comp_type=comp_type_v,
             group=process_group,
@@ -118,8 +124,8 @@ def patch_gather_fwd(
         # --- End Synchronous --- #
     else:
         # --- Asynchronous Communication (DistriFusion) --- #
-        k_cache_key = f'{mod_idx}-k'
-        v_cache_key = f'{mod_idx}-v'
+        k_cache_key = f'{mod_idx}-k{key_suffix}'
+        v_cache_key = f'{mod_idx}-v{key_suffix}'
         # print(f"k_cache_key: {k_cache_key}, v_cache_key: {v_cache_key}")
         with Profiler.scope("df.all_gather"):
             if current_iter < config.async_warmup:
@@ -197,12 +203,18 @@ def patch_gather_fwd(
             value_to_use = torch.cat([global_v, joint_tensor_value], dim=1)
     # --- End Apply Joint Tensors ---
 
+    # PERFORMANCE: Avoid synchronous .all() checks in inner loops.
+    # Top-level usp_dit_forward already cleans up trivial masks by setting them to None.
+    # If mask is not None here, we assume it's non-trivial.
+    is_trivial_mask = False
+
     # Perform attention with potentially augmented global K and V
-    # with Profiler.scope("compact.gather.attention"): # Profile the computation
+    if mask is not None and not is_trivial_mask:
+        # Use compact_attn_forward which handles chunked LSE and masks
         out, lse = compact_attn_forward(
             q,
-            key_to_use, # Use potentially augmented K
-            value_to_use, # Use potentially augmented V
+            key_to_use, 
+            value_to_use,
             dropout_p,
             softmax_scale,
             causal=causal,
@@ -213,41 +225,45 @@ def patch_gather_fwd(
         from yunchang.kernels.attention import pytorch_attn_forward
         out, lse = pytorch_attn_forward(
             q,
-            key_to_use, # Use potentially augmented K
-            value_to_use, # Use potentially augmented V
+            key_to_use, 
+            value_to_use,
             dropout_p,
             softmax_scale,
             causal=causal,
         )
     else:
         # Use flash_attn
-        if flash_attn.__version__ <= "2.6.3":
-            out, _, _, _, _, lse, _, _ = _flash_attn_forward(
-                q,
-                key_to_use, # Use potentially augmented K
-                value_to_use, # Use potentially augmented V
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                softcap=0.0,
-                alibi_slopes=alibi_slopes,
-                return_softmax=True and dropout_p > 0,
-            )
+        v_str = getattr(flash_attn, "__version__", "0.0.0")
+        use_legacy = False
+        try:
+            v_parts = [int(p) for p in v_str.split('.') if p.isdigit()]
+            if v_parts and v_parts[0] < 2:
+                use_legacy = True
+            elif v_parts and v_parts[0] == 2 and len(v_parts) > 1 and v_parts[1] <= 6:
+                use_legacy = True
+        except Exception:
+            pass
+
+        fa_kwargs = {
+            "dropout_p": dropout_p,
+            "softmax_scale": softmax_scale,
+            "causal": causal,
+            "softcap": 0.0,
+            "alibi_slopes": alibi_slopes,
+            "return_softmax": True and dropout_p > 0,
+        }
+
+        if use_legacy:
+            fa_kwargs["window_size"] = window_size
+            fa_res = _flash_attn_forward(q, key_to_use, value_to_use, **fa_kwargs)
+            out = fa_res[0]
+            lse = fa_res[5]  # type: ignore
         else:
-                out, lse, _, _ = _flash_attn_forward(
-                q,
-                key_to_use, # Use potentially augmented K
-                value_to_use, # Use potentially augmented V
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size_left=window_size[0],
-                window_size_right=window_size[1],
-                softcap=0.0,
-                alibi_slopes=alibi_slopes,
-                return_softmax=True and dropout_p > 0,
-            )
+            fa_kwargs["window_size_left"] = window_size[0]
+            fa_kwargs["window_size_right"] = window_size[1]
+            fa_res = _flash_attn_forward(q, key_to_use, value_to_use, **fa_kwargs)
+            out = fa_res[0]
+            lse = fa_res[1]  # type: ignore
 
     out = out.to(q.dtype)
     lse = lse.squeeze(dim=-1).transpose(1, 2)

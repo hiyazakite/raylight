@@ -44,7 +44,7 @@ class CompactConfig:
         log_stats: bool = False,
         check_consist: bool = False,
         fastpath: bool = False,
-        quantized_cache: bool = False,
+        quantized_cache: bool = True,
         cache_quant_bits: int | None = None,
         delta_decay_factor: float | None = None
     ):

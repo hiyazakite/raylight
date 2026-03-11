@@ -208,25 +208,35 @@ class GGMLLayer(torch.nn.Module):
         if tensor is None:
             return
 
+        # STRIP SUBCLASS IMMEDIATELY! 
+        # Accessing .device, .shape, .dtype on GGMLTensor triggers __torch_function__ overhead
+        # which adds up to tens of seconds across thousands of calls.
+        is_ggml = isinstance(tensor, GGMLTensor)
+        native_tensor = tensor.as_subclass(torch.Tensor) if is_ggml else tensor
+        
+        # We must capture the logical shape defined by the GGUF metadata before stripping!
+        # The raw native_tensor might just be a 1D flat int8 buffer.
+        target_shape = tensor.shape if is_ggml else native_tensor.shape
+        
         # consolidate and load patches to GPU in async
         patch_list = []
-        device = tensor.device
+        device = native_tensor.device
         key = None
         for patches, key in getattr(tensor, "patches", []):
             patch_list += move_patch_to_device(patches, device)
 
-        # DEBUG: Inspect tensor type before dequant
-        if not hasattr(self, "_logged_debug"):
-            has_patches = len(getattr(tensor, "patches", [])) > 0
-            print(f"[GGUF Forward DEBUG] Layer {self.__class__.__name__} processing weight: class={tensor.__class__.__name__}, dtype={tensor.dtype}, shape={tensor.shape}, tensor_type={getattr(tensor, 'tensor_type', 'NO_ATTR')}, has_patches={has_patches}")
-            self._logged_debug = True
-
         # dequantize tensor while patches load
+        # Pass the GGMLTensor (tensor) because dequantize_tensor needs the .tensor_shape/.tensor_type metadata
         weight = dequantize_tensor(tensor, dtype, self.dequant_dtype)
 
-        # prevent propagating custom tensor class
+        # dequantize_tensor should already strip GGMLTensor, but ensure safety
         if isinstance(weight, GGMLTensor):
             weight = weight.as_subclass(torch.Tensor)
+            
+        # CRITICAL FIX: The dequantized weight might have the shape of the raw 1D tensor buffer
+        # if qtype was None (TORCH_COMPATIBLE_QTYPES branch). We must reshape to the logical size.
+        if weight.shape != target_shape:
+            weight = weight.view(target_shape)
 
         # apply patches
         if len(patch_list) > 0:
@@ -259,24 +269,35 @@ class GGMLLayer(torch.nn.Module):
             if device is None:
                 device = input.device
 
+        weight = None
         bias = None
         non_blocking = comfy.model_management.device_supports_non_blocking(device)
+
         def match_device(t, dev):
-             if t is None or dev is None: return False
-             return str(t.device) == str(dev) or (t.device.type == dev.type and (t.device.index or 0) == (dev.index or 0))
+            if t is None or dev is None:
+                return False
+            return t.device.type == dev.type and (t.device.index or 0) == (dev.index or 0)
 
         if s.bias is not None:
-            bias_t = s.bias if match_device(s.bias, device) else s.bias.to(device)
-            bias = s.get_weight(bias_t, dtype)
-            bias = comfy.ops.cast_to(
-                bias, bias_dtype, device, non_blocking=non_blocking, copy=False
-            )
+            # Fast device check
+            b_native = s.bias.as_subclass(torch.Tensor) if isinstance(s.bias, GGMLTensor) else s.bias
+            b_tensor = s.bias
+            if not match_device(b_native, device):
+                b_tensor = b_tensor.to(device, non_blocking=non_blocking)
+            
+            bias = s.get_weight(b_tensor, dtype)
+            bias = comfy.ops.cast_to(bias, bias_dtype, device, non_blocking=non_blocking, copy=False)
 
-        weight_t = s.weight if match_device(s.weight, device) else s.weight.to(device)
-        weight = s.get_weight(weight_t, dtype)
-        weight = comfy.ops.cast_to(
-            weight, dtype, device, non_blocking=non_blocking, copy=False
-        )
+        if s.weight is not None:
+            # Fast device check
+            w_native = s.weight.as_subclass(torch.Tensor) if isinstance(s.weight, GGMLTensor) else s.weight
+            w_tensor = s.weight
+            if not match_device(w_native, device):
+                w_tensor = w_tensor.to(device, non_blocking=non_blocking)
+
+            weight = s.get_weight(w_tensor, dtype)
+            weight = comfy.ops.cast_to(weight, dtype, device, non_blocking=non_blocking, copy=False)
+
         return weight, bias
 
     def forward_comfy_cast_weights(self, input, *args, **kwargs):
@@ -319,6 +340,9 @@ class GGMLOps(comfy.ops.manual_cast):
     class Conv2d(GGMLLayer, comfy.ops.manual_cast.Conv2d):
         def forward_ggml_cast_weights(self, input):
             weight, bias = self.cast_bias_weight(input)
+            expected_shape = (self.out_channels, self.in_channels // self.groups, *self.kernel_size)
+            if weight.shape != expected_shape:
+                weight = weight.view(expected_shape)
             return self._conv_forward(input, weight, bias)
 
     class Embedding(GGMLLayer, comfy.ops.manual_cast.Embedding):
@@ -332,6 +356,9 @@ class GGMLOps(comfy.ops.manual_cast):
             weight, _bias = self.cast_bias_weight(
                 self, device=input.device, dtype=out_dtype
             )
+            expected_shape = (self.num_embeddings, self.embedding_dim)
+            if weight.shape != expected_shape:
+                weight = weight.view(expected_shape)
             return torch.nn.functional.embedding(
                 input,
                 weight,
