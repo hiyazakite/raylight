@@ -66,8 +66,10 @@ class GGMLTensor(torch.Tensor):
 
     def to(self, *args, **kwargs):
         new = super().to(*args, **kwargs)
+        if new is self:
+            return self
         new.tensor_type = getattr(self, "tensor_type", None)
-        new.tensor_shape = getattr(self, "tensor_shape", new.data.shape)
+        new.tensor_shape = getattr(self, "tensor_shape", new.size())
         new.patches = getattr(self, "patches", []).copy()
         return new
 
@@ -224,7 +226,7 @@ class GGMLLayer(torch.nn.Module):
 
         # prevent propagating custom tensor class
         if isinstance(weight, GGMLTensor):
-            weight = torch.Tensor(weight)
+            weight = weight.as_subclass(torch.Tensor)
 
         # apply patches
         if len(patch_list) > 0:
@@ -259,13 +261,19 @@ class GGMLLayer(torch.nn.Module):
 
         bias = None
         non_blocking = comfy.model_management.device_supports_non_blocking(device)
+        def match_device(t, dev):
+             if t is None or dev is None: return False
+             return str(t.device) == str(dev) or (t.device.type == dev.type and (t.device.index or 0) == (dev.index or 0))
+
         if s.bias is not None:
-            bias = s.get_weight(s.bias.to(device), dtype)
+            bias_t = s.bias if match_device(s.bias, device) else s.bias.to(device)
+            bias = s.get_weight(bias_t, dtype)
             bias = comfy.ops.cast_to(
                 bias, bias_dtype, device, non_blocking=non_blocking, copy=False
             )
 
-        weight = s.get_weight(s.weight.to(device), dtype)
+        weight_t = s.weight if match_device(s.weight, device) else s.weight.to(device)
+        weight = s.get_weight(weight_t, dtype)
         weight = comfy.ops.cast_to(
             weight, dtype, device, non_blocking=non_blocking, copy=False
         )
@@ -279,7 +287,7 @@ class GGMLLayer(torch.nn.Module):
 
         # non-ggml forward might still propagate custom tensor class
         if isinstance(out, GGMLTensor):
-            out = torch.Tensor(out)
+            out = out.as_subclass(torch.Tensor)
         return out
 
     def forward_ggml_cast_weights(self, input):

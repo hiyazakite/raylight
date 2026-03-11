@@ -98,7 +98,8 @@ class SamplerManager:
 
                 try:
                     from raylight.distributed_modules.compact.main import compact_config, compact_reset
-                    if compact_config() is not None:
+                    cfg = compact_config()
+                    if cfg is not None and cfg.enabled:
                         # Compact attention backend: reset the delta KV cache and step counter.
                         # compact_reset() handles its own internal memory; no empty_cache needed.
                         compact_reset()

@@ -96,16 +96,21 @@ class ModelContext(ABC):
             lora_manager.clear_tracking()
             print(f"[RayWorker {config.local_rank}] LoRA tracking cleared.")
         
-        # Move buffers to CPU if model still exists
+        # Move weights and buffers to CPU if model still exists
         if model is not None:
             diffusion_model = getattr(model, "model", None)
             if diffusion_model is not None:
                 try:
+                    # Move whole module to CPU to ensure weights are released from VRAM
+                    # For GGUF, this is usually a no-op as weights are already CPU mmap'd
+                    # and unpatch_model handles it, but for standard models/VAEs it's critical.
+                    diffusion_model.to('cpu')
+                    
                     for name, buf in diffusion_model.named_buffers():
                         if buf is not None and buf.device.type == 'cuda':
                             buf.data = buf.data.to('cpu')
                 except Exception as e:
-                    print(f"[RayWorker {config.local_rank}] Buffer cleanup warning: {e}")
+                    print(f"[RayWorker {config.local_rank}] Module/Buffer cleanup warning: {e}")
                 
                 # Delete cached PE tensors
                 for attr in ['_cached_pe', 'cached_pe', 'pe_cache', '_pe']:
