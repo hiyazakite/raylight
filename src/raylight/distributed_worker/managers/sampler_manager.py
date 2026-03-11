@@ -10,6 +10,8 @@ from raylight.utils.memory import monitor_memory
 from raylight.utils.common import Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 import time
+import os
+from raylight.utils.profiler import CProfileContext
 
 if TYPE_CHECKING:
     from raylight.distributed_worker.worker_config import WorkerConfig
@@ -191,20 +193,22 @@ class SamplerManager:
                             self.temporal_cache_tracker.total_steps = total_steps  # type: ignore
                         self.temporal_cache_tracker.update(step)  # type: ignore
 
-                 samples = comfy.sample.sample_custom(
-                         work_model,
-                         noise,
-                         cfg,
-                         sampler,
-                         sigmas,
-                         positive,
-                         negative,
-                      final_samples,
-                      noise_mask=noise_mask,
-                      disable_pbar=disable_pbar,
-                      seed=noise_seed,
-                      callback=sampling_callback,
-                  )
+                 profile_enabled = os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "1") == "1"
+                 with CProfileContext(enabled=profile_enabled, sort_by='cumulative', top_k=5, name="custom_ksampler (Comfy)"):
+                     samples = comfy.sample.sample_custom(
+                             work_model,
+                             noise,
+                             cfg,
+                             sampler,
+                             sigmas,
+                             positive,
+                             negative,
+                          final_samples,
+                          noise_mask=noise_mask,
+                          disable_pbar=disable_pbar,
+                          seed=noise_seed,
+                          callback=sampling_callback,
+                      )
                  if getattr(self, "temporal_cache_tracker", None) is not None:
                      self.temporal_cache_tracker.log_stats()
                  out = work_latent.copy()
@@ -295,42 +299,44 @@ class SamplerManager:
                             self.temporal_cache_tracker.total_steps = total_steps  # type: ignore
                         self.temporal_cache_tracker.update(step)  # type: ignore
                 
-                if sigmas is None:
-                    samples = comfy.sample.sample(
-                        work_model,
-                        noise,
-                        steps,
-                        cfg,
-                        sampler_name,
-                        scheduler,
-                        positive,
-                        negative,
-                        final_samples,
-                        denoise=denoise,
-                        disable_noise=disable_noise,
-                        start_step=start_step,
-                        last_step=last_step,
-                        force_full_denoise=force_full_denoise,
-                        noise_mask=noise_mask,
-                        disable_pbar=disable_pbar,
-                        seed=seed,
-                        callback=sampling_callback,
-                   )
-                else:
-                         samples = comfy.sample.sample_custom(
+                profile_enabled = os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "1") == "1"
+                with CProfileContext(enabled=profile_enabled, sort_by='cumulative', top_k=5, name="common_ksampler (Comfy)"):
+                    if sigmas is None:
+                        samples = comfy.sample.sample(
                             work_model,
                             noise,
+                            steps,
                             cfg,
-                            sampler_obj,
-                            sigmas,
+                            sampler_name,
+                            scheduler,
                             positive,
                             negative,
                             final_samples,
+                            denoise=denoise,
+                            disable_noise=disable_noise,
+                            start_step=start_step,
+                            last_step=last_step,
+                            force_full_denoise=force_full_denoise,
                             noise_mask=noise_mask,
                             disable_pbar=disable_pbar,
                             seed=seed,
                             callback=sampling_callback,
-                        )
+                       )
+                    else:
+                             samples = comfy.sample.sample_custom(
+                                work_model,
+                                noise,
+                                cfg,
+                                sampler_obj,
+                                sigmas,
+                                positive,
+                                negative,
+                                final_samples,
+                                noise_mask=noise_mask,
+                                disable_pbar=disable_pbar,
+                                seed=seed,
+                                callback=sampling_callback,
+                            )
                 
                 if getattr(self, "temporal_cache_tracker", None) is not None:
                     self.temporal_cache_tracker.log_stats()

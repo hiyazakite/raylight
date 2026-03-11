@@ -23,6 +23,7 @@ PRINT_ALL_ERROR = os.environ.get("PRINT_ALL_ERROR", "0") == "1"
 REF_ACTIVATION_PATH = os.environ.get("REF_ACTIVATION_PATH", "ref_activations")
 DUMP_ACTIVATIONS = os.environ.get("DUMP_ACTIVATIONS", "0") == "1"
 CALC_TOTAL_ERROR = os.environ.get("CALC_TOTAL_ERROR", "0") == "1"
+CALC_ERROR = os.environ.get("CALC_ERROR", "0") == "1"
 
 def stats_hello():
     print("--- 📦  Statistics Configuration ---")
@@ -32,6 +33,7 @@ def stats_hello():
     print(f"REF_ACTIVATION_PATH: {REF_ACTIVATION_PATH}")
     print(f"DUMP_ACTIVATIONS: {DUMP_ACTIVATIONS}")
     print(f"CALC_TOTAL_ERROR: {CALC_TOTAL_ERROR}")
+    print(f"CALC_ERROR: {CALC_ERROR}")
     print("------------------------------")
 
 class StatsLogger:
@@ -149,20 +151,24 @@ class StatsLogger:
         if key not in self.stats:
             self.stats[key] = []
 
-        # Calculate on-the-fly compression error
-        error = torch.norm(before_comp_activation - recv_activation)
+        # Calculate on-the-fly compression error (Synchronous!)
+        error = None
+        if CALC_ERROR:
+            error_tensor = torch.norm(before_comp_activation - recv_activation)
+            error = error_tensor.item()
 
-        # --- Compare with Dumped Activations (assert path if flag is True) ---
+        # --- Compare with Dumped Activations ---
         total_error = None
         if calc_total_error:
-            # Assert that the path is provided if calculation is requested
+            # Assert that the path is provided
             assert ref_activation_path is not None, \
                 "ref_activation_path must be provided when calc_total_error is True"
             load_dir = ref_activation_path
             filename = os.path.join(load_dir, f"{key}_step{step_count}.pt")
             # Let it crash if file not found
             gt_activation = torch.load(filename, map_location='cpu')
-            total_error = torch.norm(recv_activation.cpu() - gt_activation)
+            total_error_tensor = torch.norm(recv_activation.cpu() - gt_activation)
+            total_error = total_error_tensor.item()
 
         # Calculate sizes
         original_size_bytes = before_comp_activation.numel() * before_comp_activation.element_size()
@@ -300,8 +306,8 @@ class StatsLogger:
 
         # Store current stats
         self.stats[key].append({
-            'error': error.item(),
-            'total_error': total_error.item() if total_error is not None else None, # Store total error
+            'error': error,
+            'total_error': total_error,
             'activation_norm': act_norm,
             'delta_norm': delta_norm,
             'delta_delta_norm': delta_delta_norm,
@@ -464,8 +470,10 @@ class StatsLogger:
                 print(f", act: {avg_act_norm:.3f}", end="")
 
                 if res >= 1:
-                    avg_delta_norm = np.mean([s['delta_norm'] for s in stats if s['delta_norm'] is not None])
-                    delta_ratio = avg_delta_norm/avg_act_norm
+                    avg_delta_norm_vals = [s['delta_norm'] for s in stats if s['delta_norm'] is not None]
+                    avg_delta_norm = np.mean(avg_delta_norm_vals) if avg_delta_norm_vals else 0
+                    
+                    delta_ratio = avg_delta_norm/avg_act_norm if avg_act_norm > 1e-8 else 0
                     print(f", delta={avg_delta_norm:.3f}, d/a={delta_ratio:.2f}", end="")
 
                     # Add delta before feedback stats 

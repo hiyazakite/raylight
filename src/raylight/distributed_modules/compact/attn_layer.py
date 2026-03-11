@@ -76,7 +76,7 @@ class xFuserLongContextAttention(LongContextAttention):
         self.idx = None # NOTE: assign idx in forward
 
     @torch.compiler.disable
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         attn,
         query: Tensor,
@@ -135,7 +135,7 @@ class xFuserLongContextAttention(LongContextAttention):
             pass
         else:
             raise ValueError(
-                f"joint_tensor_query, joint_tensor_key, and joint_tensor_value should be None or not None simultaneously."
+                "joint_tensor_query, joint_tensor_key, and joint_tensor_value should be None or not None simultaneously."
             )
 
         if is_joint:
@@ -172,7 +172,7 @@ class xFuserLongContextAttention(LongContextAttention):
                 qkv = SeqAllToAll4D.apply(
                     self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx
                 )
-                qkv = torch.chunk(qkv, 3, dim=0)
+                qkv = torch.chunk(qkv, 3, dim=0)  # type: ignore
                 query_layer, key_layer, value_layer = qkv
 
             else:
@@ -197,8 +197,7 @@ class xFuserLongContextAttention(LongContextAttention):
         """
         Collector for Q, K, V, Layer/Step Specific
         """
-        # from raylight.distributed_modules.compact.main import compact_config, compact_get_step
-        from raylight.distributed_modules.compact.main import compact_get_step
+        from raylight.distributed_modules.compact.context import compact_get_step
         # from raylight.distributed_modules.collector.collector import collect
         # collect(query_layer, "q", compact_get_step(), self.idx)
         # collect(key_layer, "k", compact_get_step(), self.idx)
@@ -206,17 +205,17 @@ class xFuserLongContextAttention(LongContextAttention):
         
         # Build a common kwargs dict for the ring attention function
         from raylight.distributed_modules.compact.ring import compact_fwd, _VERBOSE_ATTN
+        from raylight.distributed_modules.attention.xfuser_ring_patch import xdit_ring_flash_attn_func_patched
+        
         is_compact_ring = self.ring_attn_fn == compact_fwd
+        ring_fn = self.ring_attn_fn
 
         # If a mask is present and we are using the standard xfuser ring (which doesn't support masks),
-        # transparently fall back to compact_fwd for this call only.
-        # compact_fwd handles masks correctly by slicing them per ring step.
-        ring_fn = self.ring_attn_fn
+        # transparently use our PATCHED xfuser ring for this call.
         if mask is not None and not is_compact_ring:
             if _VERBOSE_ATTN:
-                print(f"[Raylight] ⚠️ Mask present but standard ring active — overriding to compact_fwd for mask support (Layer: {self.idx})")
-            ring_fn = compact_fwd
-            is_compact_ring = True
+                print(f"[Raylight] ⚡ Mask present — using patched xfuser ring for mask support (Layer: {self.idx})")
+            ring_fn = xdit_ring_flash_attn_func_patched
 
         attn_kwargs = {
             "dropout_p": dropout_p,
@@ -240,12 +239,16 @@ class xFuserLongContextAttention(LongContextAttention):
         if is_compact_ring:
             attn_kwargs["mod_idx"] = kwargs.get("mod_idx", self.idx)
             attn_kwargs["current_iter"] = kwargs.get("current_iter", compact_get_step())
-            attn_kwargs["mask"] = mask  # compact_fwd supports mask; xfuser ring does not
+            attn_kwargs["key_suffix"] = kwargs.get("key_suffix", "")
+            attn_kwargs["mask"] = mask
+        elif mask is not None:
+            # Patched xfuser ring also needs the mask (already diverted to ring_fn)
+            attn_kwargs["mask"] = mask
 
         out = ring_fn(
-            query_layer,
-            key_layer,
-            value_layer,
+            query_layer,  # type: ignore
+            key_layer,  # type: ignore
+            value_layer,  # type: ignore
             **attn_kwargs
         )
 
@@ -262,4 +265,4 @@ class xFuserLongContextAttention(LongContextAttention):
             )
 
         # out e.g., [s/p::h]
-        return output
+        return output  # type: ignore

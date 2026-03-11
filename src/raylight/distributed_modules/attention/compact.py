@@ -88,7 +88,8 @@ class CompactAttentionBackend(AttentionBackend):
                 q, k, v, heads,
                 join_q=None, join_k=None, join_v=None,
                 mask=None, attn_precision=None,
-                skip_reshape=False, skip_output_reshape=False):
+                skip_reshape=False, skip_output_reshape=False,
+                **kwargs):
 
             if skip_reshape:
                 b, _, _, dim_head = q.shape
@@ -124,12 +125,14 @@ class CompactAttentionBackend(AttentionBackend):
                     joint_tensor_key=join_k.transpose(1, 2),
                     joint_tensor_value=join_v.transpose(1, 2),
                     mask=mask,
+                    **kwargs,
                 ).transpose(1, 2)
             else:
                 out = xfuser_attn(
                     None,
                     q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                     mask=mask,
+                    **kwargs,
                 ).transpose(1, 2)
             
             if not skip_output_reshape:

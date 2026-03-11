@@ -299,13 +299,20 @@ def usp_cross_attn_forward(
 
     # Pass metadata if available in transformer_options
     mod_idx = transformer_options.get("block_index", None)
+    cond_or_uncond = transformer_options.get("cond_or_uncond", None)
+    key_suffix = ""
+    if cond_or_uncond is not None:
+        if isinstance(cond_or_uncond, list) and len(cond_or_uncond) > 0:
+            key_suffix = f"-c{cond_or_uncond[0]}"
+    
     from raylight.distributed_modules.compact.main import compact_get_step
     
     out = xfuser_optimized_attention(
         q, k, v, self.heads, 
         mask=mask, 
         mod_idx=mod_idx,
-        current_iter=compact_get_step()
+        current_iter=compact_get_step(),
+        key_suffix=key_suffix
     )
 
     # Apply per-head gating if enabled (LTX-specific)
