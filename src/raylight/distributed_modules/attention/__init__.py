@@ -1,6 +1,6 @@
 from .registry import AttentionRegistry
-from .standard import StandardAttentionBackend
-from .compact import CompactAttentionBackend
+from .backends.standard import StandardAttentionBackend
+from .backends.compact import CompactAttentionBackend
 
 # Register backends
 AttentionRegistry.register("STANDARD", StandardAttentionBackend)

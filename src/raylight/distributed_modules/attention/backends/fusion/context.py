@@ -1,5 +1,5 @@
-from raylight.distributed_modules.compact.utils import CompactConfig, CompactCache
-from raylight.distributed_modules.compact.patchpara.df_cache import AllGatherCache
+from raylight.distributed_modules.attention.backends.fusion.utils import CompactConfig, CompactCache
+from raylight.distributed_modules.attention.backends.fusion.patchpara.df_cache import AllGatherCache
 
 _config: CompactConfig = None
 _cache: CompactCache = None

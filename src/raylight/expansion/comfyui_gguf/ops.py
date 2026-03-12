@@ -204,6 +204,7 @@ class GGMLLayer(torch.nn.Module):
 
         return
 
+    @torch_compiler_disable()
     def get_weight(self, tensor, dtype):
         if tensor is None:
             return
@@ -297,6 +298,7 @@ class GGMLLayer(torch.nn.Module):
 
         return weight, bias
 
+    @torch_compiler_disable()
     def forward_comfy_cast_weights(self, input, *args, **kwargs):
         if self.is_ggml_quantized():
             out = self.forward_ggml_cast_weights(input, *args, **kwargs)

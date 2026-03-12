@@ -39,7 +39,8 @@ def stats_hello():
 class StatsLogger:
     """Simple statistics logger for compression metrics."""
 
-    def __init__(self):
+    def __init__(self, enabled=False):
+        self.enabled = enabled
         # Main storage for stats
         self.stats = {}
         # Prev step storage for similarity calculations
@@ -116,6 +117,8 @@ class StatsLogger:
         compressed_tensor, 
         compress_residual,
     ):
+        if not self.enabled:
+            return
         """
         Log compression statistics for a layer.
         
@@ -195,8 +198,8 @@ class StatsLogger:
             delta_before_feedback = before_comp_activation - self.prev_activations[key].to(before_comp_activation.device)
             delta_before_feedback_norm = torch.norm(delta_before_feedback).item()
             
-            from raylight.distributed_modules.compact.slowpath import sim_compress
-            from raylight.distributed_modules.compact.utils import COMPACT_COMPRESS_TYPE
+            from raylight.distributed_modules.attention.backends.fusion.slowpath import sim_compress
+            from raylight.distributed_modules.attention.backends.fusion.utils import COMPACT_COMPRESS_TYPE
             delta_before_feedback_lowrank = sim_compress(delta_before_feedback.cuda(), COMPACT_COMPRESS_TYPE.LOW_RANK, rank=8).cpu()
             # no need for norm, just for similarity
 
@@ -210,7 +213,7 @@ class StatsLogger:
             delta = before_comp_activation - base
             transmitted_delta = recv_activation - base # Still recv_activation - base
             delta_delta = before_comp_activation - base - delta_base
-            # from raylight.distributed_modules.compact.plot import plot_3d
+            # from raylight.distributed_modules.attention.backends.fusion.plot import plot_3d
             # plot_3d(delta_delta, title=f"dd_{key}_{self.plot_counter}")
             # self.plot_counter += 1
         else:
@@ -361,7 +364,7 @@ class StatsLogger:
                                      log_scale: bool = True,
                                      top_k: Optional[int] = None,
                                      num_bins: int = 100):
-        from raylight.distributed_modules.compact.plot import plot_eigenvalue_distribution
+        from raylight.distributed_modules.attention.backends.fusion.plot import plot_eigenvalue_distribution
         plot_eigenvalue_distribution(self.eigenvalues, key, step, data_type, save_dir, log_scale, top_k, num_bins)
 
     def plot_eigenvalue_cumsum(
@@ -373,7 +376,7 @@ class StatsLogger:
         log_scale: bool = True,
         top_k: Optional[int] = None,
     ):
-        from raylight.distributed_modules.compact.plot import plot_eigenvalue_cumsum
+        from raylight.distributed_modules.attention.backends.fusion.plot import plot_eigenvalue_cumsum
         plot_eigenvalue_cumsum(self.eigenvalues, key, step, data_type, save_dir, log_scale, top_k)
 
     def summary_over_steps(self, steps=None, keys=None):
@@ -612,7 +615,7 @@ class StatsLogger:
 
         mean_rel_err = mean_err / mean_act if mean_act > 1e-8 else float('inf')
         print(f"🟧 avg comp error: {mean_err:.3f}, avg rel err: {mean_rel_err:.1%}" + (f", avg total err: {mean_total_err:.3f}" if mean_total_err is not None else ", [total err not logged]"))
-        from raylight.distributed_modules.compact.utils import get_emoji
+        from raylight.distributed_modules.attention.backends.fusion.utils import get_emoji
         print(get_emoji())
 
     def save_eigenvalues(self, save_dir="eigenvalues"):
@@ -651,7 +654,7 @@ class StatsLogger:
         layer_idx = int(key.split("-")[0])
         if layer_idx not in UV_PLOT_LAYERS or step not in UV_PLOT_STEPS:
             return
-        from raylight.distributed_modules.compact.plot import plot_low_rank_factors
+        from raylight.distributed_modules.attention.backends.fusion.plot import plot_low_rank_factors
         plot_low_rank_factors(u, v, key, step, save_dir)
 
     def dump_average_error_vs_steps(
@@ -662,7 +665,7 @@ class StatsLogger:
         assert self.stats, "No statistics logged. Cannot dump data."
         # Basic check if any data exists, detailed checks happen in the dump function
 
-        from raylight.distributed_modules.compact.plot import dump_average_error_vs_steps # Import renamed function
+        from raylight.distributed_modules.attention.backends.fusion.plot import dump_average_error_vs_steps # Import renamed function
         dump_average_error_vs_steps(self.stats, save_dir) # Call renamed function
 
     def dump_average_norms_and_similarity_vs_steps(
@@ -672,40 +675,40 @@ class StatsLogger:
         """Dumps average activation norm, delta norm, and activation similarity vs steps data to a file."""
         assert self.stats, "No statistics logged. Cannot dump data."
 
-        from raylight.distributed_modules.compact.plot import dump_average_norms_and_similarity_vs_steps
+        from raylight.distributed_modules.attention.backends.fusion.plot import dump_average_norms_and_similarity_vs_steps
         dump_average_norms_and_similarity_vs_steps(self.stats, save_dir)
 
 # Global stats instance
-_stats = None
+_stats_logger = None
 
-def stats_log():
-    global _stats
-    if _stats is None:
-        _stats = StatsLogger()
-    return _stats
+def stats_log(enabled=False):
+    global _stats_logger
+    if _stats_logger is None:
+        _stats_logger = StatsLogger(enabled=enabled)
+    return _stats_logger
 
 def stats_clear():
-    global _stats
-    if _stats is not None:
+    global _stats_logger
+    if _stats_logger is not None:
         # Explicitly release GPU tensor references to prevent memory leaks
         # when the StatsLogger survives longer than expected in the GC cycle.
-        _stats.prev_activations.clear()
-        _stats.prev_deltas.clear()
-        _stats.prev_transmitted_deltas.clear()
-        _stats.prev_delta_before_feedback.clear()
-        _stats.prev_delta_before_feedback_lowrank.clear()
-        _stats.eigenvalues.clear()
-        _stats.stats.clear()
-    _stats = None
+        _stats_logger.prev_activations.clear()
+        _stats_logger.prev_deltas.clear()
+        _stats_logger.prev_transmitted_deltas.clear()
+        _stats_logger.prev_delta_before_feedback.clear()
+        _stats_logger.prev_delta_before_feedback_lowrank.clear()
+        _stats_logger.eigenvalues.clear()
+        _stats_logger.stats.clear()
+    _stats_logger = None
 
 def stats_verbose(step_range=None, key=None, summary_keys=True):
-    if _stats is None:
+    if _stats_logger is None:
         print("No statistics logged.")
         return
     if summary_keys:
-        _stats.summary_over_keys(step_range, key)
-    _stats.summary_compression_volume()
-    _stats.summary_total_avg()
+        _stats_logger.summary_over_keys(step_range, key)
+    _stats_logger.summary_compression_volume()
+    _stats_logger.summary_total_avg()
 
 def log(key, base, delta_base, real_activation, recv_activation, compressed_tensor, compress_residual):
     """
@@ -730,10 +733,10 @@ def stats_verbose_steps(steps=None, keys=None):
         steps: List of step indices to include (None for all)
         keys: List of layer keys to summarize (None for all)
     """
-    if _stats is None:
+    if _stats_logger is None:
         print("No statistics logged.")
         return
-    _stats.summary_over_steps(steps, keys)
+    _stats_logger.summary_over_steps(steps, keys)
 
 def plot_eigenvalues(key=None, step=None, data_type='activation', save_dir=None, log_scale=True, top_k=None, cum_sum=False):
     """
@@ -747,23 +750,23 @@ def plot_eigenvalues(key=None, step=None, data_type='activation', save_dir=None,
         log_scale: Whether to use log scale for y-axis
         top_k: Number of top eigenvalues to plot (None for all)
     """
-    if _stats is None:
+    if _stats_logger is None:
         print("No statistics logged.")
         return
     if cum_sum:
-        _stats.plot_eigenvalue_cumsum(key, step, data_type, save_dir, log_scale, top_k)
+        _stats_logger.plot_eigenvalue_cumsum(key, step, data_type, save_dir, log_scale, top_k)
     else:
-        _stats.plot_eigenvalue_distribution(key, step, data_type, save_dir, log_scale, top_k)
+        _stats_logger.plot_eigenvalue_distribution(key, step, data_type, save_dir, log_scale, top_k)
 
 def save_eigenvalues(save_dir="eigenvalues"):
     """
     Global function to save profiled eigenvalues.
     """
-    if _stats is None:
+    if _stats_logger is None:
         print("No statistics logged.")
         return
     
-    _stats.save_eigenvalues(save_dir)
+    _stats_logger.save_eigenvalues(save_dir)
 
 def dump_err_vs_steps(save_dir: str): # Renamed, save_dir mandatory
     """
@@ -772,10 +775,10 @@ def dump_err_vs_steps(save_dir: str): # Renamed, save_dir mandatory
     Args:
         save_dir: Directory to save the dumped data file.
     """
-    if _stats is None:
+    if _stats_logger is None:
         print("No statistics logged. Cannot dump data.")
         return
-    _stats.dump_average_error_vs_steps(save_dir) # Call renamed method
+    _stats_logger.dump_average_error_vs_steps(save_dir) # Call renamed method
 
 def dump_norms_sim_vs_steps(save_dir: str):
     """
@@ -785,7 +788,7 @@ def dump_norms_sim_vs_steps(save_dir: str):
     Args:
         save_dir: Directory to save the dumped data file.
     """
-    if _stats is None:
+    if _stats_logger is None:
         print("No statistics logged. Cannot dump data.")
         return
-    _stats.dump_average_norms_and_similarity_vs_steps(save_dir)
+    _stats_logger.dump_average_norms_and_similarity_vs_steps(save_dir)

@@ -14,6 +14,9 @@ except ImportError:
     select_flash_attn_impl = None
     AttnType = None
 
+from typing import Optional, Any, Tuple
+import torch.nn as nn
+
 try:
     import flash_attn
     from flash_attn.flash_attn_interface import _flash_attn_forward
@@ -175,23 +178,23 @@ def xdit_ring_flash_attn_forward_patched(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale,
-    dropout_p=0,
-    causal=True,
-    window_size=(-1, -1),
-    alibi_slopes=None,
-    deterministic=False,
-    attn_type=None,
-    attn_processor=None,
-    attn_layer=None,
-    joint_tensor_key=None,
-    joint_tensor_value=None,
-    joint_strategy="none",
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
-    mask=None,
-):
+    softmax_scale: float,
+    dropout_p: float = 0.0,
+    causal: bool = True,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    attn_type: Optional[Any] = None,
+    attn_processor: Optional[nn.Module] = None,
+    attn_layer: Optional[Any] = None,
+    joint_tensor_key: Optional[torch.Tensor] = None,
+    joint_tensor_value: Optional[torch.Tensor] = None,
+    joint_strategy: str = "none",
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Patched xfuser ring attention forward that supports masks.
     """
@@ -252,6 +255,7 @@ def xdit_ring_flash_attn_forward_patched(
         # Slice mask for current ring step
         mask_slice = None
         if has_nontrivial_mask:
+            assert mask is not None
             q_len, k_len_block = q.shape[1], block_k.shape[1]
             q_start = rank * q_len
             recv_rank = (rank - step) % world_size
@@ -274,7 +278,8 @@ def xdit_ring_flash_attn_forward_patched(
                 if AttnType is None or select_flash_attn_impl is None:
                     raise ImportError("yunchang is required for xfuser ring attention without masks")
                 _attn_type = getattr(AttnType, "FA") if attn_type is None else attn_type
-                fn = select_flash_attn_impl(_attn_type, stage="fwd-only", attn_processor=attn_processor)
+                # type ignore because select_flash_attn_impl return type is dynamic and signature varies by stage
+                fn: Any = select_flash_attn_impl(_attn_type, stage="fwd-only", attn_processor=attn_processor) # type: ignore
                 block_out, block_lse = fn(
                     q, block_k, block_v,
                     dropout_p=dropout_p,
@@ -294,6 +299,7 @@ def xdit_ring_flash_attn_forward_patched(
 
         if step + 1 != world_size:
             comm.wait()
+            assert next_k is not None and next_v is not None
             k = next_k
             v = next_v
 

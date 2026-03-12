@@ -63,7 +63,7 @@ def attention(q, k, v, pe, mask=None) -> Tensor:
     if pe is not None:
         q, k = apply_rope(q, k, pe)
 
-    heads = q.shape[1]
+    heads = q.shape[2]
     x = xfuser_optimized_attention(
         q,
         k,
@@ -120,8 +120,12 @@ def usp_dit_forward(
     pe_combine = self.pe_embedder(ids)
     pe_image = self.pe_embedder(img_ids)
 
-    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
-    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    pe_combine = pe_combine.transpose(1, 2)
+    pe_image = pe_image.transpose(1, 2)
+    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    pe_combine = pe_combine.contiguous()
+    pe_image = pe_image.contiguous()
 
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
@@ -225,7 +229,7 @@ def usp_single_stream_forward(self, x: Tensor, pe: Tensor, vec: Tensor, attn_mas
     x_mod = torch.addcmul(mod.shift, 1 + mod.scale, self.pre_norm(x))
     qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
-    q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 1, 3, 4)
     q, k = self.norm(q, k, v)
 
     # compute attention
@@ -244,20 +248,20 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: T
     # prepare image for attention
     img_modulated = torch.addcmul(img_mod1.shift, 1 + img_mod1.scale, self.img_norm1(img))
     img_qkv = self.img_attn.qkv(img_modulated)
-    img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 1, 3, 4)
     img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
 
     # prepare txt for attention
     txt_modulated = torch.addcmul(txt_mod1.shift, 1 + txt_mod1.scale, self.txt_norm1(txt))
     txt_qkv = self.txt_attn.qkv(txt_modulated)
-    txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 1, 3, 4)
     txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
     # run actual attention
     img_q, img_k = apply_rope(img_q, img_k, pe)
-    attn = attention(torch.cat((txt_q, img_q), dim=2),
-                     torch.cat((txt_k, img_k), dim=2),
-                     torch.cat((txt_v, img_v), dim=2),
+    attn = attention(torch.cat((txt_q, img_q), dim=1),
+                     torch.cat((txt_k, img_k), dim=1),
+                     torch.cat((txt_v, img_v), dim=1),
                      pe=None, mask=attn_mask)
 
     txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]

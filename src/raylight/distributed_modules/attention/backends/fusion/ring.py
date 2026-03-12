@@ -7,10 +7,10 @@ import os
 
 from yunchang.ring.utils import RingComm, update_out_and_lse
 
-from raylight.distributed_modules.compact.utils import COMPACT_COMPRESS_TYPE
-from raylight.distributed_modules.compact.context import compact_config, compact_cache
-from raylight.distributed_modules.compact.ops import compact_compress, compact_decompress
-from raylight.distributed_modules.compact.prof import Profiler
+from raylight.distributed_modules.attention.backends.fusion.utils import COMPACT_COMPRESS_TYPE
+from raylight.distributed_modules.attention.backends.fusion.context import compact_config, compact_cache
+from raylight.distributed_modules.attention.backends.fusion.ops import compact_compress, compact_decompress
+from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
 import torch.nn.functional as F
 
 try:
@@ -86,7 +86,7 @@ def compact_fwd(
     gather = config.override_with_patch_gather_fwd if config else False
     
     if gather:
-        from raylight.distributed_modules.compact.patchpara.fwd import patch_gather_fwd
+        from raylight.distributed_modules.attention.backends.fusion.patchpara.fwd import patch_gather_fwd
         return patch_gather_fwd(
             q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_attn_probs,
             deterministic, attn_layer, group, joint_tensor_key, joint_tensor_value, joint_strategy, mod_idx, current_iter,
@@ -112,7 +112,7 @@ def compact_update_awl_scale(q, k, v):
         q: Query tensor (bs, seq_len, head_cnt, head_size)
         k: Key tensor (bs, seq_len, head_cnt, head_size)
     """
-    from raylight.distributed_modules.compact.slowpath import set_current_lowrank_scale
+    from raylight.distributed_modules.attention.backends.fusion.slowpath import set_current_lowrank_scale
     if not AWL:
         return
     with torch.no_grad(): # No need to track gradients for importance calculation

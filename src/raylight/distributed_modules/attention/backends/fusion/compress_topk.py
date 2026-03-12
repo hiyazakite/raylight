@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 import torch
-from raylight.distributed_modules.compact.prof import Profiler
+from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
 
 # NOTE: This topk implementation is obsolete and not used in the current codebase.
 

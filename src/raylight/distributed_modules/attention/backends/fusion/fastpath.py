@@ -1,13 +1,13 @@
 import triton
 import triton.language as tl
 import torch
-from raylight.distributed_modules.compact.prof import Profiler
-from raylight.distributed_modules.compact.compress_quantize import (
+from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
+from raylight.distributed_modules.attention.backends.fusion.compress_quantize import (
     dequantize_1bit, quantize_1bit,
     quantize_int2, dequantize_int2 # Add imports for INT2 slowpath
 )
 # Import subspace iter for rank-1 scale approximation
-from raylight.distributed_modules.compact.compress_lowrank import subspace_iter
+from raylight.distributed_modules.attention.backends.fusion.compress_lowrank import subspace_iter
 
 def _ensure_standard_tensor(x):
     if x is None:
