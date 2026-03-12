@@ -131,6 +131,13 @@ def compact_reset():
     try:
         from raylight.distributed_modules.attention.layer import reset_attn_layer_idx
         reset_attn_layer_idx()
+        
+        # ALSO: Clear GGUF dequantization cache to prevent VRAM accumulation
+        try:
+            from raylight.expansion.comfyui_gguf.ops import GGMLLayer
+            GGMLLayer.clear_dequant_cache()
+        except (ImportError, AttributeError):
+            pass
     except (ImportError, AttributeError):
         pass
 

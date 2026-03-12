@@ -177,6 +177,11 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 
             from raylight.utils.common import cleanup_memory
             cleanup_memory()
+            
+            # CLEAR GGUF LAYER CACHE
+            for layer in self.model.modules():
+                if hasattr(layer, "dequant_cache"):
+                    layer.dequant_cache = {}
 
         # Move patches themselves back to offload device if they were on GPU
         for key, patch_list in self.patches.items():
@@ -273,6 +278,7 @@ class RayGGUFLoader:
                     "RAY_ACTORS_INIT",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
+                "cache_patched_weights": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -288,13 +294,15 @@ class RayGGUFLoader:
         unet_name,
         dequant_dtype,
         patch_dtype,
+        cache_patched_weights=False,
     ):
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
         parallel_dict: Any = parallel_dict
         
         model_options = {
             "dequant_dtype": dequant_dtype,
-            "patch_dtype": patch_dtype
+            "patch_dtype": patch_dtype,
+            "cache_patched_weights": cache_patched_weights
         }
         
         unet_path = folder_paths.get_full_path_or_raise("unet", unet_name)
@@ -378,6 +386,10 @@ class RayGGUFLoader:
                 patched_futures.append(actor.patch_usp.remote())
 
         ray.get(patched_futures)
+
+        # FINAL MEMORY TRIM: Sweep each actor to reclaim memory from initialization
+        for actor in gpu_actors:
+             actor.cleanup_memory.remote()
 
         return (ray_actors,)
 

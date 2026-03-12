@@ -19,6 +19,8 @@ except ImportError:
 
 from raylight.distributed_modules.attention.backends.xfuser_ring_patch import xdit_ring_flash_attn_func_patched
 
+_WRAPPED_CACHE = {}
+
 def select_ring_attn_fn(
     use_compact_ring: bool,
     has_mask: bool,
@@ -34,12 +36,23 @@ def select_ring_attn_fn(
     
     # Standard xfuser path
     if has_mask:
-        if _VERBOSE_ATTN:
-            print(f"[Raylight] ⚡ Mask present — using patched xfuser ring for mask support (Layer: {layer_idx})")
-        return xdit_ring_flash_attn_func_patched
+        # Use patched version if available (supports masks)
+        target_fn = xdit_ring_flash_attn_func_patched or xdit_ring_flash_attn_func
+        if target_fn is not None:
+            if _VERBOSE_ATTN:
+                print(f"[Raylight] ⚡ Mask present — using patched xfuser ring for mask support (Layer: {layer_idx})")
+            # Wrap to swallow extra kwargs like mod_idx
+            if target_fn not in _WRAPPED_CACHE:
+                _fn = target_fn
+                _WRAPPED_CACHE[target_fn] = lambda *args, **kwargs: _fn(*args, **{k: v for k, v in kwargs.items() if k not in ["mod_idx"]})
+            return _WRAPPED_CACHE[target_fn]
     
     if xdit_ring_flash_attn_func is not None:
-        return xdit_ring_flash_attn_func
+        # Wrap the original function to swallow extra kwargs like mod_idx
+        if xdit_ring_flash_attn_func not in _WRAPPED_CACHE:
+            _fn = xdit_ring_flash_attn_func
+            _WRAPPED_CACHE[xdit_ring_flash_attn_func] = lambda *args, **kwargs: _fn(*args, **{k: v for k, v in kwargs.items() if k not in ["mod_idx"]})
+        return _WRAPPED_CACHE[xdit_ring_flash_attn_func]
     
     # Fallback to compact ring if xfuser ring is missing
     logger.warning("[Raylight] Standard xfuser ring not found, falling back to compact ring")
@@ -87,14 +100,24 @@ def prepare_ring_attn_kwargs(
         "joint_strategy": joint_strategy,
     }
     
+    # Determine mod_idx: prioritize kwargs (from model architecture) over global layer_idx
+    mod_idx = kwargs.get("mod_idx")
+    if mod_idx is None:
+        mod_idx = layer_idx
+    
     if is_compact:
-        attn_kwargs["mod_idx"] = layer_idx
+        attn_kwargs["mod_idx"] = mod_idx
         attn_kwargs["current_iter"] = kwargs.get("current_iter", compact_get_step())
         attn_kwargs["key_suffix"] = kwargs.get("key_suffix", "")
         attn_kwargs["mask"] = mask
     else:
         # standard xfuser ring or patched ring
+        attn_kwargs["mod_idx"] = mod_idx # Pass it anyway for consistency/future-proofing
         if mask is not None:
             attn_kwargs["mask"] = mask
+
+    # Verification Logging (Temporary)
+    if kwargs.get("current_iter", 0) == 0 and mod_idx is not None and mod_idx < 3:
+        print(f"[Dispatcher DEBUG] Layer {layer_idx} | mod_idx {mod_idx} | ring_fn {ring_fn.__name__ if hasattr(ring_fn, '__name__') else 'unknown'}")
 
     return attn_kwargs

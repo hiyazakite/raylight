@@ -306,9 +306,17 @@ class GGUFContext(ModelContext):
         if "metadata" in valid_params:
             kwargs["metadata"] = gguf_meta
         
+        model_options = state.model_options.copy()
+        model_options["custom_operations"] = ops
+        
+        # Apply cache_patched_weights if present in model_options
+        if model_options.get("cache_patched_weights"):
+             setattr(ops.Linear, "cache_patched_weights", True)
+             print(f"[GGUFContext] Enabling cache_patched_weights for {state.unet_path}")
+
         model = comfy.sd.load_diffusion_model_state_dict(
             isolated, 
-            model_options={"custom_operations": ops},
+            model_options=model_options,
             **kwargs
         )
         
@@ -337,6 +345,10 @@ class GGUFContext(ModelContext):
                 setattr(ops.Linear, "patch_dtype", getattr(torch, patch_dtype, None))
         
         print(f"[GGUFContext DEBUG] Ops Config Result | Linear.dequant_dtype: {getattr(ops.Linear, 'dequant_dtype', 'None')} | Linear.patch_dtype: {getattr(ops.Linear, 'patch_dtype', 'None')}")
+        
+        # Restore cache_patched_weights during hot-reload
+        if dequant_dtype == "cache_patched_weights" or (isinstance(dequant_dtype, dict) and dequant_dtype.get("cache_patched_weights")):
+             setattr(ops.Linear, "cache_patched_weights", True)
 
 
     def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):

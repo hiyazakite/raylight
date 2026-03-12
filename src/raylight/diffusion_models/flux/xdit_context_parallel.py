@@ -59,7 +59,7 @@ def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
-def attention(q, k, v, pe, mask=None) -> Tensor:
+def attention(q, k, v, pe, mask=None, **kwargs) -> Tensor:
     if pe is not None:
         q, k = apply_rope(q, k, pe)
 
@@ -69,7 +69,8 @@ def attention(q, k, v, pe, mask=None) -> Tensor:
         k,
         v,
         heads,
-        skip_reshape=True
+        skip_reshape=True,
+        **kwargs
     )
     return x
 
@@ -149,6 +150,7 @@ def usp_dit_forward(
     transformer_options["total_blocks"] = len(self.double_blocks)
     transformer_options["block_type"] = "double"
     for i, block in enumerate(self.double_blocks):
+        transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
                 out = {}
@@ -203,6 +205,8 @@ def usp_dit_forward(
     transformer_options["total_blocks"] = len(self.single_blocks)
     transformer_options["block_type"] = "single"
     for i, block in enumerate(self.single_blocks):
+        # Add offset for single blocks if needed, usually Flux follows doubles then singles
+        transformer_options["block_index"] = i + len(self.double_blocks)
         if ("single_block", i) in blocks_replace:
             def block_wrap(args):
                 out = {}
@@ -260,7 +264,11 @@ def usp_single_stream_forward(
     q, k = self.norm(q, k, v)
 
     # compute attention
-    attn = attention(q, k, v, pe=pe, mask=attn_mask)
+    mod_idx = kwargs.get("modifier", {}).get("block_index")
+    if mod_idx is None:
+        mod_idx = kwargs.get("transformer_options", {}).get("block_index")
+        
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, mod_idx=mod_idx)
     del q, k, v
 
     # compute activation in mlp stream, cat again and run second linear layer
@@ -320,7 +328,11 @@ def usp_double_stream_forward(
         v = torch.cat((img_v, txt_v), dim=1)
         del img_v, txt_v
         # run actual attention
-        attn = attention(q, k, v, pe=None, mask=attn_mask)
+        mod_idx = kwargs.get("modifier", {}).get("block_index")
+        if mod_idx is None:
+            mod_idx = kwargs.get("transformer_options", {}).get("block_index")
+            
+        attn = attention(q, k, v, pe=None, mask=attn_mask, mod_idx=mod_idx)
         del q, k, v
 
         img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1]:]
@@ -333,7 +345,11 @@ def usp_double_stream_forward(
         v = torch.cat((txt_v, img_v), dim=1)
         del txt_v, img_v
         # run actual attention
-        attn = attention(q, k, v, pe=None, mask=attn_mask)
+        mod_idx = kwargs.get("modifier", {}).get("block_index")
+        if mod_idx is None:
+            mod_idx = kwargs.get("transformer_options", {}).get("block_index")
+            
+        attn = attention(q, k, v, pe=None, mask=attn_mask, mod_idx=mod_idx)
         del q, k, v
 
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]

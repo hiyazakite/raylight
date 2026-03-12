@@ -285,6 +285,9 @@ class RayWorker:
         mem_now = torch.cuda.memory_allocated(self.device) / 1e9
         print(f"[RayWorker {self.local_rank}] Post-Offload VRAM: {mem_now:.2f}GB")
 
+    def cleanup_memory(self):
+        cleanup_memory()
+
 
     def patch_cfg(self):
         if self.model is not None:

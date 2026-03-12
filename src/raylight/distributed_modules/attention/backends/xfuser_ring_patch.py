@@ -194,6 +194,7 @@ def xdit_ring_flash_attn_forward_patched(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     mask: Optional[torch.Tensor] = None,
+    **kwargs: Any,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Patched xfuser ring attention forward that supports masks.
