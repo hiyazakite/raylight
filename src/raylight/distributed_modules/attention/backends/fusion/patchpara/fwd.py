@@ -1,12 +1,12 @@
-from raylight.distributed_modules.compact.context import compact_config
-from raylight.distributed_modules.compact.prof import Profiler
+from raylight.distributed_modules.attention.backends.fusion.context import compact_config
+from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
 import torch
 import torch.distributed as dist
-from raylight.distributed_modules.compact.utils import COMPACT_COMPRESS_TYPE
+from raylight.distributed_modules.attention.backends.fusion.utils import COMPACT_COMPRESS_TYPE
 
 # Import necessary components for DistriFusion
-from raylight.distributed_modules.compact.patchpara.df_cache import AllGatherCache, DummyHandle
-from raylight.distributed_modules.compact.patchpara.df_utils import PatchConfig
+from raylight.distributed_modules.attention.backends.fusion.patchpara.df_cache import AllGatherCache, DummyHandle
+from raylight.distributed_modules.attention.backends.fusion.patchpara.df_utils import PatchConfig
 
 try:
     import flash_attn
@@ -15,7 +15,7 @@ except ImportError:
     flash_attn = None
     _flash_attn_forward = None
 
-from raylight.distributed_modules.compact.ring import compact_attn_forward
+from raylight.distributed_modules.attention.backends.fusion.ring import compact_attn_forward
 _buffers = {}
 
 def clear_buffers():
@@ -85,7 +85,7 @@ def patch_gather_fwd(
     
     cache = None
     if config.async_comm:
-        from raylight.distributed_modules.compact.main import allgather_cache
+        from raylight.distributed_modules.attention.backends.fusion.main import allgather_cache
         cache = allgather_cache()
 
     q = q.contiguous()
@@ -97,7 +97,7 @@ def patch_gather_fwd(
 
     # --- Communication Step (Sync or Async) ---
     if config.use_compact:
-        from raylight.distributed_modules.compact.ops import compact_all_gather
+        from raylight.distributed_modules.attention.backends.fusion.ops import compact_all_gather
         comp_type_k = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
         comp_type_v = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
         k_list_for_computation = compact_all_gather(

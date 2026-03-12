@@ -1,8 +1,9 @@
 from typing import Callable
+import torch
 from yunchang.kernels import AttnType
-from raylight.distributed_modules.compact.attn_layer import xFuserLongContextAttention
-from .interface import AttentionBackend
-from ..sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
+from ..layer import RaylightAttention
+from ..interface import AttentionBackend
+from ...sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 
 class StandardAttentionBackend(AttentionBackend):
     """
@@ -19,8 +20,13 @@ class StandardAttentionBackend(AttentionBackend):
         elif attn_type == "SAGE_FP8_SM90":
             ensure_hf_sm90_kernel()
 
-        # Initialize the underlying xFuser attention class
-        xfuser_attn = xFuserLongContextAttention(use_sync=sync_ulysses, attn_type=attn_enum, use_pack_qkv=False, use_compact_ring=False)
+        # Initialize the underlying Raylight attention class
+        xfuser_attn = RaylightAttention(
+            use_sync=sync_ulysses, 
+            attn_type=attn_enum, 
+            use_pack_qkv=False, 
+            use_compact_ring=False  # Standard uses xfuser ring or patched flash
+        )
 
         def _attention_xfuser_unmask(
                 q,
@@ -43,8 +49,6 @@ class StandardAttentionBackend(AttentionBackend):
             else:
                 b, _, dim_head = q.shape
                 dim_head //= heads
-                # OPT 3: Reshape directly to (B, S, H, D) — xfuser_attn expects this layout.
-                # Previously did view→transpose(1,2)→(B,H,S,D) then transpose(1,2) back.
                 q, k, v = map(
                     lambda t: t.view(b, -1, heads, dim_head),
                     (q, k, v),
@@ -69,22 +73,22 @@ class StandardAttentionBackend(AttentionBackend):
                 assert join_k is not None and join_v is not None
                 out = xfuser_attn(
                     None,
-                    q if not skip_reshape else q.transpose(1, 2),
-                    k if not skip_reshape else k.transpose(1, 2),
-                    v if not skip_reshape else v.transpose(1, 2),
+                    q,
+                    k,
+                    v,
                     joint_strategy="rear",
-                    joint_tensor_query=join_q if not skip_reshape else join_q.transpose(1, 2),
-                    joint_tensor_key=join_k if not skip_reshape else join_k.transpose(1, 2),
-                    joint_tensor_value=join_v if not skip_reshape else join_v.transpose(1, 2),
+                    joint_tensor_query=join_q,
+                    joint_tensor_key=join_k,
+                    joint_tensor_value=join_v,
                     mask=mask,
                     **kwargs
                 )
             else:
                 out = xfuser_attn(
                     None,
-                    q if not skip_reshape else q.transpose(1, 2),
-                    k if not skip_reshape else k.transpose(1, 2),
-                    v if not skip_reshape else v.transpose(1, 2),
+                    q,
+                    k,
+                    v,
                     mask=mask,
                     **kwargs
                 )

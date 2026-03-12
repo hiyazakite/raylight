@@ -1,12 +1,12 @@
 import torch
 import torch.distributed as dist
-from raylight.distributed_modules.compact.compress_topk import (
+from raylight.distributed_modules.attention.backends.fusion.compress_topk import (
     topk_compress,
     topk_decompress,
     sim_topk,
     SPARSE_LAST_DIM_SIZE,
 )
-from raylight.distributed_modules.compact.compress_quantize import (
+from raylight.distributed_modules.attention.backends.fusion.compress_quantize import (
     quantize_1bit,
     dequantize_1bit,
     sim_binary,
@@ -16,10 +16,10 @@ from raylight.distributed_modules.compact.compress_quantize import (
     dequantize_int4,
     sim_int2_minmax,
 )
-from raylight.distributed_modules.compact.compress_lowrank import (
+from raylight.distributed_modules.attention.backends.fusion.compress_lowrank import (
     subspace_iter,
 )
-from raylight.distributed_modules.compact.utils import (
+from raylight.distributed_modules.attention.backends.fusion.utils import (
     COMPACT_COMPRESS_TYPE,
 )
 
@@ -233,9 +233,9 @@ def sim_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, sparse_r
         return torch.matmul(u, v)
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_AWL:
         assert rank is not None
-        from raylight.distributed_modules.compact.utils import ALLOW_DEPRECATED
+        from raylight.distributed_modules.attention.backends.fusion.utils import ALLOW_DEPRECATED
         assert ALLOW_DEPRECATED, "LOW_RANK_AWL is deprecated"
-        from raylight.distributed_modules.compact.main import compact_get_current_cache_key
+        from raylight.distributed_modules.attention.backends.fusion.main import compact_get_current_cache_key
         N, C = x.shape
         cache_key = compact_get_current_cache_key()
         is_k = cache_key.split("-")[-1] == 'k'

@@ -1,8 +1,8 @@
 import torch
 import torch.distributed as dist
-from raylight.distributed_modules.compact.prof import Profiler
+from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
 from enum import Enum
-from raylight.distributed_modules.compact.patchpara.df_utils import PatchConfig
+from raylight.distributed_modules.attention.backends.fusion.patchpara.df_utils import PatchConfig
 import os
 
 ALLOW_DEPRECATED = os.environ.get("COMPACT_ALLOW_DEPRECATED", "0") == "1"
@@ -129,8 +129,8 @@ class CompactConfig:
             return compress_type.name
         return str(compress_type)
 
-from raylight.distributed_modules.compact.compress_quantize import quantize_int8, dequantize_int8, quantize_int4, dequantize_int4
-from raylight.distributed_modules.compact.compress_lowrank import subspace_iter
+from raylight.distributed_modules.attention.backends.fusion.compress_quantize import quantize_int8, dequantize_int8, quantize_int4, dequantize_int4
+from raylight.distributed_modules.attention.backends.fusion.compress_lowrank import subspace_iter
 
 
 class CompactCache:
@@ -152,7 +152,7 @@ class CompactCache:
             elif self.quant_bits == 4:
                 base = quantize_int4(base)
         self.base[key] = base
-        # from raylight.distributed_modules.compact.main import compact_get_step
+        # from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
         # from raylight.distributed_modules.collector.collector import collect
         # if "k" in key:
         #     collect(base, "kbase", compact_get_step(), int(key.split("-")[0]))

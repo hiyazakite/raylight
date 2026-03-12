@@ -1,12 +1,12 @@
 from typing import Callable
 from yunchang.kernels import AttnType
-from .interface import AttentionBackend
-from ..sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
+from ..interface import AttentionBackend
+from ..layer import RaylightAttention
+from ...sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 
 # Vendored Compact Modules
-from raylight.distributed_modules.compact.main import compact_init, CompactConfig, compact_hello
-from raylight.distributed_modules.compact.utils import COMPACT_COMPRESS_TYPE
-from raylight.distributed_modules.compact.attn_layer import xFuserLongContextAttention as CompactxFuserLongContextAttention
+from raylight.distributed_modules.attention.backends.fusion.main import compact_init, CompactConfig, compact_hello
+from raylight.distributed_modules.attention.backends.fusion.utils import COMPACT_COMPRESS_TYPE
 
 class CompactAttentionBackend(AttentionBackend):
     """
@@ -78,10 +78,14 @@ class CompactAttentionBackend(AttentionBackend):
         elif attn_type == "SAGE_FP8_SM90":
             ensure_hf_sm90_kernel()
 
-        # 3. Instantiate Vendored Attention Class
-        # This class (from attn_layer.py) automatically hooks into compact_fwd if config.enabled is True
-        # Note: CompactxFuserLongContextAttention does not accept use_sync, we ignore sync_ulysses for now or map it if supported
-        xfuser_attn = CompactxFuserLongContextAttention(attn_type=attn_enum, use_pack_qkv=False)
+        # 3. Instantiate Centralized Attention Class
+        # This class automatically hooks into the dispatcher
+        xfuser_attn = RaylightAttention(
+            use_sync=sync_ulysses,
+            attn_type=attn_enum, 
+            use_pack_qkv=False,
+            use_compact_ring=True # Compact backend uses compact ring by default
+        )
 
         # 4. Wrapper Function (same signature as Standard)
         def _attention_xfuser_compact_unmask(
@@ -120,22 +124,22 @@ class CompactAttentionBackend(AttentionBackend):
                 assert join_k is not None and join_v is not None
                 out = xfuser_attn(
                     None,
-                    q if not skip_reshape else q.transpose(1, 2),
-                    k if not skip_reshape else k.transpose(1, 2),
-                    v if not skip_reshape else v.transpose(1, 2),
+                    q,
+                    k,
+                    v,
                     joint_strategy="rear",
-                    joint_tensor_query=join_q if not skip_reshape else join_q.transpose(1, 2),
-                    joint_tensor_key=join_k if not skip_reshape else join_k.transpose(1, 2),
-                    joint_tensor_value=join_v if not skip_reshape else join_v.transpose(1, 2),
+                    joint_tensor_query=join_q,
+                    joint_tensor_key=join_k,
+                    joint_tensor_value=join_v,
                     mask=mask,
                     **kwargs,
                 )
             else:
                 out = xfuser_attn(
                     None,
-                    q if not skip_reshape else q.transpose(1, 2),
-                    k if not skip_reshape else k.transpose(1, 2),
-                    v if not skip_reshape else v.transpose(1, 2),
+                    q,
+                    k,
+                    v,
                     mask=mask,
                     **kwargs,
                 )

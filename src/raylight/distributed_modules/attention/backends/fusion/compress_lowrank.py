@@ -1,5 +1,5 @@
 import torch
-from raylight.distributed_modules.compact.prof import Profiler
+from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
 import torch.nn.functional as F # For normalization
 
 def _ensure_standard_tensor(x):

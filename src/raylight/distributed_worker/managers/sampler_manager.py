@@ -12,6 +12,7 @@ from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 import time
 import os
 from raylight.utils.profiler import CProfileContext
+import ctypes
 
 if TYPE_CHECKING:
     from raylight.distributed_worker.worker_config import WorkerConfig
@@ -99,17 +100,21 @@ class SamplerManager:
                 gc.collect()
 
                 try:
-                    from raylight.distributed_modules.compact.main import compact_config, compact_reset
-                    cfg = compact_config()
-                    if cfg is not None and cfg.enabled:
-                        # Compact attention backend: reset the delta KV cache and step counter.
-                        compact_reset()
+                    from raylight.distributed_modules.attention.backends.fusion.main import compact_reset
+                    # Reset all global states (layer indices, cache, instrumentation)
+                    compact_reset()
                 except Exception:
                     pass
                 finally:
                     # CRITICAL: Always defragment GPU allocator to prevent cross-run
                     # slowdown from fragmented ring attention / compact buffers.
                     torch.cuda.empty_cache()
+
+                # Stabilize CPU heap to prevent progressive slowdown from fragmentation
+                try:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
 
 
                 if config.is_fsdp:
@@ -152,16 +157,13 @@ class SamplerManager:
                  print(f"[RayWorker {config.local_rank}] Mmap Cache Len: {len(model.mmap_cache) if model.mmap_cache else 0}")
              
              with torch.no_grad():
-                 # Correctly initialize CompactFusion step counter
+                 # Correctly initialize CompactFusion step counter and clear indices
                  try:
-                     from raylight.distributed_modules.compact.main import compact_set_step, compact_config, compact_reset
-                     compact_cfg = compact_config()
-                     if compact_cfg is not None and compact_cfg.enabled:
-                         compact_reset() # Ensure cache is clean for new generation
-                         compact_set_step(0) # custom_sampler usually implies 0 start unless specified usually, but sigmas handle it. 
-                         # Actually Comfy's sample_custom doesn't pass step to callback straightforwardly in all versions, 
-                         # but let's assume standard behavior.
-                 except (ImportError, NameError, AttributeError):
+                     from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step, compact_reset
+                     # Essential: Always reset state before sampling to clear indices/state from previous runs
+                     compact_reset()
+                     compact_set_step(0) 
+                 except Exception:
                      pass
 
 
@@ -179,7 +181,7 @@ class SamplerManager:
                     # Step timing available via duration variable if needed
                     
                     try:
-                        from raylight.distributed_modules.compact.main import compact_set_step, compact_config
+                        from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step, compact_config
                         compact_cfg = compact_config()
                         if compact_cfg is not None and compact_cfg.enabled:
                             compact_set_step(step)
@@ -265,14 +267,13 @@ class SamplerManager:
 
             # 4. Sampling
             with torch.no_grad():
-                # Correctly initialize CompactFusion step counter
+                # Correctly initialize CompactFusion step counter and clear indices
                 try:
-                    from raylight.distributed_modules.compact.main import compact_set_step, compact_config, compact_reset
-                    compact_cfg = compact_config()
-                    if compact_cfg is not None and compact_cfg.enabled:
-                        compact_reset()  # Ensure cache is clean for new generation
-                        compact_set_step(start_step if start_step is not None else 0)
-                except (ImportError, NameError, AttributeError):
+                    from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step, compact_reset
+                    # Essential: Always reset state before sampling to clear indices/state from previous runs
+                    compact_reset()
+                    compact_set_step(start_step if start_step is not None else 0)
+                except Exception:
                     pass
                 
                 # Stats + Compact Callback
@@ -287,7 +288,7 @@ class SamplerManager:
                     pass
 
                     try:
-                        from raylight.distributed_modules.compact.main import compact_set_step, compact_config
+                        from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step, compact_config
                         compact_cfg = compact_config()
                         if compact_cfg is not None and compact_cfg.enabled:
                             compact_set_step(step)

@@ -1,20 +1,13 @@
-import torch
 import torch.distributed as dist
-from raylight.distributed_modules.compact.utils import (
+from raylight.distributed_modules.attention.backends.fusion.utils import (
     CompactConfig,
     CompactCache,
-    COMPACT_COMPRESS_TYPE,
 )
-from raylight.distributed_modules.compact.prof import Profiler
-# from xfuser.modules.base_module import BaseModule
-from raylight.distributed_modules.compact.stats import stats_log, stats_hello
-from raylight.distributed_modules.compact.slowpath import slowpath_compress, slowpath_decompress, sim_compress
-from raylight.distributed_modules.compact.patchpara.df_cache import AllGatherCache
-from raylight.distributed_modules.compact.utils import ALLOW_DEPRECATED
-from raylight.distributed_modules.compact.fastpath import binary_quant_fastpath, binary_dequant_fastpath, int2_quant_fastpath, int2_dequant_fastpath
-import raylight.distributed_modules.compact.patchpara.fwd as fwd_module
+from raylight.distributed_modules.attention.backends.fusion.stats import stats_hello
+from raylight.distributed_modules.attention.backends.fusion.patchpara.df_cache import AllGatherCache
+import raylight.distributed_modules.attention.backends.fusion.patchpara.fwd as fwd_module
 
-import raylight.distributed_modules.compact.context as context
+import raylight.distributed_modules.attention.backends.fusion.context as context
 
 """
 COMPACT: Activation Compression with Delta Transmission and Error Feedback
@@ -75,6 +68,13 @@ def compact_config():
     return context.compact_config()
 
 def compact_set_step(step):
+    # Reset the global attention layer index counter at the start of each step.
+    # This prevents the cache from growing indefinitely across sampling steps (OOM).
+    try:
+        from raylight.distributed_modules.attention.layer import reset_attn_layer_idx
+        reset_attn_layer_idx()
+    except (ImportError, AttributeError):
+        pass
     context.compact_set_step(step)
 
 def compact_get_step():
@@ -87,6 +87,15 @@ def allgather_cache():
     return context.allgather_cache()
 
 def compact_reset():
+    # Reset the global attention layer index counter in the centralized layer module.
+    # If this is not reset between generation steps, the cache keys keep incrementing
+    # infinitely causing massive cache leaks (OOM).
+    try:
+        from raylight.distributed_modules.attention.layer import reset_attn_layer_idx
+        reset_attn_layer_idx()
+    except (ImportError, AttributeError):
+        pass
+
     if context._config is None:
         return
 
@@ -98,10 +107,10 @@ def compact_reset():
     )
     del old_cache
 
-    from raylight.distributed_modules.compact.stats import stats_clear
+    from raylight.distributed_modules.attention.backends.fusion.stats import stats_clear
     stats_clear()
     try:
-        from raylight.distributed_modules.compact.prof import Profiler
+        from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
         Profiler.instance().reset()
     except:
         pass
@@ -118,22 +127,11 @@ def compact_reset():
 
     context._current_cache_key = None
     
-    # CRITICAL: Reset the global attention layer index counter.
-    # ComfyUI dynamically instantiates/re-instantiates layers. If this is not
-    # reset between generation steps, the cache keys keep incrementing
-    # infinitely (e.g. 0-35, 36-71, 72-107) causing massive cache leaks and slowdowns.
+    # Reset global attention layer index counter in the centralized layer module
     try:
-        import raylight.distributed_modules.compact.attn_layer as attn_layer_module
-        if hasattr(attn_layer_module, "ATTN_LAYER_IDX"):
-            attn_layer_module.ATTN_LAYER_IDX = 0
-        # Reset idx on any surviving xFuserLongContextAttention instances so
-        # they re-register on next forward() with fresh indices.
-        if hasattr(attn_layer_module, "xFuserLongContextAttention"):
-            import gc
-            for obj in gc.get_referrers(attn_layer_module.xFuserLongContextAttention):
-                if isinstance(obj, attn_layer_module.xFuserLongContextAttention):
-                    obj.idx = None
-    except ImportError:
+        from raylight.distributed_modules.attention.layer import reset_attn_layer_idx
+        reset_attn_layer_idx()
+    except (ImportError, AttributeError):
         pass
 
 def compact_get_current_cache_key():
@@ -142,7 +140,7 @@ def compact_get_current_cache_key():
     """
     return context._current_cache_key
 
-from raylight.distributed_modules.compact.ops import (
+from raylight.distributed_modules.attention.backends.fusion.ops import (
     compact_compress,
     compact_decompress,
     compact_all_gather,

@@ -305,7 +305,7 @@ def usp_cross_attn_forward(
         if isinstance(cond_or_uncond, list) and len(cond_or_uncond) > 0:
             key_suffix = f"-c{cond_or_uncond[0]}"
     
-    from raylight.distributed_modules.compact.main import compact_get_step
+    from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
     
     out = xfuser_optimized_attention(
         q, k, v, self.heads, 

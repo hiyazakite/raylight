@@ -164,12 +164,7 @@ def usp_joint_attention_forward(
 
     # print(f"[RayLight DEBUG] xq shape: {xq.shape}, n_local_heads: {n_exec_heads}, world_size: {world_size}")
 
-    output = xfuser_optimized_attention(xq.movedim(1, 2),
-                                        xk.movedim(1, 2),
-                                        xv.movedim(1, 2),
-                                        n_exec_heads,
-                                        x_mask,
-                                        skip_reshape=True)
+    output = xfuser_optimized_attention(xq, xk, xv, n_exec_heads, x_mask, skip_reshape=True)
                                         
     # If we padded, we must crop the output
     if pad_heads > 0:

@@ -1,14 +1,14 @@
 import torch
 import torch.distributed as dist
-import raylight.distributed_modules.compact.context as context
-from raylight.distributed_modules.compact.utils import (
+import raylight.distributed_modules.attention.backends.fusion.context as context
+from raylight.distributed_modules.attention.backends.fusion.utils import (
     COMPACT_COMPRESS_TYPE,
     ALLOW_DEPRECATED,
 )
-from raylight.distributed_modules.compact.prof import Profiler
-from raylight.distributed_modules.compact.stats import stats_log
-from raylight.distributed_modules.compact.slowpath import slowpath_compress, slowpath_decompress, sim_compress
-from raylight.distributed_modules.compact.fastpath import (
+from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
+from raylight.distributed_modules.attention.backends.fusion.stats import stats_log
+from raylight.distributed_modules.attention.backends.fusion.slowpath import slowpath_compress, slowpath_decompress, sim_compress
+from raylight.distributed_modules.attention.backends.fusion.fastpath import (
     binary_quant_fastpath, 
     binary_dequant_fastpath, 
     int2_quant_fastpath, 
@@ -302,12 +302,12 @@ def compact_decompress(
             if context._config.compress_residual == 0:
                 reconstructed = _decompress_fn(compressed, compress_type, shape, rank)
             elif context._config.compress_residual == 1:
-                base = context._cache.get_base(cache_key)
+                base = context._cache.get_base(cache_key, expected_shape=shape)
                 recv_delta = _decompress_fn(compressed, compress_type, shape, rank)
                 reconstructed = base + recv_delta if base is not None else recv_delta
                 cond_cache_put(cache_key, reconstructed, None)
             elif context._config.compress_residual == 2:
-                base = context._cache.get_base(cache_key)
+                base = context._cache.get_base(cache_key, expected_shape=shape)
                 delta_base = context._cache.get_delta_base(cache_key)
                 recv_delta_delta = _decompress_fn(compressed, compress_type, shape, rank)
                 reconstructed = (base if base is not None else 0) + (delta_base if delta_base is not None else 0) + recv_delta_delta

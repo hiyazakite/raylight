@@ -56,8 +56,8 @@ def usp_token_refiner_forward(self, x, c, mask, transformer_options={}):
 
     norm_x = self.norm1(x)
     qkv = self.self_attn.qkv(norm_x)
-    q, k, v = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, self.heads, -1).permute(2, 0, 3, 1, 4)
-    attn = xfuser_optimized_attention(q, k, v, self.heads, skip_reshape=True)
+    q, k, v = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, self.heads, -1).permute(2, 0, 1, 3, 4)
+    attn = xfuser_optimized_attention(q, k, v, q.shape[2], skip_reshape=True)
 
     x = x + self.self_attn.proj(attn) * mod1.unsqueeze(1)
     x = x + self.mlp(self.norm2(x)) * mod2.unsqueeze(1)
@@ -173,8 +173,12 @@ def usp_dit_forward(
     pe_combine = self.pe_embedder(ids)
     pe_image = self.pe_embedder(img_ids)
 
-    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
-    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=2)[get_sequence_parallel_rank()]
+    pe_combine = pe_combine.transpose(1, 2)
+    pe_image = pe_image.transpose(1, 2)
+    pe_combine = torch.chunk(pe_combine, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    pe_image = torch.chunk(pe_image, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    pe_combine = pe_combine.contiguous()
+    pe_image = pe_image.contiguous()
 
     img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]

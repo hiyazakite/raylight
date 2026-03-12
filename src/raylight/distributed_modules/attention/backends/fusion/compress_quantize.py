@@ -1,8 +1,8 @@
 import triton
 import triton.language as tl
 import torch
-from raylight.distributed_modules.compact.prof import Profiler
-from raylight.distributed_modules.compact.compress_lowrank import subspace_iter
+from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
+from raylight.distributed_modules.attention.backends.fusion.compress_lowrank import subspace_iter
 
 def _ensure_standard_tensor(x):
     if x is None:
@@ -327,7 +327,7 @@ def sim_binary(input_tensor: torch.Tensor, rank: int|None = None) -> torch.Tenso
         tok_scale = tok_scale / tok_scale.mean()
         scale = chan_scale * tok_scale
     else: # rank >= 1
-        from raylight.distributed_modules.compact.compress_lowrank import svd, subspace_iter
+        from raylight.distributed_modules.attention.backends.fusion.compress_lowrank import svd, subspace_iter
         RANK=rank
         # subspace_iter input (N, C), output u_nk(N, K), v_kc(K, C)
         u_nk, v_kc, _ = subspace_iter(torch.abs(input_tensor), RANK, 2)
