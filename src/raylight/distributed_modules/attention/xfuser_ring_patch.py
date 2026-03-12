@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-import math
 import logging
 
 logger = logging.getLogger(__name__)
@@ -39,6 +38,51 @@ except ImportError:
     memory_efficient_attention_forward = None
     LowerTriangularMask = None
 
+
+# ────────────────────────────────────────────────────────────────────────────
+# Shared utility: chunked LSE computation for SDPA fallback
+# ────────────────────────────────────────────────────────────────────────────
+
+def compute_chunked_lse(q_t, k_t, softmax_scale, mask=None, causal=False):
+    """Compute log-sum-exp in chunks to avoid O(N^2) memory spikes.
+
+    Args:
+        q_t: Query tensor in (B, H, Q, D) layout.
+        k_t: Key tensor in (B, H, K, D) layout.
+        softmax_scale: Attention scaling factor.
+        mask: Optional attention mask broadcastable to (B, H, Q, K).
+        causal: Whether to apply causal masking.
+
+    Returns:
+        LSE tensor of shape (B, H, Q).
+    """
+    bs, heads, q_len, _ = q_t.shape
+    k_len = k_t.shape[2]
+    CHUNK_SIZE = max(1, 1024 * 32 // k_len) if k_len > 0 else 1024
+    lse = torch.empty(bs, heads, q_len, device=q_t.device, dtype=torch.float32)
+
+    with torch.no_grad():
+        kt_v = k_t.transpose(-2, -1)
+        for i in range(0, q_len, CHUNK_SIZE):
+            end = min(i + CHUNK_SIZE, q_len)
+            q_chunk = q_t[:, :, i:end, :]
+            attn_chunk = torch.matmul(q_chunk, kt_v) * softmax_scale
+
+            if mask is not None:
+                m_chunk = mask[:, :, i:end, :] if mask.shape[2] > 1 else mask
+                attn_chunk.add_(m_chunk)
+
+            if causal:
+                row_indices = torch.arange(i, end, device=q_t.device).view(1, 1, -1, 1)
+                col_indices = torch.arange(k_len, device=q_t.device).view(1, 1, 1, -1)
+                attn_chunk.masked_fill_(row_indices < col_indices, float("-inf"))
+
+            lse[:, :, i:end] = torch.logsumexp(attn_chunk.float(), dim=-1)
+            del attn_chunk
+
+    return lse
+
+
 def manual_block_attention(
     q, k, v, 
     dropout_p=0.0, 
@@ -56,74 +100,42 @@ def manual_block_attention(
     # 1. Try FlexAttention (Fastest, avoids materializing large masks)
     if _HAS_FLEX_ATTN and mask is not None:
         def score_mod(score, b, h, q_idx, kv_idx):
-            # Use h % mask.shape[1] to handle broadcasting across heads safely in Triton
             return score + mask[b, h % mask.shape[1], q_idx, kv_idx]
 
         if flex_attention is None or AuxRequest is None:
             raise ImportError("FlexAttention components not available despite _HAS_FLEX_ATTN being True")
 
-        logger.info("[Raylight] manual_block_attention: Using FlexAttention")
-
         # We need to ensure they match (B, H, S, D).
         if q.dim() == 3:
-            # (B, L, H*D) -> (B, L, H, D) -> (B, H, L, D)
             b, l, dim = q.shape
-            
-            # Identify heads from k shape or context if possible, 
-            # normally we'd pass heads, but we can try to guess from mask
-            # mask is (B, H, Q_L, K_L)
             h = mask.shape[1]
             d = dim // h
-            
             q_flex = q.view(b, l, h, d).transpose(1, 2)
             k_flex = k.view(b, k.shape[1], h, d).transpose(1, 2)
             v_flex = v.view(b, v.shape[1], h, d).transpose(1, 2)
         elif q.dim() == 4:
-            if q.shape[2] == q.shape[1] or q.shape[2] > q.shape[1]: 
-                # Already (B, H, S, D) or something similar. 
-                # Check for (bs, seq, heads, dim). If seq > heads, it's (B, S, H, D)
-                if q.shape[1] > getattr(q, 'shape')[2]: # usually S > H
-                    q_flex = q.transpose(1, 2)
-                    k_flex = k.transpose(1, 2)
-                    v_flex = v.transpose(1, 2)
-                else: # already B, H, S, D
-                    q_flex = q
-                    k_flex = k
-                    v_flex = v
-            else: # (B, S, H, D)
+            if q.shape[1] > q.shape[2]:  # (B, S, H, D)
                 q_flex = q.transpose(1, 2)
                 k_flex = k.transpose(1, 2)
                 v_flex = v.transpose(1, 2)
+            else:  # already B, H, S, D
+                q_flex = q
+                k_flex = k
+                v_flex = v
         else:
-            raise ValueError(f"Expected 3D or 4D query, got {q.dim()}D")        
-        # Call flex_attention directly (avoiding torch.compile OOMs on some hardware limits)
-        flex_fn = flex_attention
-        if flex_fn is None:
-            raise ImportError("FlexAttention not available")
-        
-        # Use AuxRequest to get LSE natively from the kernel
-        res = flex_fn(q_flex, k_flex, v_flex, score_mod=score_mod, return_aux=AuxRequest(lse=True))
-        
+            raise ValueError(f"Expected 3D or 4D query, got {q.dim()}D")
+
+        res = flex_attention(q_flex, k_flex, v_flex, score_mod=score_mod, return_aux=AuxRequest(lse=True))
         out, aux = res
         lse = getattr(aux, "lse", None)
-        
-        # Transpose back to (B, S, H, D)
         out = out.transpose(1, 2).contiguous()
         return out, lse
 
     # 2. Try xformers
     if xformers is not None and memory_efficient_attention_forward is not None:
         attn_bias = mask
-        if causal:
-            if attn_bias is None:
-                if LowerTriangularMask is not None:
-                    attn_bias = LowerTriangularMask()
-                else:
-                    pass
-            else:
-                pass
-
-        logger.info("[Raylight] Using xformers for masked block attention.")
+        if causal and attn_bias is None and LowerTriangularMask is not None:
+            attn_bias = LowerTriangularMask()
 
         if attn_bias is not None and (LowerTriangularMask is None or not isinstance(attn_bias, LowerTriangularMask)):
             if hasattr(attn_bias, "shape") and getattr(attn_bias, "shape")[1] == 1 and q.shape[2] > 1:
@@ -142,9 +154,7 @@ def manual_block_attention(
         return out, lse
 
     # 3. SDPA Fallback
-    logger.info("[Raylight] Falling back to manual PyTorch attention for block (xformers not available). Using SDPA.")
-    
-    q_t = q.transpose(1, 2) # (B, H, L, D)
+    q_t = q.transpose(1, 2)  # (B, H, L, D)
     k_t = k.transpose(1, 2)
     v_t = v.transpose(1, 2)
     
@@ -156,33 +166,9 @@ def manual_block_attention(
         scale=softmax_scale
     )
     
-    # Calculate LSE in chunks to avoid O(N^2) memory spikes
-    bs, heads, q_len, dim = q_t.shape
-    k_len = k_t.shape[2]
-    CHUNK_SIZE = max(1, 1024 * 32 // k_len) if k_len > 0 else 1024
-    lse = torch.empty(bs, heads, q_len, device=q.device, dtype=torch.float32)
-    
-    with torch.no_grad():
-        kt_v = k_t.transpose(-2, -1)
-        for i in range(0, q_len, CHUNK_SIZE):
-            end = min(i + CHUNK_SIZE, q_len)
-            q_chunk = q_t[:, :, i:end, :]
-            attn_chunk = torch.matmul(q_chunk, kt_v) * softmax_scale
-            
-            if mask is not None:
-                # Slice mask if it's not a singleton broadcast
-                m_chunk = mask[:, :, i:end, :] if mask.shape[2] > 1 else mask
-                attn_chunk.add_(m_chunk)
-            
-            if causal:
-                row_indices = torch.arange(i, end, device=q.device).view(1, 1, -1, 1)
-                col_indices = torch.arange(k_len, device=q.device).view(1, 1, 1, -1)
-                attn_chunk.masked_fill_(row_indices < col_indices, float("-inf"))
-            
-            lse[:, :, i:end] = torch.logsumexp(attn_chunk.float(), dim=-1)
-            del attn_chunk
-            
+    lse = compute_chunked_lse(q_t, k_t, softmax_scale, mask=mask, causal=causal)
     return out.transpose(1, 2).contiguous(), lse
+
 
 def xdit_ring_flash_attn_forward_patched(
     process_group,
@@ -204,15 +190,12 @@ def xdit_ring_flash_attn_forward_patched(
     q_descale=None,
     k_descale=None,
     v_descale=None,
-    # Added mask support
     mask=None,
 ):
     """
     Patched xfuser ring attention forward that supports masks.
     """
-    is_joint = False
-    if (joint_tensor_key is not None and joint_tensor_value is not None):
-        is_joint = True
+    is_joint = (joint_tensor_key is not None and joint_tensor_value is not None)
     
     if RingComm is None:
         raise ImportError("yunchang is required for xfuser ring attention")
@@ -233,20 +216,26 @@ def xdit_ring_flash_attn_forward_patched(
         k = k.contiguous()
         v = v.contiguous()
 
-    # Pre-check for trivial mask
-    is_trivial_mask = False
+    # OPT 1: Avoid GPU-CPU sync — check mask triviality without .all()
+    # Use numel-based fast check: singleton zero or small tensor sampled check
+    has_nontrivial_mask = False
     if mask is not None:
-        is_trivial_mask = (mask == 0).all()
-        if is_trivial_mask:
-            logger.info("[Raylight] xdit_ring_flash_attn_forward: Mask is trivial (all zeros), using fast path")
+        if mask.numel() <= 1:
+            has_nontrivial_mask = not (mask.item() == 0)
+        else:
+            # Sample a few elements instead of full synchronous .all()
+            flat = mask.reshape(-1)
+            sample_indices = [0, flat.numel() // 2, flat.numel() - 1]
+            sampled = flat[sample_indices]
+            has_nontrivial_mask = not (sampled.eq(0).all().item())
 
-    next_k = None  # type: ignore
-    next_v = None  # type: ignore
+    next_k = None
+    next_v = None
 
     for step in range(world_size):
         if step + 1 != world_size:
-            next_k: torch.Tensor = comm.send_recv(k)
-            next_v: torch.Tensor = comm.send_recv(v)
+            next_k = comm.send_recv(k)
+            next_v = comm.send_recv(v)
             comm.commit()
 
         # Handle joint
@@ -260,13 +249,13 @@ def xdit_ring_flash_attn_forward_patched(
                 block_k = torch.cat([joint_tensor_key, k], dim=1)
                 block_v = torch.cat([joint_tensor_value, v], dim=1)
 
-        # Slice mask
+        # Slice mask for current ring step
         mask_slice = None
-        if mask is not None and not is_trivial_mask:
+        if has_nontrivial_mask:
             q_len, k_len_block = q.shape[1], block_k.shape[1]
             q_start = rank * q_len
             recv_rank = (rank - step) % world_size
-            k_start = recv_rank * k.shape[1] # original block length
+            k_start = recv_rank * k.shape[1]
             
             q_idx = slice(q_start, q_start + q_len) if mask.shape[2] > 1 else slice(None)
             k_idx = slice(k_start, k_start + k_len_block) if mask.shape[3] > 1 else slice(None)
@@ -274,8 +263,6 @@ def xdit_ring_flash_attn_forward_patched(
 
         if not causal or step <= rank:
             if mask_slice is not None:
-                logger.info(f"[Raylight] xdit_ring_flash_attn_forward (rank {rank}, step {step}): Using manual_block_attention (Masked/Fallback)")
-                # Manual fallback for masked block
                 block_out, block_lse = manual_block_attention(
                     q, block_k, block_v,
                     dropout_p=dropout_p,
@@ -284,32 +271,25 @@ def xdit_ring_flash_attn_forward_patched(
                     mask=mask_slice
                 )
             else:
-                if step == 0:
-                    logger.info(f"[Raylight] xdit_ring_flash_attn_forward (rank {rank}, step {step}): Using FlashAttention")
                 if AttnType is None or select_flash_attn_impl is None:
                     raise ImportError("yunchang is required for xfuser ring attention without masks")
-                # FlashAttn
                 _attn_type = getattr(AttnType, "FA") if attn_type is None else attn_type
-                fn = select_flash_attn_impl(_attn_type, stage="fwd-only", attn_processor=attn_processor)  # type: ignore
-                block_out, block_lse = fn(  # type: ignore
+                fn = select_flash_attn_impl(_attn_type, stage="fwd-only", attn_processor=attn_processor)
+                block_out, block_lse = fn(
                     q, block_k, block_v,
-                    dropout_p=dropout_p,  # type: ignore
-                    softmax_scale=softmax_scale,  # type: ignore
-                    causal=causal and step == 0,  # type: ignore
-                    window_size=window_size,  # type: ignore
-                    softcap=0.0,  # type: ignore
-                    alibi_slopes=alibi_slopes,  # type: ignore
-                    return_softmax=True and dropout_p > 0,  # type: ignore
+                    dropout_p=dropout_p,
+                    softmax_scale=softmax_scale,
+                    causal=causal and step == 0,
+                    window_size=window_size,
+                    softcap=0.0,
+                    alibi_slopes=alibi_slopes,
+                    return_softmax=True and dropout_p > 0,
                 )
 
             if update_out_and_lse is None:
                 raise ImportError("yunchang is required for xfuser ring attention updates")
-                
-            # Type guard for block_lse being None from xformers/flex_attention fallback paths
             if block_lse is None:
-                # If a fallback doesn't provide LSE, we can't reliably do ring attention update
                 raise RuntimeError("LSE is None from block attention, but required for ring attention update.")
-            
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         if step + 1 != world_size:
@@ -322,63 +302,15 @@ def xdit_ring_flash_attn_forward_patched(
     if lse is None:
         lse = torch.zeros(q.shape[0], q.shape[2], q.shape[1], device=q.device, dtype=torch.float32)
     else:
+        # OPT 6: Single LSE post-processing (was duplicated before)
         lse = lse.squeeze(dim=-1).transpose(1, 2)
         
     out = out.to(q.dtype)
-    lse = lse.squeeze(dim=-1).transpose(1, 2)
     return out, lse
 
-class xFuserRingFlashAttnFuncPatched(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_softmax,
-        group,
-        attn_type,
-        attn_processor,
-        attn_layer,
-        joint_tensor_key,
-        joint_tensor_value,
-        joint_strategy,
-        mask=None,
-    ):
-        if softmax_scale is None:
-            softmax_scale = 1.0 / math.sqrt(q.size(-1))
 
-        out, softmax_lse = xdit_ring_flash_attn_forward_patched(
-            group,
-            q,
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
-            causal=causal,
-            window_size=window_size,
-            alibi_slopes=alibi_slopes,
-            deterministic=False,
-            attn_type=attn_type,
-            attn_processor=attn_processor,
-            attn_layer=attn_layer,
-            joint_tensor_key=joint_tensor_key,
-            joint_tensor_value=joint_tensor_value,
-            joint_strategy=joint_strategy,
-            mask=mask,
-        )
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
-        return out if not return_softmax else (out, softmax_lse, None)
-
-    @staticmethod
-    def backward(ctx, *args):
-        raise NotImplementedError("Backward not implemented for patched ring attention.")
+# OPT 5: Removed autograd.Function wrapper — backward was not implemented,
+# and save_for_backward was leaking Q/K/V/out/LSE memory under torch.no_grad().
 
 def xdit_ring_flash_attn_func_patched(
     q,
@@ -401,23 +333,26 @@ def xdit_ring_flash_attn_func_patched(
     mask=None,
     **kwargs,
 ):
-    return xFuserRingFlashAttnFuncPatched.apply(
+    if softmax_scale is None:
+        softmax_scale = q.size(-1) ** -0.5
+
+    out, softmax_lse = xdit_ring_flash_attn_forward_patched(
+        group,
         q,
         k,
         v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_attn_probs,
-        group,
-        attn_type,
-        attn_processor,
-        attn_layer,
-        joint_tensor_key,
-        joint_tensor_value,
-        joint_strategy,
-        mask,
+        softmax_scale=softmax_scale,
+        dropout_p=dropout_p,
+        causal=causal,
+        window_size=window_size,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        attn_type=attn_type,
+        attn_processor=attn_processor,
+        attn_layer=attn_layer,
+        joint_tensor_key=joint_tensor_key,
+        joint_tensor_value=joint_tensor_value,
+        joint_strategy=joint_strategy,
+        mask=mask,
     )
+    return out if not return_attn_probs else (out, softmax_lse, None)

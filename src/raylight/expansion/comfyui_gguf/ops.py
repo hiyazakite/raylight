@@ -208,14 +208,11 @@ class GGMLLayer(torch.nn.Module):
         if tensor is None:
             return
 
-        # STRIP SUBCLASS IMMEDIATELY! 
-        # Accessing .device, .shape, .dtype on GGMLTensor triggers __torch_function__ overhead
-        # which adds up to tens of seconds across thousands of calls.
+        # Strip subclass to bypass __torch_function__ overhead on metadata access
         is_ggml = isinstance(tensor, GGMLTensor)
         native_tensor = tensor.as_subclass(torch.Tensor) if is_ggml else tensor
         
         # We must capture the logical shape defined by the GGUF metadata before stripping!
-        # The raw native_tensor might just be a 1D flat int8 buffer.
         target_shape = tensor.shape if is_ggml else native_tensor.shape
         
         # consolidate and load patches to GPU in async
@@ -257,7 +254,7 @@ class GGMLLayer(torch.nn.Module):
                 weight = ray_calculate_weight(
                     patch_list, weight, key, patch_dtype
                 )
-        return weight
+        return weight.to(device)
 
     @torch_compiler_disable()
     def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None):

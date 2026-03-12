@@ -4,13 +4,8 @@ NOTE: code from yunchang
 
 import torch
 import os
-import logging
 
-logger = logging.getLogger(__name__)
 from yunchang.ring.utils import RingComm, update_out_and_lse
-
-
-
 
 from raylight.distributed_modules.compact.utils import COMPACT_COMPRESS_TYPE
 from raylight.distributed_modules.compact.context import compact_config, compact_cache
@@ -44,6 +39,16 @@ except ImportError:
     LowerTriangularMask = None
 
 _VERBOSE_ATTN = os.getenv("RAYLIGHT_VERBOSE_ATTN", "0") == "1"
+
+# OPT 7: Cache RingComm instances per process group
+_ring_comm_cache = {}
+
+def _get_ring_comm(process_group):
+    """Reuse RingComm for the same process group to avoid repeated allocation."""
+    group_key = id(process_group)
+    if group_key not in _ring_comm_cache:
+        _ring_comm_cache[group_key] = RingComm(process_group)
+    return _ring_comm_cache[group_key]
 
 def compact_fwd(
     q: torch.Tensor,
@@ -153,85 +158,35 @@ def compact_attn_forward(
 
     # FlexAttention is the fastest and most flexible for complex masks
     if _HAS_FLEX_ATTN and mask is not None:
-        if _VERBOSE_ATTN:
-            print("[Raylight] Using FlexAttention for masked attention.")
-        
-        # FlexAttention expects a score_mod or mask_mod.
-        # If mask is [B, 1, Q, K], we can pass it as a bias via score_mod.
         def score_mod(score, b, h, q_idx, kv_idx):
-            # Use h % mask.shape[1] to handle broadcasting across heads safely in Triton
             return score + mask[b, h % mask.shape[1], q_idx, kv_idx]
 
-        # Use torch.compile for the fused kernel. 
-        # Note: We don't want to compile every time, so we wrap it.
-        # For Ring Attention, we also need LSE.
-        # If flex_attention doesn't return LSE directly, we can get it by 
-        # using SDPA for LSE only, which is still faster than materializing 
-        # the full scores for 'out'.
-        
         if flex_attention is None or AuxRequest is None:
             raise ImportError("FlexAttention components not available despite _HAS_FLEX_ATTN being True")
 
-        logger.info("[Raylight] compact_attn_forward: Using FlexAttention")
-
-        # In Ring Attention, q is (bs, seq_len/N, head_cnt, head_size) or (B, H, L, D_h).
-        # We need to ensure they match (B, H, S, D).
         if q.dim() == 4:
-            if q.shape[2] == q.shape[1] or q.shape[2] > q.shape[1]: 
-                # Already (B, H, S, D) or something similar. 
-                # Check for (bs, seq, heads, dim). If seq > heads, it's (B, S, H, D)
-                if q.shape[1] > getattr(q, 'shape')[2]: # usually S > H
-                    q_flex = q.transpose(1, 2)
-                    k_flex = k.transpose(1, 2)
-                    v_flex = v.transpose(1, 2)
-                else: # already B, H, S, D
-                    q_flex = q
-                    k_flex = k
-                    v_flex = v
-            else: # (B, S, H, D)
+            if q.shape[1] > q.shape[2]:  # (B, S, H, D)
                 q_flex = q.transpose(1, 2)
                 k_flex = k.transpose(1, 2)
                 v_flex = v.transpose(1, 2)
+            else:  # already B, H, S, D
+                q_flex = q
+                k_flex = k
+                v_flex = v
         else:
             raise ValueError(f"Expected 4D query, got {q.dim()}D")
         
-        # Call flex_attention directly (avoiding torch.compile OOMs on some hardware limits)
-        flex_fn = flex_attention
-        if flex_fn is None:
-            raise ImportError("FlexAttention not available")
-        
-        # Use AuxRequest to get LSE natively from the kernel
-        res = flex_fn(q_flex, k_flex, v_flex, score_mod=score_mod, return_aux=AuxRequest(lse=True))
-        
-        # flex_attention returns (out, aux_outputs) when return_aux is specified
+        res = flex_attention(q_flex, k_flex, v_flex, score_mod=score_mod, return_aux=AuxRequest(lse=True))
         out, aux = res
         lse = getattr(aux, "lse", None)
-        
-        # flex_attention 'out' is (B, H, S, D). Transpose back to (B, S, H, D) for Ring Attention.
         out = out.transpose(1, 2).contiguous()
-        # lse is (B, H, S). Ring attention code usually wants it in a specific layout
-        # for update_out_and_lse. We'll keep it as (B, H, S) here as it's the most common internal format.
         return out, lse
 
     # xformers is very fast for masked attention and returns LSE
     if xformers is not None and memory_efficient_attention_forward is not None:
-        # q, k, v are (bs, seq_len, head_cnt, head_size)
-        # xformers expects (B, L, H, D)
-        
-        # Handle causal mask if needed
         attn_bias = mask
-        if causal:
-            if attn_bias is None:
-                if LowerTriangularMask is not None:
-                    attn_bias = LowerTriangularMask()
-                else:
-                    # Fallback if LowerTriangularMask is missing but xformers is active
-                    pass
-            else:
-                # Merge causal into existing mask if needed
-                pass
-
-        print("[Raylight] Using xformers for masked attention.")
+        if causal and attn_bias is None and LowerTriangularMask is not None:
+            attn_bias = LowerTriangularMask()
 
         if attn_bias is not None and (LowerTriangularMask is None or not isinstance(attn_bias, LowerTriangularMask)):
             if hasattr(attn_bias, "shape") and getattr(attn_bias, "shape")[1] == 1 and q.shape[2] > 1:
@@ -246,15 +201,15 @@ def compact_attn_forward(
         if isinstance(res, tuple):
             out, lse = res[0], res[1]
         else:
-            out, lse = res, None # LSE might not be returned by some xformers versions/ops
+            out, lse = res, None
         return out, lse
 
-    logger.info("[Raylight] Falling back to manual PyTorch attention (xformers not available). Using SDPA.")
+    # OPT 4: SDPA Fallback — use shared chunked LSE utility
+    from raylight.distributed_modules.attention.xfuser_ring_patch import compute_chunked_lse
 
-    # Optimized fallback using SDPA (Memory efficient for 'out')
-    q_t = q.transpose(1, 2) # (bs, heads, q_len, dim)
-    k_t = k.transpose(1, 2) # (bs, heads, k_len, dim)
-    v_t = v.transpose(1, 2) # (bs, heads, k_len, dim)
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
     
     out = F.scaled_dot_product_attention(
         q_t, k_t, v_t,
@@ -264,42 +219,7 @@ def compact_attn_forward(
         scale=softmax_scale
     )
     
-    # SDPA doesn't return LSE directly. For ring attention online softmax, LSE is MANDATORY.
-    # To avoid O(N^2) memory bottlenecks during high-res upscaling, we chunk the LSE calculation.
-    bs, heads, q_len, dim = q_t.shape
-    k_len = k_t.shape[2]
-    
-    # Use a chunk size that fits comfortably in VRAM
-    # If k_len is huge, we need smaller Q-chunks.
-    CHUNK_SIZE = max(1, 1024 * 32 // k_len) if k_len > 0 else 1024
-    lse = torch.empty(bs, heads, q_len, device=q.device, dtype=torch.float32)
-    
-    with torch.no_grad():
-        kt_v = k_t.transpose(-2, -1)
-        for i in range(0, q_len, CHUNK_SIZE):
-            end = min(i + CHUNK_SIZE, q_len)
-            q_chunk = q_t[:, :, i:end, :]
-            
-            # Compute raw attention scores for this chunk: (bs, heads, chunk_len, k_len)
-            attn_chunk = torch.matmul(q_chunk, kt_v) * softmax_scale
-            
-            if mask is not None:
-                if mask.shape[2] > 1:
-                    m_chunk = mask[:, :, i:end, :]
-                else:
-                    m_chunk = mask
-                attn_chunk.add_(m_chunk)
-            
-            if causal:
-                # Optimized causal mask for the local block
-                row_indices = torch.arange(i, end, device=q.device).view(1, 1, -1, 1)
-                col_indices = torch.arange(k_len, device=q.device).view(1, 1, 1, -1)
-                attn_chunk.masked_fill_(row_indices < col_indices, float("-inf"))
-            
-            # logsumexp over the K-dimension (dim=-1)
-            lse[:, :, i:end] = torch.logsumexp(attn_chunk.float(), dim=-1)
-            del attn_chunk
-            
+    lse = compute_chunked_lse(q_t, k_t, softmax_scale, mask=mask, causal=causal)
     out = out.transpose(1, 2).contiguous()
     return out, lse
 
@@ -361,8 +281,8 @@ def _compact_ring_fwd(
         # v = v.contiguous()
         pass
     process_group = group if group is not None else torch.distributed.group.WORLD
-    from typing import cast
-    comm = RingComm(cast(torch.distributed.ProcessGroup, process_group))
+    # OPT 7: Reuse RingComm instance for same process group
+    comm = _get_ring_comm(process_group)
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
@@ -370,17 +290,16 @@ def _compact_ring_fwd(
     out = None
     lse = None
 
-    # PERFORMANCE: Detect trivial mask once for the entire global mask.
-    # If the global mask is all zeros, we can use the FlashAttention fast-path for all blocks.
-    global_trivial_mask = False
+    # OPT 1: Avoid GPU-CPU sync — use sampled check instead of full .all()
+    has_nontrivial_mask = False
     if mask is not None:
-        # Singleton zero or empty mask is trivial
-        if mask.numel() == 1:
-            global_trivial_mask = (mask == 0).all()
-        # Avoid full scan for huge masks if possible, or do it once.
-        # For LTX 2.3, masks are usually manageable in size.
-        elif (mask == 0).all():
-            global_trivial_mask = True
+        if mask.numel() <= 1:
+            has_nontrivial_mask = (mask.item() != 0)
+        else:
+            flat = mask.reshape(-1)
+            sample_indices = [0, flat.numel() // 2, flat.numel() - 1]
+            sampled = flat[sample_indices]
+            has_nontrivial_mask = not (sampled.eq(0).all().item())
 
     config = compact_config()
     if config:
@@ -461,45 +380,18 @@ def _compact_ring_fwd(
         # (bs, seq_len, head_cnt, head_size)
         if not causal or step <= comm.rank:
             # Calculate mask slice for the current K block
-            # mask handling
             mask_slice = None
-            if mask is not None:
-                # mask: [B, 1, 1, seq_len] or [B, 1, seq_len, seq_len]
-                # Handle broadcastable masks (singleton dimensions)
+            if has_nontrivial_mask:
                 q_len = q.shape[1]
-                k_len_block = k.shape[1] # Length of the current K block
-                
-                # Calculate global start/end for the current Q and K blocks
+                k_len_block = k.shape[1]
                 recv_rank = (comm.rank - step) % comm.world_size
                 q_start = comm.rank * q_len
                 k_start = recv_rank * k_len_block
-                
-                # Slicing:
-                # If mask is [B, 1, 1, S_global], we slice dim 3.
-                # If mask is [B, 1, S_global, S_global], we slice dim 2 (Q) and dim 3 (K).
-                # Note: Q is ALWAYS local in our Ring implementation (only K rotates).
                 q_idx = slice(q_start, q_start + q_len) if (len(mask.shape) > 2 and mask.shape[2] > 1) else slice(None)
                 k_idx = slice(k_start, k_start + k_len_block) if (len(mask.shape) > 3 and mask.shape[3] > 1) else slice(None)
-                
                 mask_slice = mask[:, :, q_idx, k_idx]
 
-            # PERFORMANCE: Trivial Mask Fast-Path
-            # Using pre-calculated global_trivial_mask to avoid synchronous inner-loop .all() calls.
-            is_trivial_mask = global_trivial_mask
-            if not is_trivial_mask and mask_slice is not None:
-                # Double check for singleton mask if it was not globally trivial
-                if mask_slice.numel() == 1:
-                    is_trivial_mask = (mask_slice == 0).all()
-
-            if (mask is not None and not is_trivial_mask) or flash_attn is None:
-                if step == 0 and not is_trivial_mask:
-                    if _VERBOSE_ATTN:
-                        logger.info(f"[Raylight] Side-stepping FlashAttn: mask={mask is not None}, is_trivial={is_trivial_mask}, flash_attn={flash_attn is not None}")
-                
-                logger.info(f"[Raylight] _compact_ring_fwd (step {step}): Using compact_attn_forward (Masked/Fallback)")
-                
-                # Use custom manual attention if mask is present and non-trivial or FlashAttn unavailable
-                # This ensures we respect the mask (Critical for padding/mangled output issues)
+            if mask_slice is not None or flash_attn is None:
                 block_out, block_lse = compact_attn_forward(
                     q,
                     key_to_use,
@@ -510,8 +402,6 @@ def _compact_ring_fwd(
                     mask=mask_slice
                 )
             else:
-                if step == 0:
-                    logger.info(f"[Raylight] _compact_ring_fwd (step {step}): Using FlashAttention")
                 assert _flash_attn_forward is not None
                 v_str = getattr(flash_attn, "__version__", "0.0.0")
                 

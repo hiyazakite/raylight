@@ -686,6 +686,16 @@ def stats_log():
 
 def stats_clear():
     global _stats
+    if _stats is not None:
+        # Explicitly release GPU tensor references to prevent memory leaks
+        # when the StatsLogger survives longer than expected in the GC cycle.
+        _stats.prev_activations.clear()
+        _stats.prev_deltas.clear()
+        _stats.prev_transmitted_deltas.clear()
+        _stats.prev_delta_before_feedback.clear()
+        _stats.prev_delta_before_feedback_lowrank.clear()
+        _stats.eigenvalues.clear()
+        _stats.stats.clear()
     _stats = None
 
 def stats_verbose(step_range=None, key=None, summary_keys=True):
