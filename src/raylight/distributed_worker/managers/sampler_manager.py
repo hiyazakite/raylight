@@ -12,7 +12,7 @@ from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 import time
 import os
 from raylight.utils.profiler import CProfileContext
-import ctypes
+
 
 if TYPE_CHECKING:
     from raylight.distributed_worker.worker_config import WorkerConfig
@@ -110,8 +110,16 @@ class SamplerManager:
                     # slowdown from fragmented ring attention / compact buffers.
                     torch.cuda.empty_cache()
 
+                # ALSO: Clear GGUF dequantization cache to prevent VRAM accumulation
+                try:
+                    from raylight.expansion.comfyui_gguf.ops import GGMLLayer
+                    GGMLLayer.clear_dequant_cache()
+                except Exception:
+                    pass
+
                 # Stabilize CPU heap to prevent progressive slowdown from fragmentation
                 try:
+                    import ctypes
                     ctypes.CDLL("libc.so.6").malloc_trim(0)
                 except Exception:
                     pass
@@ -181,10 +189,9 @@ class SamplerManager:
                     # Step timing available via duration variable if needed
                     
                     try:
-                        from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step, compact_config
-                        compact_cfg = compact_config()
-                        if compact_cfg is not None and compact_cfg.enabled:
-                            compact_set_step(step)
+                        from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step
+                        # Always set step to reset the global ATTN_LAYER_IDX counter
+                        compact_set_step(step)
                     except (ImportError, NameError, AttributeError):
                         pass
                         
@@ -194,7 +201,7 @@ class SamplerManager:
                             self.temporal_cache_tracker.total_steps = total_steps  # type: ignore
                         self.temporal_cache_tracker.update(step)  # type: ignore
 
-                 profile_enabled = os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "1") == "1"
+                 profile_enabled = os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "0") == "1"
                  with CProfileContext(enabled=profile_enabled, sort_by='cumulative', top_k=5, name="custom_ksampler (Comfy)"):
                      samples = comfy.sample.sample_custom(
                              work_model,
@@ -288,10 +295,9 @@ class SamplerManager:
                     pass
 
                     try:
-                        from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step, compact_config
-                        compact_cfg = compact_config()
-                        if compact_cfg is not None and compact_cfg.enabled:
-                            compact_set_step(step)
+                        from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step
+                        # Always set step to reset the global ATTN_LAYER_IDX counter
+                        compact_set_step(step)
                     except (ImportError, NameError, AttributeError):
                         pass
 
@@ -300,7 +306,7 @@ class SamplerManager:
                             self.temporal_cache_tracker.total_steps = total_steps  # type: ignore
                         self.temporal_cache_tracker.update(step)  # type: ignore
                 
-                profile_enabled = os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "1") == "1"
+                profile_enabled = os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "0") == "1"
                 with CProfileContext(enabled=profile_enabled, sort_by='cumulative', top_k=5, name="common_ksampler (Comfy)"):
                     if sigmas is None:
                         samples = comfy.sample.sample(

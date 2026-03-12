@@ -7,6 +7,7 @@ import comfy.ops
 import comfy.lora
 import comfy.model_management
 from .dequant import dequantize_tensor, is_quantized
+import time
 
 from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
 
@@ -120,11 +121,23 @@ class GGMLLayer(torch.nn.Module):
     dequant_dtype = None
     patch_dtype = None
     largest_layer = False
+    dequant_cache = {}
+    cache_patched_weights = False # Strictly optional, disabled by default
     torch_compatible_tensor_types = {
         None,
         gguf.GGMLQuantizationType.F32,
         gguf.GGMLQuantizationType.F16,
     }
+
+    @staticmethod
+    def clear_dequant_cache():
+        # Clear the global/class-level cache
+        GGMLLayer.dequant_cache = {}
+        # Also force a collection to prevent deferred deletion issues
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def is_ggml_quantized(self, *, weight=None, bias=None):
         if weight is None:
@@ -167,6 +180,10 @@ class GGMLLayer(torch.nn.Module):
                 self.bias = torch.nn.Parameter(v, requires_grad=False)
             else:
                 unexpected_keys.append(k)
+        
+        # Clear the local dequantization cache on load to avoid stale weights
+        if hasattr(self, "dequant_cache") and self.dequant_cache is not GGMLLayer.dequant_cache:
+             self.dequant_cache = {}
 
         # For Linear layer with missing weight
         if self.weight is None and isinstance(self, torch.nn.Linear):
@@ -215,7 +232,24 @@ class GGMLLayer(torch.nn.Module):
         
         # We must capture the logical shape defined by the GGUF metadata before stripping!
         target_shape = tensor.shape if is_ggml else native_tensor.shape
+
+        # dequantization cache key (based on tensor data pointer and target dtype)
+        ptr = native_tensor.data_ptr()
+        cache_key = (ptr, dtype, target_shape)
+        if self.cache_patched_weights and cache_key in self.dequant_cache:
+            return self.dequant_cache[cache_key]
         
+        # Periodic cache health check
+        if self.cache_patched_weights:
+            if not hasattr(GGMLLayer, "_last_stats_log"):
+                GGMLLayer._last_stats_log = 0
+            curr_time = time.time()
+            if curr_time - GGMLLayer._last_stats_log > 10: # Log every 10 seconds
+               GGMLLayer._last_stats_log = curr_time
+               print(f"[GGUF DEBUG] Dequant Cache Size: {len(self.dequant_cache)}")
+               if len(self.dequant_cache) > 200:
+                   print(f"[GGUF WARNING] Cache size suspiciously large! ptr={ptr}")
+
         # consolidate and load patches to GPU in async
         patch_list = []
         device = native_tensor.device
@@ -255,6 +289,15 @@ class GGMLLayer(torch.nn.Module):
                 weight = ray_calculate_weight(
                     patch_list, weight, key, patch_dtype
                 )
+            
+            # Cache the patched weight if enabled
+            if self.cache_patched_weights:
+                self.dequant_cache[cache_key] = weight
+
+        # CRITICAL FIX: Cache the weight even if there were no patches!
+        elif self.cache_patched_weights:
+            self.dequant_cache[cache_key] = weight
+
         return weight.to(device)
 
     @torch_compiler_disable()
