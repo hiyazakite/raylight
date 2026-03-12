@@ -89,10 +89,15 @@ def allgather_cache():
 def compact_reset():
     if context._config is None:
         return
+
+    # Explicitly drop old cache references before creating new ones to aid GC
+    old_cache = context._cache
     context._cache = CompactCache(
         quantize=context._config.quantized_cache, 
         quant_bits=(context._config.cache_quant_bits if context._config.cache_quant_bits is not None else 8),
     )
+    del old_cache
+
     from raylight.distributed_modules.compact.stats import stats_clear
     stats_clear()
     try:
@@ -101,9 +106,16 @@ def compact_reset():
     except:
         pass
     context._step = None
+
+    # Always clear AllGatherCache and patchpara buffers, even if override flag
+    # is currently off. Stale buffers from a prior config would otherwise persist.
+    if context._allgather_cache is not None:
+        context._allgather_cache.clear()
+        context._allgather_cache = None
     if context._config.override_with_patch_gather_fwd:
         context._allgather_cache = AllGatherCache()
-        fwd_module.clear_buffers()
+    fwd_module.clear_buffers()
+
     context._current_cache_key = None
     
     # CRITICAL: Reset the global attention layer index counter.
@@ -114,9 +126,13 @@ def compact_reset():
         import raylight.distributed_modules.compact.attn_layer as attn_layer_module
         if hasattr(attn_layer_module, "ATTN_LAYER_IDX"):
             attn_layer_module.ATTN_LAYER_IDX = 0
-            for obj in getattr(attn_layer_module, "_layer_registry", []) or []:
-                 pass # We might need to reset individual layer instances if they track self.idx 
-                      # but usually they are fresh instantiations if ATTN_LAYER_IDX increases.
+        # Reset idx on any surviving xFuserLongContextAttention instances so
+        # they re-register on next forward() with fresh indices.
+        if hasattr(attn_layer_module, "xFuserLongContextAttention"):
+            import gc
+            for obj in gc.get_referrers(attn_layer_module.xFuserLongContextAttention):
+                if isinstance(obj, attn_layer_module.xFuserLongContextAttention):
+                    obj.idx = None
     except ImportError:
         pass
 

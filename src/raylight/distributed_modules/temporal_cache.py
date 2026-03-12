@@ -21,6 +21,7 @@ class DenoisingStepTracker:
         self.last_timestep = None
         self.cache_hit_count = 0
         self.cache_miss_count = 0
+        self._wrappers = []  # track registered cache wrappers for cleanup
 
     def update(self, timestep):
         """Update step counter based on changing timestep values."""
@@ -36,6 +37,10 @@ class DenoisingStepTracker:
         self.last_timestep = None
         self.cache_hit_count = 0
         self.cache_miss_count = 0
+        # Release GPU tensors held by all registered cache wrappers
+        for wrapper in self._wrappers:
+            if hasattr(wrapper, 'clear_cache'):
+                wrapper.clear_cache()
 
     def log_stats(self):
         """Log summary of hits and misses for the current session."""
@@ -77,6 +82,11 @@ class CachedAttentionWrapper:
         self.tracker = tracker
         self.config = config
         self.name = name
+        self.cache = None
+        self.cached_step = -1
+
+    def clear_cache(self):
+        """Release cached GPU tensor to prevent cross-run memory leaks."""
         self.cache = None
         self.cached_step = -1
         
@@ -126,6 +136,10 @@ class FluxCachedAttentionHandler:
         self.config = config
         # Individual cache per block
         self.cache = {}
+
+    def clear_cache(self):
+        """Release all cached GPU tensors to prevent cross-run memory leaks."""
+        self.cache.clear()
         
     def __call__(self, q, k, v, pe, mask=None, transformer_options={}):
         # If caching is disabled, just run the original attention and ensure cache is clear
@@ -193,7 +207,7 @@ def apply_temporal_caching(model, config: dict):
                 flux_math._temporal_cache_original_attention = flux_math.attention
                 handler = FluxCachedAttentionHandler(flux_math._temporal_cache_original_attention, tracker, config)
                 flux_math.attention = handler
-                print("[TemporalCache] Patched Flux global attention function.")
+                tracker._wrappers.append(handler)
         except ImportError:
             pass
     
@@ -213,6 +227,7 @@ def apply_temporal_caching(model, config: dict):
                 module._temporal_cache_original_forward = getattr(module, "forward")
                 wrapper = CachedAttentionWrapper(module._temporal_cache_original_forward, tracker, config, name=prefix)
                 module.forward = wrapper
+                tracker._wrappers.append(wrapper)
                 patched_count += 1
                 
         # Recurse children

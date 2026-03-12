@@ -103,15 +103,14 @@ class SamplerManager:
                     cfg = compact_config()
                     if cfg is not None and cfg.enabled:
                         # Compact attention backend: reset the delta KV cache and step counter.
-                        # compact_reset() handles its own internal memory; no empty_cache needed.
                         compact_reset()
-                    else:
-                        # Standard attention backend: defragment GPU allocator to prevent
-                        # cross-run slowdown from fragmented ring attention buffers.
-                        torch.cuda.empty_cache()
                 except Exception:
-                    # Fallback: always defragment if compact state is unavailable
+                    pass
+                finally:
+                    # CRITICAL: Always defragment GPU allocator to prevent cross-run
+                    # slowdown from fragmented ring attention / compact buffers.
                     torch.cuda.empty_cache()
+
 
                 if config.is_fsdp:
                     # Reset temporal cache tracker if present
@@ -268,9 +267,10 @@ class SamplerManager:
             with torch.no_grad():
                 # Correctly initialize CompactFusion step counter
                 try:
-                    from raylight.distributed_modules.compact.main import compact_set_step, compact_config
+                    from raylight.distributed_modules.compact.main import compact_set_step, compact_config, compact_reset
                     compact_cfg = compact_config()
                     if compact_cfg is not None and compact_cfg.enabled:
+                        compact_reset()  # Ensure cache is clean for new generation
                         compact_set_step(start_step if start_step is not None else 0)
                 except (ImportError, NameError, AttributeError):
                     pass
