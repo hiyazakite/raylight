@@ -10,9 +10,11 @@ from xfuser.core.distributed import (
 )
 from ..utils import pad_to_world_size
 import raylight.distributed_modules.attention as xfuser_attn
+from raylight.distributed_modules.sequence_parallel import extract_local_tensor
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+ring_impl_type = getattr(xfuser_attn, "get_ring_impl_type", lambda: "basic")()
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
 
 
 def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
@@ -134,8 +136,8 @@ def usp_dit_forward(
         pe_combine = None
         pe_image = None
 
-    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
-    txt = torch.chunk(txt, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    img = extract_local_tensor(img, ring_impl_type=ring_impl_type)
+    txt = extract_local_tensor(txt, ring_impl_type=ring_impl_type)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     if "post_input" in patches:
@@ -199,7 +201,7 @@ def usp_dit_forward(
 
     if self.params.global_modulation:
         vec, _ = self.single_stream_modulation(vec_orig)
-    img = torch.chunk(img, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
+    img = extract_local_tensor(img, ring_impl_type=ring_impl_type)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     transformer_options["total_blocks"] = len(self.single_blocks)

@@ -13,7 +13,7 @@ class CompactAttentionBackend(AttentionBackend):
     Attention backend enabling CompactFusion optimization for activation compression.
     """
 
-    def create_attention(self, attn_type: str, sync_ulysses: bool, **kwargs) -> Callable:
+    def create_attention(self, attn_type: str, sync_ulysses: bool, ring_impl_type: str = "basic", **kwargs) -> Callable:
         """
         Creates CompactFusion attention.
         
@@ -25,7 +25,7 @@ class CompactAttentionBackend(AttentionBackend):
             compact_quantized_cache (bool): Default False
             compact_cache_quant_bits (int): Default None (8 if quantized_cache is True)
         """
-        print(f"Using CompactFusion XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
+        print(f"Using CompactFusion XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}, Impl: {ring_impl_type}")
         
         # 1. Configuration Lifecycle
         # Default policy: Warmup for first 5 steps, then configured compression (default BINARY)
@@ -83,6 +83,7 @@ class CompactAttentionBackend(AttentionBackend):
         xfuser_attn = RaylightAttention(
             use_sync=sync_ulysses,
             attn_type=attn_enum, 
+            ring_impl_type=ring_impl_type,
             use_pack_qkv=False,
             use_compact_ring=True # Compact backend uses compact ring by default
         )

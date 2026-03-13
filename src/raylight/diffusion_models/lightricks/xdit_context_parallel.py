@@ -5,13 +5,16 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
+from raylight.distributed_modules.sequence_parallel import extract_local_tensor
 from comfy.ldm.lightricks.model import apply_rotary_emb
 from ..utils import pad_to_world_size
 from .optimizations import prepare_pe_cached, RAYLIGHT_DEBUG, logger
 
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+# LTX is non-causal, so we force "basic" ring implementation to avoid zigzag overhead
+ring_impl_type = "basic"
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
 
 
 # A better solution is just to type.MethodType the x, context, and pe construction,
@@ -52,8 +55,8 @@ def pad_and_split_pe(pe, dim, sp_world_size, sp_rank):
         sin_padded, _ = pad_to_world_size(sin, dim=dim)
 
         # Split (sequence parallel)
-        cos_chunk = torch.chunk(cos_padded, sp_world_size, dim=dim)[sp_rank]
-        sin_chunk = torch.chunk(sin_padded, sp_world_size, dim=dim)[sp_rank]
+        cos_chunk = extract_local_tensor(cos_padded, rank=sp_rank, world_size=sp_world_size, dim=dim, ring_impl_type=ring_impl_type)
+        sin_chunk = extract_local_tensor(sin_padded, rank=sp_rank, world_size=sp_world_size, dim=dim, ring_impl_type=ring_impl_type)
 
         out.append((cos_chunk, sin_chunk, flag))
 
@@ -62,11 +65,11 @@ def pad_and_split_pe(pe, dim, sp_world_size, sp_rank):
 
 def sp_chunk_group(group, sp_world_size, sp_rank, dim):
     if torch.is_tensor(group):
-        return torch.chunk(group, sp_world_size, dim=dim)[sp_rank]
+        return extract_local_tensor(group, sp_rank, sp_world_size, dim=dim, ring_impl_type=ring_impl_type)
 
     elif isinstance(group, (list, tuple)):
         return type(group)(
-            torch.chunk(g, sp_world_size, dim=dim)[sp_rank]
+            extract_local_tensor(g, sp_rank, sp_world_size, dim=dim, ring_impl_type=ring_impl_type)
             for g in group
         )
     else:

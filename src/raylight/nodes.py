@@ -157,6 +157,10 @@ class RayInitializer:
                     ["STANDARD", "COMPACT"],
                     {"default": "STANDARD"},
                 ),
+                "ring_impl_type": (
+                    ["basic", "zigzag"],
+                    {"default": "basic", "tooltip": "Ring attention implementation. 'zigzag' provides load-balancing for causal attention."}
+                ),
                 "ray_object_store_gb": ("FLOAT", {
                     "default": 0.0,
                     "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
@@ -236,6 +240,7 @@ class RayInitializer:
         kv_cache_quant_bits: int = 8,
         delta_compression: str = "BINARY",
         compact_warmup_steps: int = 1,
+        ring_impl_type: str = "basic",
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # THIS IS PYTORCH DIST ADDRESS
@@ -295,8 +300,8 @@ class RayInitializer:
                 self.parallel_dict["cfg_degree"] = cfg_degree
                 self.parallel_dict["cfg_degree"] = cfg_degree
                 self.parallel_dict["sync_ulysses"] = sync_ulysses
-                self.parallel_dict["sync_ulysses"] = sync_ulysses
                 self.parallel_dict["attention_backend"] = attention_backend
+                self.parallel_dict["ring_impl_type"] = ring_impl_type
 
             self.parallel_dict["use_kitchen"] = use_kitchen
             
@@ -470,6 +475,10 @@ class RayInitializerAdvanced(RayInitializer):
                     ["BINARY", "INT2", "INT4", "IDENTITY", "SPARSE"],
                     {"default": "BINARY",
                      "tooltip": "Compression type for delta updates (CompactFusion). BINARY (INT1) is fastest/smallest."}
+                ),
+                "ring_impl_type": (
+                    ["basic", "zigzag"],
+                    {"default": "basic", "tooltip": "Ring attention implementation. 'zigzag' provides load-balancing for causal attention."}
                 ),
             },
             "optional": {

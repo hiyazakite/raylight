@@ -9,6 +9,7 @@ AttentionRegistry.register("COMPACT", CompactAttentionBackend)
 # Global variables for backward compatibility (used by get_attn_type/get_sync_ulysses)
 _ATTN_TYPE = None
 _SYNC_ULYSSES = None
+_RING_IMPL_TYPE = "basic"
 
 
 def set_attn_type(attn):
@@ -35,7 +36,16 @@ def get_sync_ulysses():
         return _SYNC_ULYSSES
 
 
-def make_xfuser_attention(attn_type, sync_ulysses):
+def set_ring_impl_type(impl_type):
+    global _RING_IMPL_TYPE
+    _RING_IMPL_TYPE = impl_type
+
+
+def get_ring_impl_type():
+    return _RING_IMPL_TYPE
+
+
+def make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=None):
     """
     Create xFuser attention using the registered backend.
     Currently defaults to 'STANDARD' backend.
@@ -44,5 +54,8 @@ def make_xfuser_attention(attn_type, sync_ulysses):
     import os
     backend_name = os.environ.get("RAYLIGHT_ATTN_BACKEND", "STANDARD")
     
+    if ring_impl_type is None:
+        ring_impl_type = get_ring_impl_type()
+
     backend = AttentionRegistry.get(backend_name)
-    return backend.create_attention(attn_type, sync_ulysses)
+    return backend.create_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
