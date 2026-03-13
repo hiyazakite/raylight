@@ -143,6 +143,7 @@ class RayWorker:
             )
             xfuser_attn.set_attn_type(self.parallel_dict["attention"])
             xfuser_attn.set_sync_ulysses(self.parallel_dict["sync_ulysses"])
+            xfuser_attn.set_ring_impl_type(self.parallel_dict.get("ring_impl_type", "basic"))
 
             self.cp_degree = self.parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
             self.cfg_degree = self.parallel_dict["cfg_degree"]

@@ -170,7 +170,177 @@ def manual_block_attention(
     )
     
     lse = compute_chunked_lse(q_t, k_t, softmax_scale, mask=mask, causal=causal)
-    return out.transpose(1, 2).contiguous(), lse
+    out = out.transpose(1, 2).contiguous()
+    return out, lse
+
+def get_zigzag_mask_chunk(mask, q_rank, k_rank, world_size, block_seq_len, q_slice=None, k_slice=None):
+    """
+    Extract the attention mask chunk for non-contiguous zigzag blocks.
+    q_slice: 0 for first half (B_rank), 1 for second half (B_2N-rank-1), None for both.
+    k_slice: 0 for first half (B_rank), 1 for second half (B_2N-rank-1), None for both.
+    """
+    if mask is None: return None
+    
+    q_indices = []
+    if q_slice == 0 or q_slice is None:
+        q_indices.append((q_rank * block_seq_len, (q_rank + 1) * block_seq_len))
+    if q_slice == 1 or q_slice is None:
+        q_indices.append(((2 * world_size - q_rank - 1) * block_seq_len, (2 * world_size - q_rank) * block_seq_len))
+    
+    k_indices = []
+    if k_slice == 0 or k_slice is None:
+        k_indices.append((k_rank * block_seq_len, (k_rank + 1) * block_seq_len))
+    if k_slice == 1 or k_slice is None:
+        k_indices.append(((2 * world_size - k_rank - 1) * block_seq_len, (2 * world_size - k_rank) * block_seq_len))
+    
+    q_chunks = []
+    for qs, qe in q_indices:
+        k_chunks = []
+        for ks, ke in k_indices:
+            k_chunks.append(mask[:, :, qs:qe, ks:ke])
+        q_chunks.append(torch.cat(k_chunks, dim=-1))
+    
+    return torch.cat(q_chunks, dim=-2)
+
+
+def xdit_ring_zigzag_flash_attn_forward_patched(
+    process_group,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    dropout_p: float = 0.0,
+    causal: bool = True,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    attn_type: Optional[Any] = None,
+    attn_processor: Optional[nn.Module] = None,
+    attn_layer: Optional[Any] = None,
+    joint_tensor_value: Optional[torch.Tensor] = None,
+    joint_strategy: str = "none",
+    mask: Optional[torch.Tensor] = None,
+    **kwargs: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Zigzag Ring Flash Attention with Mask and Joint Tensor support.
+    Follows Yunchang's zigzag logic for load-balancing causal attention.
+    """
+    assert causal == True, "zigzag ring is only supported for causal=True"
+    
+    if RingComm is None:
+        raise ImportError("yunchang is required for xfuser ring attention")
+    comm = RingComm(process_group)
+    rank = comm.rank
+    world_size = comm.world_size
+
+    # In zigzag, query/key/value are each [rank, 2*world_size - rank - 1] blocks
+    block_seq_len = q.shape[1] // 2
+    
+    out = None
+    lse = None
+
+    if attn_layer is not None:
+        k, v = get_cache_manager().update_and_get_kv_cache(
+            new_kv=[k, v],
+            layer=attn_layer,
+            slice_dim=1,
+            layer_type="attn",
+        )
+        k = k.contiguous()
+        v = v.contiguous()
+
+    has_nontrivial_mask = False
+    if mask is not None:
+        if mask.numel() <= 1:
+            has_nontrivial_mask = not (mask.item() == 0)
+        else:
+            flat = mask.reshape(-1)
+            sample_indices = [0, flat.numel() // 2, flat.numel() - 1]
+            sampled = flat[sample_indices]
+            has_nontrivial_mask = not (sampled.eq(0).all().item())
+
+    def iterate_attn(_q, _k, _v, _causal, _mask_chunk):
+        if has_nontrivial_mask and _mask_chunk is not None:
+             return manual_block_attention(
+                _q, _k, _v, dropout_p=dropout_p, softmax_scale=softmax_scale,
+                causal=_causal, mask=_mask_chunk
+            )
+        else:
+            _attn_type = getattr(AttnType, "FA") if attn_type is None else attn_type
+            fn: Any = select_flash_attn_impl(_attn_type, stage="fwd-only", attn_processor=attn_processor)
+            return fn(
+                _q, _k, _v, dropout_p=dropout_p, softmax_scale=softmax_scale,
+                causal=_causal, window_size=window_size, softcap=0.0,
+                alibi_slopes=alibi_slopes, return_softmax=True and dropout_p > 0
+            )
+
+    curr_k, curr_v = k, v
+    next_k = None
+    next_v = None
+
+    for step in range(world_size):
+        if step + 1 != world_size:
+            next_k = comm.send_recv(curr_k)
+            next_v = comm.send_recv(curr_v)
+            comm.commit()
+
+        recv_rank = (rank - step) % world_size
+        
+        if step == 0:
+            # Step 0: Causal attn on full local Q vs full local K
+            m_chunk = get_zigzag_mask_chunk(mask, rank, rank, world_size, block_seq_len) if has_nontrivial_mask else None
+            block_out, block_lse = iterate_attn(q, curr_k, curr_v, _causal=True, _mask_chunk=m_chunk)
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+        elif step <= rank:
+            # Attend to the first half of the received blocks (K_recv_rank)
+            k0 = curr_k[:, :block_seq_len]
+            v0 = curr_v[:, :block_seq_len]
+            m_chunk = get_zigzag_mask_chunk(mask, rank, recv_rank, world_size, block_seq_len, k_slice=0) if has_nontrivial_mask else None
+            block_out, block_lse = iterate_attn(q, k0, v0, _causal=False, _mask_chunk=m_chunk)
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+        else:
+            # Only the second half of Q attends to the received blocks
+            q1 = q[:, block_seq_len:]
+            m_chunk = get_zigzag_mask_chunk(mask, rank, recv_rank, world_size, block_seq_len, q_slice=1) if has_nontrivial_mask else None
+            block_out, block_lse = iterate_attn(q1, curr_k, curr_v, _causal=False, _mask_chunk=m_chunk)
+            out, lse = update_out_and_lse(
+                out, lse, block_out, block_lse, 
+                slice_=(slice(None), slice(block_seq_len, None))
+            )
+            
+        if step + 1 != world_size:
+            comm.wait()
+            curr_k, curr_v = next_k, next_v
+
+    if out is None:
+        out = torch.zeros_like(q)
+    if lse is None:
+        lse = torch.zeros(q.shape[0], q.shape[2], q.shape[1], device=q.device, dtype=torch.float32)
+    else:
+        lse = lse.squeeze(dim=-1).transpose(1, 2)
+        
+    out = out.to(q.dtype)
+    return out, lse
+
+def xdit_ring_zigzag_flash_attn_func_patched(
+    q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1),
+    alibi_slopes=None, deterministic=False, return_attn_probs=False, group=None,
+    attn_type=None, attn_processor=None, attn_layer=None, joint_tensor_key=None,
+    joint_tensor_value=None, joint_strategy="none", mask=None, **kwargs,
+):
+    if softmax_scale is None:
+        softmax_scale = q.size(-1) ** -0.5
+
+    out, softmax_lse = xdit_ring_zigzag_flash_attn_forward_patched(
+        group, q, k, v, softmax_scale=softmax_scale, dropout_p=dropout_p,
+        causal=causal, window_size=window_size, alibi_slopes=alibi_slopes,
+        deterministic=deterministic, attn_type=attn_type, attn_processor=attn_processor,
+        attn_layer=attn_layer, joint_tensor_key=joint_tensor_key,
+        joint_tensor_value=joint_tensor_value, joint_strategy=joint_strategy,
+        mask=mask, **kwargs
+    )
+    return out if not return_attn_probs else (out, softmax_lse, None)
 
 
 def xdit_ring_flash_attn_forward_patched(

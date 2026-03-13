@@ -10,8 +10,8 @@ class StandardAttentionBackend(AttentionBackend):
     The standard xFuser attention implementation.
     """
 
-    def create_attention(self, attn_type: str, sync_ulysses: bool, **kwargs) -> Callable:
-        print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}")
+    def create_attention(self, attn_type: str, sync_ulysses: bool, ring_impl_type: str = "basic", **kwargs) -> Callable:
+        print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}, Impl: {ring_impl_type}")
         
         attn_enum = AttnType[attn_type]
         
@@ -24,6 +24,7 @@ class StandardAttentionBackend(AttentionBackend):
         xfuser_attn = RaylightAttention(
             use_sync=sync_ulysses, 
             attn_type=attn_enum, 
+            ring_impl_type=ring_impl_type,
             use_pack_qkv=False, 
             use_compact_ring=False  # Standard uses xfuser ring or patched flash
         )

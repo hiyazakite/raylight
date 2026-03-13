@@ -33,7 +33,7 @@ class RaylightAttention(LongContextAttention):
     Unified attention layer for Raylight that supports both standard xFuser
     and CompactFusion backends via a centralized dispatcher.
     """
-    ring_impl_type_supported_kv_cache = ["basic"]
+    ring_impl_type_supported_kv_cache = ["basic", "zigzag"]
 
     def __init__(
         self,
@@ -56,6 +56,7 @@ class RaylightAttention(LongContextAttention):
         )
         self.use_kv_cache = use_kv_cache
         self.use_compact_ring = use_compact_ring
+        self.ring_impl_type = ring_impl_type
         
         if (
             use_kv_cache
@@ -171,7 +172,8 @@ class RaylightAttention(LongContextAttention):
         ring_fn = select_ring_attn_fn(
             use_compact_ring=self.use_compact_ring,
             has_mask=(mask is not None),
-            layer_idx=call_idx
+            layer_idx=call_idx,
+            ring_impl_type=self.ring_impl_type
         )
         
         # Assertions to satisfy type checker

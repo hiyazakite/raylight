@@ -17,14 +17,18 @@ try:
 except ImportError:
     xdit_ring_flash_attn_func = None
 
-from raylight.distributed_modules.attention.backends.xfuser_ring_patch import xdit_ring_flash_attn_func_patched
+from raylight.distributed_modules.attention.backends.xfuser_ring_patch import (
+    xdit_ring_flash_attn_func_patched,
+    xdit_ring_zigzag_flash_attn_func_patched
+)
 
 _WRAPPED_CACHE = {}
 
 def select_ring_attn_fn(
     use_compact_ring: bool,
     has_mask: bool,
-    layer_idx: Optional[int] = None
+    layer_idx: Optional[int] = None,
+    ring_impl_type: str = "basic"
 ) -> Callable:
     """
     Centralized logic to select the appropriate ring attention function.
@@ -35,6 +39,17 @@ def select_ring_attn_fn(
         return compact_fwd
     
     # Standard xfuser path
+    if ring_impl_type == "zigzag":
+        target_fn = xdit_ring_zigzag_flash_attn_func_patched
+        if target_fn is not None:
+             if _VERBOSE_ATTN:
+                print(f"[Raylight] ⚡ Using zigzag ring attention (Layer: {layer_idx})")
+             # Wrap to swallow extra kwargs like mod_idx
+             if target_fn not in _WRAPPED_CACHE:
+                 _fn = target_fn
+                 _WRAPPED_CACHE[target_fn] = lambda *args, **kwargs: _fn(*args, **{k: v for k, v in kwargs.items() if k not in ["mod_idx"]})
+             return _WRAPPED_CACHE[target_fn]
+
     if has_mask:
         # Use patched version if available (supports masks)
         target_fn = xdit_ring_flash_attn_func_patched or xdit_ring_flash_attn_func

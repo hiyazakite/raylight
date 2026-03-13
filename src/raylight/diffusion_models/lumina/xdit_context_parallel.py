@@ -7,11 +7,14 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
+from raylight.distributed_modules.sequence_parallel import extract_local_tensor
 import comfy
 
 attn_type = xfuser_attn.get_attn_type()
 sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+# Lumina is non-causal, so we force "basic" ring implementation to avoid zigzag overhead/assertion
+ring_impl_type = "basic"
+xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
@@ -73,8 +76,8 @@ def usp_dit_forward(self, x, timesteps, context, num_tokens, attention_mask=None
     x = pad_to_divisible(x, world_size, dim=1)
     freqs_cis = pad_to_divisible(freqs_cis, world_size, dim=1)
 
-    x = torch.chunk(x, world_size, dim=1)[get_sequence_parallel_rank()]
-    freqs_cis = torch.chunk(freqs_cis, world_size, dim=1)[get_sequence_parallel_rank()]
+    x = extract_local_tensor(x, ring_impl_type=ring_impl_type, dim=1)
+    freqs_cis = extract_local_tensor(freqs_cis, ring_impl_type=ring_impl_type, dim=1)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     for layer in self.layers:
