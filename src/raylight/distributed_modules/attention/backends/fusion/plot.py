@@ -76,7 +76,8 @@ def plot_low_rank_factors(
         filename = f"{key}_{step_str}_uv.png"
         filepath = os.path.join(save_dir, filename)
         plt.savefig(filepath, dpi=150, bbox_inches="tight")
-        print(f"Saved U/V plot to {filepath}")
+        # print(f"Saved U/V plot to {filepath}")
+        pass
         plt.close(fig)  # Close the figure after saving
     else:
         plt.show()
@@ -120,7 +121,8 @@ def plot_eigenvalue_cumsum(
         for key in eigenvalues:
             for step in eigenvalues[key]:
                 if data_type in eigenvalues[key][step]:
-                    print(f"Plotting {key} {data_type} CDF for step {step}")
+                    # print(f"Plotting {key} {data_type} CDF for step {step}")
+                    pass
                     plt.figure(figsize=(10, 6))
                     # Check if the list is empty before accessing
                     if not eigenvalues[key][step][data_type]:
@@ -142,14 +144,16 @@ def plot_eigenvalue_cumsum(
                     if save_dir:
                         file_path = os.path.join(save_dir, f"{key}_{data_type}_cdf_step{step}.png")
                         plt.savefig(file_path, dpi=300, bbox_inches='tight')
-                        print(f"Plot saved to {file_path}")
+                        # print(f"Plot saved to {file_path}")
+                        pass
                         plt.clf()
                         plt.close()
                     else:
                         plt.show()
     elif key is not None and step is None: # Plot all eigenvalues for all target steps for a specific layer
         if key not in eigenvalues:
-            print(f"No eigenvalue data for key {key}.")
+            # print(...)
+            pass
             return
         for step in eigenvalues[key]:
             if data_type in eigenvalues[key][step]:
@@ -222,7 +226,8 @@ def plot_eigenvalue_cumsum(
                     plt.show()
     elif key is not None and step is not None: # Plot eigenvalues for a specific key and step
         if key not in eigenvalues:
-            print(f"No eigenvalue data for key {key}.")
+            # print(...)
+            pass
             return
 
         if step not in eigenvalues[key]:
@@ -316,14 +321,16 @@ def plot_eigenvalue_distribution(
                     if save_dir:
                         file_path = os.path.join(save_dir, f"{key}_{data_type}_step{step}.png")
                         plt.savefig(file_path, dpi=300, bbox_inches='tight')
-                        print(f"Plot saved to {file_path}")
+                        # print(f"Plot saved to {file_path}")
+                        pass
                         plt.clf()
                         plt.close()
                     else:
                         plt.show()
     elif key is not None and step is None: # Plot all eigenvalues for all target steps for a specific layer
         if key not in eigenvalues:
-            print(f"No eigenvalue data for key {key}.")
+            # print(...)
+            pass
             return
         for step in eigenvalues[key]:
             if data_type in eigenvalues[key][step]:
@@ -376,7 +383,8 @@ def plot_eigenvalue_distribution(
                     plt.show()
     elif key is not None and step is not None: # Plot eigenvalues for a specific key and step
         if key not in eigenvalues:
-            print(f"No eigenvalue data for key {key}.")
+            # print(...)
+            pass
             return
 
         if step not in eigenvalues[key]:

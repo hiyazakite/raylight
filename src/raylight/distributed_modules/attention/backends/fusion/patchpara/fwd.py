@@ -42,7 +42,6 @@ def patch_gather_fwd(
     mod_idx=None,
     current_iter=None,
     mask=None,
-    key_suffix="",
 ):
     """
     Attention forward pass using all_gather for K/V tensors (no compression).
@@ -101,13 +100,13 @@ def patch_gather_fwd(
         comp_type_k = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
         comp_type_v = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
         k_list_for_computation = compact_all_gather(
-            f"{mod_idx}-k{key_suffix}",
+            f"{mod_idx}-k",
             k,
             comp_type=comp_type_k,
             group=process_group,
         )
         v_list_for_computation = compact_all_gather(
-            f"{mod_idx}-v{key_suffix}",
+            f"{mod_idx}-v",
             v,
             comp_type=comp_type_v,
             group=process_group,
@@ -124,8 +123,8 @@ def patch_gather_fwd(
         # --- End Synchronous --- #
     else:
         # --- Asynchronous Communication (DistriFusion) --- #
-        k_cache_key = f'{mod_idx}-k{key_suffix}'
-        v_cache_key = f'{mod_idx}-v{key_suffix}'
+        k_cache_key = f'{mod_idx}-k'
+        v_cache_key = f'{mod_idx}-v'
         # print(f"k_cache_key: {k_cache_key}, v_cache_key: {v_cache_key}")
         with Profiler.scope("df.all_gather"):
             if current_iter < config.async_warmup:

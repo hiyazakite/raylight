@@ -22,8 +22,8 @@ class CompactAttentionBackend(AttentionBackend):
             compact_fastpath (bool): Default True
             compact_residual (int): Default 1 (1st order)
             compact_rank (int): Default -1
-            compact_quantized_cache (bool): Default False
-            compact_cache_quant_bits (int): Default None (8 if quantized_cache is True)
+            compact_quantized_cache (bool): Default True
+            compact_cache_quant_bits (int): Default 8
         """
         print(f"Using CompactFusion XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}, Impl: {ring_impl_type}")
         
@@ -31,8 +31,12 @@ class CompactAttentionBackend(AttentionBackend):
         # Default policy: Warmup for first 5 steps, then configured compression (default BINARY)
         import os
         
-        # Priority: kwargs > env var > default
-        quantized_cache = kwargs.get("compact_quantized_cache", os.environ.get("RAYLIGHT_COMPACT_QUANTIZED_CACHE") == "1")
+        # Priority: env var > kwargs > default (True)
+        env_val = os.environ.get("RAYLIGHT_COMPACT_QUANTIZED_CACHE")
+        if env_val is not None:
+            quantized_cache = (env_val == "1")
+        else:
+            quantized_cache = kwargs.get("compact_quantized_cache", True)
         
         # Parse delta compression type
         delta_compression_str = os.environ.get("RAYLIGHT_DELTA_COMPRESSION", "BINARY").upper()
@@ -125,24 +129,22 @@ class CompactAttentionBackend(AttentionBackend):
                 assert join_k is not None and join_v is not None
                 out = xfuser_attn(
                     None,
-                    q,
-                    k,
-                    v,
+                    q, k, v,
                     joint_strategy="rear",
                     joint_tensor_query=join_q,
                     joint_tensor_key=join_k,
                     joint_tensor_value=join_v,
                     mask=mask,
-                    **kwargs,
+                    mod_idx=kwargs.get("mod_idx"),
+                    current_iter=kwargs.get("current_iter"),
                 )
             else:
                 out = xfuser_attn(
                     None,
-                    q,
-                    k,
-                    v,
+                    q, k, v,
                     mask=mask,
-                    **kwargs,
+                    mod_idx=kwargs.get("mod_idx"),
+                    current_iter=kwargs.get("current_iter"),
                 )
             
             if not skip_output_reshape:

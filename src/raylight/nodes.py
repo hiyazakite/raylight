@@ -22,7 +22,7 @@ from .distributed_worker.ray_worker import (
     ensure_fresh_actors,
     ray_nccl_tester,
 )
-from .comfy_dist.utils import cancellable_get
+from .comfy_dist.utils import cancellable_get, clear_ray_cluster, get_ray_cluster_epoch
 from raylight.utils.memory import monitor_memory
 
 
@@ -214,6 +214,10 @@ class RayInitializer:
 
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return get_ray_cluster_epoch()
 
     def spawn_actor(
         self,
@@ -540,6 +544,10 @@ class RayUNETLoader:
 
     CATEGORY = "Raylight"
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return get_ray_cluster_epoch()
+
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype):
         with monitor_memory("RayUNETLoader.load_ray_unet"):
             ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
@@ -671,48 +679,52 @@ class XFuserKSamplerAdvanced:
         denoise=1.0,
         sigmas=None,
     ):
-        with monitor_memory("XFuserKSampler.ray_sample"):
-            # Clean VRAM for preparation to load model
-            pass
-        force_full_denoise = True
-        if return_with_leftover_noise == "enable":
-            force_full_denoise = False
-        disable_noise = False
-        if add_noise == "disable":
-            disable_noise = True
+        try:
+            with monitor_memory("XFuserKSampler.ray_sample"):
+                # Clean VRAM for preparation to load model
+                pass
+            force_full_denoise = True
+            if return_with_leftover_noise == "enable":
+                force_full_denoise = False
+            disable_noise = False
+            if add_noise == "disable":
+                disable_noise = True
 
-        gpu_actors = ray_actors["workers"]
+            gpu_actors = ray_actors["workers"]
 
-        # Re-apply LoRAs for this branch's config_hash if needed (Always call to handle None/reset)
-        lora_config_hash = ray_actors.get("lora_config_hash")
-        print(f"[XFuserKSamplerAdvanced] Syncing LoRA state (config_hash={lora_config_hash})...")
-        lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
-        cancellable_get(lora_futures)
+            # Re-apply LoRAs for this branch's config_hash if needed (Always call to handle None/reset)
+            lora_config_hash = ray_actors.get("lora_config_hash")
+            print(f"[XFuserKSamplerAdvanced] Syncing LoRA state (config_hash={lora_config_hash})...")
+            lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
+            cancellable_get(lora_futures)
 
-        futures = [
-            actor.common_ksampler.remote(
-                noise_seed,
-                steps,
-                cfg,
-                sampler_name,
-                scheduler,
-                positive,
-                negative,
-                latent_image,
-                denoise=denoise,
-                disable_noise=disable_noise,
-                start_step=start_at_step,
-                last_step=end_at_step,
-                force_full_denoise=force_full_denoise,
-                sigmas=sigmas,
-            )
-            for actor in gpu_actors
-        ]
+            futures = [
+                actor.common_ksampler.remote(
+                    noise_seed,
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    positive,
+                    negative,
+                    latent_image,
+                    denoise=denoise,
+                    disable_noise=disable_noise,
+                    start_step=start_at_step,
+                    last_step=end_at_step,
+                    force_full_denoise=force_full_denoise,
+                    sigmas=sigmas,
+                )
+                for actor in gpu_actors
+            ]
 
-        results: Any = cancellable_get(futures)
-        if results is None:
-             raise RuntimeError("Raylight: Sampling failed or was cancelled.")
-        return (results[0][0],)
+            results: Any = cancellable_get(futures)
+            if results is None:
+                 raise RuntimeError("Raylight: Sampling failed or was cancelled.")
+            return (results[0][0],)
+        except Exception as e:
+            clear_ray_cluster(ray_actors, reason=f"sampling error in XFuserKSamplerAdvanced: {type(e).__name__}")
+            raise
 
 
 class DPKSamplerAdvanced:
@@ -772,84 +784,87 @@ class DPKSamplerAdvanced:
         return_with_leftover_noise,
         denoise=1.0,
     ):
-
         ray_actors = ray_actors[0]
-        add_noise = add_noise[0]
-        steps = steps[0]
-        cfg = cfg[0]
-        sampler_name = sampler_name[0]
-        scheduler = scheduler[0]
-        positive = positive[0]
-        negative = negative[0]
-        start_at_step = start_at_step[0]
-        end_at_step = end_at_step[0]
-        return_with_leftover_noise = return_with_leftover_noise[0]
+        try:
+            add_noise = add_noise[0]
+            steps = steps[0]
+            cfg = cfg[0]
+            sampler_name = sampler_name[0]
+            scheduler = scheduler[0]
+            positive = positive[0]
+            negative = negative[0]
+            start_at_step = start_at_step[0]
+            end_at_step = end_at_step[0]
+            return_with_leftover_noise = return_with_leftover_noise[0]
 
-        gpu_actors = ray_actors["workers"]
+            gpu_actors = ray_actors["workers"]
 
-        parallel_dict: Any = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
-        if parallel_dict is not None and parallel_dict.get("is_xdit") is True:
-            raise ValueError(
+            parallel_dict: Any = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
+            if parallel_dict is not None and parallel_dict.get("is_xdit") is True:
+                raise ValueError(
+                    """
+                Data Parallel KSampler only supports FSDP or standard Data Parallel (DP).
+                Please set both 'ulysses_degree' and 'ring_degree' to 0,
+                or use the XFuser KSampler instead. More info on Raylight mode https://github.com/komikndr/raylight
                 """
-            Data Parallel KSampler only supports FSDP or standard Data Parallel (DP).
-            Please set both 'ulysses_degree' and 'ring_degree' to 0,
-            or use the XFuser KSampler instead. More info on Raylight mode https://github.com/komikndr/raylight
-            """
-            )
+                )
 
-        if len(latent_image) != len(gpu_actors):
-            latent_image = [latent_image[0]] * len(gpu_actors)
+            if len(latent_image) != len(gpu_actors):
+                latent_image = [latent_image[0]] * len(gpu_actors)
 
-        # Clean VRAM for preparation to load model
-        force_full_denoise = True
-        if return_with_leftover_noise == "enable":
-            force_full_denoise = False
-        disable_noise = False
-        if add_noise == "disable":
-            disable_noise = True
+            # Clean VRAM for preparation to load model
+            force_full_denoise = True
+            if return_with_leftover_noise == "enable":
+                force_full_denoise = False
+            disable_noise = False
+            if add_noise == "disable":
+                disable_noise = True
 
-        # Re-apply LoRAs for this branch's config_hash if needed (Always call to handle None/reset)
-        lora_config_hash = ray_actors.get("lora_config_hash")
-        print(f"[DPKSamplerAdvanced] Syncing LoRA state (config_hash={lora_config_hash})...")
-        lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
-        cancellable_get(lora_futures)
+            # Re-apply LoRAs for this branch's config_hash if needed (Always call to handle None/reset)
+            lora_config_hash = ray_actors.get("lora_config_hash")
+            print(f"[DPKSamplerAdvanced] Syncing LoRA state (config_hash={lora_config_hash})...")
+            lora_futures = [actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors]
+            cancellable_get(lora_futures)
 
-        futures = [
-            actor.common_ksampler.remote(
-                noise_list[i],
-                steps,
-                cfg,
-                sampler_name,
-                scheduler,
-                positive,
-                negative,
-                latent_image[i],
-                denoise=denoise,
-                disable_noise=disable_noise,
-                start_step=start_at_step,
-                last_step=end_at_step,
-                force_full_denoise=force_full_denoise,
-            )
-            for i, actor in enumerate(gpu_actors)
-        ]
+            futures = [
+                actor.common_ksampler.remote(
+                    noise_list[i],
+                    steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    positive,
+                    negative,
+                    latent_image[i],
+                    denoise=denoise,
+                    disable_noise=disable_noise,
+                    start_step=start_at_step,
+                    last_step=end_at_step,
+                    force_full_denoise=force_full_denoise,
+                )
+                for i, actor in enumerate(gpu_actors)
+            ]
 
-        results: Any = cancellable_get(futures)
-        if results is None:
-             raise RuntimeError("Raylight: Sampling failed or was cancelled.")
+            results: Any = cancellable_get(futures)
+            if results is None:
+                 raise RuntimeError("Raylight: Sampling failed or was cancelled.")
+            
+            if parallel_dict is not None and parallel_dict.get("is_xdit"):
+                 return (results[0][0],)
+
+            # Standard mode: concat shards
+            out: Any = latent_image[0]
+            out = out.copy()
+            samples = []
+            for res in results:
+                 if res is not None:
+                      samples.append(res[0]["samples"])
         
-        if parallel_dict is not None and parallel_dict.get("is_xdit"):
-             return (results[0][0],)
-
-        # Standard mode: concat shards
-        out: Any = latent_image[0]
-        out = out.copy()
-        samples = []
-        for res in results:
-             if res is not None:
-                  samples.append(res[0]["samples"])
-        
-        out["samples"] = torch.cat(samples, dim=0)
-        return (out,)
+            out["samples"] = torch.cat(samples, dim=0)
+            return (out,)
+        except Exception as e:
+            clear_ray_cluster(ray_actors, reason=f"sampling error in DPKSamplerAdvanced: {type(e).__name__}")
+            raise
 
 
 class Noise_RandomNoise:

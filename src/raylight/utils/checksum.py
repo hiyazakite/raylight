@@ -62,10 +62,10 @@ def verify_model_checksum(sd: Dict[str, Any], stored_checksum: str, metadata: Op
     current_checksum = compute_model_checksum(sd, metadata)
     
     if stored_checksum != current_checksum:
-        print(f"[{context_tag}] CRITICAL: Cache Corruption Detected!")
-        print(f"  Stored:  {stored_checksum}")
-        print(f"  Current: {current_checksum}")
+        # print(...)
+        pass
         return False
     else:
-        print(f"[{context_tag}] Cache Integrity Verified (Checksum match).")
+        # print(...)
+        pass
         return True

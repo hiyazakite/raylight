@@ -43,26 +43,7 @@ def compact_init(config: CompactConfig):
     context._current_cache_key = None
 
 def compact_hello():
-    if dist.get_rank() == 0:
-        print("--- 🐳  Compact initialized ---")
-        if context._config is None:
-            print("🟫  Compact not initialized")
-        else:
-            print("🟦  Compact enabled" if context._config.enabled else "🟫  Compact disabled")
-            if context._config.enabled:
-                if not context._config.override_with_patch_gather_fwd:
-                    print("🟦  Fastpath" if context._config.fastpath else "🟫  No fastpath")
-                    print("🟦  Simulate compress" if context._config.simulate_compress else "🟫  No simulate compress")
-                    print("🟦  Stats log" if context._config.log_compress_stats else "🟫  No stats log")
-                    print("🟦  Check consistency" if context._config.check_cache_consistency else "🟫  No check consistency")
-                else:
-                    print("🟧  Overrided to Patch Para")
-                    patch_config = context._config.patch_gather_fwd_config
-                    print("🟨  Using DistriFusion" if patch_config.async_comm else "🟫  Sync patch para")
-                    print("🟨  Using Compact" if patch_config.use_compact else "🟫  No compression")
-        print("------------------------------")
-        if context._config and context._config.log_compress_stats and context._config.enabled:
-            stats_hello()
+    pass
 
 def compact_config():
     return context.compact_config()

@@ -135,5 +135,6 @@ class monitor_memory:
         except:
             pass
             
-        print(f"[{'END:' + status}] {self.tag} | Peak VRAM Delta: {peak_gb:.2f} GB")
+        # print(f"[{'END:' + status}] {self.tag} | Peak VRAM Delta: {peak_gb:.2f} GB")
+        pass
         log_memory_stats(f"[END:{status}] {self.tag}", self.device)

@@ -45,7 +45,7 @@ class CompactConfig:
         check_consist: bool = False,
         fastpath: bool = False,
         quantized_cache: bool = True,
-        cache_quant_bits: int | None = None,
+        cache_quant_bits: int = 8,
         delta_decay_factor: float | None = None
     ):
         """
@@ -134,7 +134,7 @@ from raylight.distributed_modules.attention.backends.fusion.compress_lowrank imp
 
 
 class CompactCache:
-    def __init__(self, quantize=False, quant_bits=8):
+    def __init__(self, quantize=True, quant_bits=8):
         self.quantize = quantize
         self.quant_bits = quant_bits
         self.base = {}
@@ -150,7 +150,15 @@ class CompactCache:
             if self.quant_bits == 8:
                 base = quantize_int8(base)
             elif self.quant_bits == 4:
-                base = quantize_int4(base)
+                if base.ndim == 2 and (base.shape[0] % 2) != 0:
+                    # INT4 packing stores two rows per byte along N, so odd N needs
+                    # one extra row. Duplicate the last row so min/max statistics stay
+                    # unchanged, then remember the original length for cropping.
+                    padded_base = torch.cat([base, base[-1:].contiguous()], dim=0)
+                    packed, scale, min_val = quantize_int4(padded_base)
+                    base = (packed, scale, min_val, base.shape[0])
+                else:
+                    base = quantize_int4(base)
         self.base[key] = base
         # from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
         # from raylight.distributed_modules.collector.collector import collect
@@ -172,7 +180,11 @@ class CompactCache:
                 if self.quant_bits == 8:
                     base = dequantize_int8(*base)
                 elif self.quant_bits == 4:
-                    base = dequantize_int4(*base)
+                    if isinstance(base, tuple) and len(base) == 4:
+                        packed, scale, min_val, orig_n = base
+                        base = dequantize_int4(packed, scale, min_val)[:orig_n]
+                    else:
+                        base = dequantize_int4(*base)
         
         if base is not None:
             # Check shape

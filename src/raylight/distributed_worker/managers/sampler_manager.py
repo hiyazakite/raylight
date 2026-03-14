@@ -61,10 +61,10 @@ class SamplerManager:
         noise_mask = latent.get("noise_mask", None)
 
         # DEBUG: Verify GGUF Ops State
-        if getattr(work_model, "gguf_metadata", None):
-             ops = work_model.model_options.get("custom_operations")
-             if ops and hasattr(ops, "Linear"):
-                  print(f"[RayWorker {config.local_rank}] SAMPLING START | GGUF Config verified: Dequant={getattr(ops.Linear, 'dequant_dtype', 'None')}, Patch={getattr(ops.Linear, 'patch_dtype', 'None')}")
+        # if getattr(work_model, "gguf_metadata", None):
+        #      ops = work_model.model_options.get("custom_operations")
+        #      if ops and hasattr(ops, "Linear"):
+        #           print(f"[RayWorker {config.local_rank}] SAMPLING START | GGUF Config verified: Dequant={getattr(ops.Linear, 'dequant_dtype', 'None')}, Patch={getattr(ops.Linear, 'patch_dtype', 'None')}")
 
         return work_model, latent_image, noise_mask, disable_pbar, model_was_modified
     
@@ -161,8 +161,8 @@ class SamplerManager:
 
              # 3. Sampling
              # Use utility for consistent memory logging
-             if hasattr(model, "mmap_cache"):
-                 print(f"[RayWorker {config.local_rank}] Mmap Cache Len: {len(model.mmap_cache) if model.mmap_cache else 0}")
+             # if hasattr(model, "mmap_cache"):
+             #     print(f"[RayWorker {config.local_rank}] Mmap Cache Len: {len(model.mmap_cache) if model.mmap_cache else 0}")
              
              with torch.no_grad():
                  # Correctly initialize CompactFusion step counter and clear indices
@@ -201,7 +201,7 @@ class SamplerManager:
                             self.temporal_cache_tracker.total_steps = total_steps  # type: ignore
                         self.temporal_cache_tracker.update(step)  # type: ignore
 
-                 profile_enabled = os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "0") == "1"
+                 profile_enabled = False # os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "0") == "1"
                  with CProfileContext(enabled=profile_enabled, sort_by='cumulative', top_k=5, name="custom_ksampler (Comfy)"):
                      samples = comfy.sample.sample_custom(
                              work_model,
@@ -306,7 +306,7 @@ class SamplerManager:
                             self.temporal_cache_tracker.total_steps = total_steps  # type: ignore
                         self.temporal_cache_tracker.update(step)  # type: ignore
                 
-                profile_enabled = os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "0") == "1"
+                profile_enabled = False # os.environ.get("RAYLIGHT_PROFILE_SAMPLER", "0") == "1"
                 with CProfileContext(enabled=profile_enabled, sort_by='cumulative', top_k=5, name="common_ksampler (Comfy)"):
                     if sigmas is None:
                         samples = comfy.sample.sample(

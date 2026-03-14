@@ -4,6 +4,40 @@ import ray
 import comfy.model_management
 
 
+_RAY_CLUSTER_EPOCH = 0
+
+
+def get_ray_cluster_epoch():
+    return _RAY_CLUSTER_EPOCH
+
+
+def clear_ray_cluster(ray_actors=None, reason=None):
+    """Best-effort cleanup of Ray workers after a fatal workflow error."""
+    global _RAY_CLUSTER_EPOCH
+    if reason:
+        print(f"[Raylight] Clearing Ray cluster after failure: {reason}")
+
+    workers = []
+    if isinstance(ray_actors, dict):
+        workers = ray_actors.get("workers", []) or []
+
+    for actor in workers:
+        try:
+            ray.kill(actor, no_restart=True)
+        except Exception:
+            try:
+                actor.kill.remote()
+            except Exception:
+                pass
+
+    try:
+        ray.shutdown()
+    except Exception:
+        pass
+
+    _RAY_CLUSTER_EPOCH += 1
+
+
 @torch.inference_mode()
 def tiled_scale_multidim(
     samples,

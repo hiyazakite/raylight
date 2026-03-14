@@ -9,6 +9,7 @@ from comfy.k_diffusion import sa_solver
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 import comfy.utils
 from .ray_patch_decorator import ray_patch_with_return
+from raylight.comfy_dist.utils import clear_ray_cluster
 
 from raylight.utils.common import Noise_EmptyNoise, Noise_RandomNoise
 
@@ -261,37 +262,41 @@ class XFuserSamplerCustom:
         sigmas,
         latent_image,
     ):
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
-        comfy.model_management.soft_empty_cache()
-        gpu_actors = ray_actors["workers"]
+        try:
+            gc.collect()
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache()
+            comfy.model_management.soft_empty_cache()
+            gpu_actors = ray_actors["workers"]
 
-        # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
-        ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+            # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
+            ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
 
-        # Re-apply LoRAs for this branch's config_hash if needed
-        lora_config_hash = ray_actors.get("lora_config_hash")
-        if lora_config_hash is not None:
-            print(f"[XFuserSamplerCustom] Ensuring LoRAs for config_hash={lora_config_hash}...")
-            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
+            # Re-apply LoRAs for this branch's config_hash if needed
+            lora_config_hash = ray_actors.get("lora_config_hash")
+            if lora_config_hash is not None:
+                print(f"[XFuserSamplerCustom] Ensuring LoRAs for config_hash={lora_config_hash}...")
+                ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
 
-        futures = [
-            actor.custom_sampler.remote(
-                add_noise,
-                noise_seed,
-                cfg,
-                positive,
-                negative,
-                sampler,
-                sigmas,
-                latent_image,
-            )
-            for i, actor in enumerate(gpu_actors)
-        ]
-        results = ray.get(futures)
-        out = results[0]
-        return (out,)
+            futures = [
+                actor.custom_sampler.remote(
+                    add_noise,
+                    noise_seed,
+                    cfg,
+                    positive,
+                    negative,
+                    sampler,
+                    sigmas,
+                    latent_image,
+                )
+                for i, actor in enumerate(gpu_actors)
+            ]
+            results = ray.get(futures)
+            out = results[0]
+            return (out,)
+        except Exception as e:
+            clear_ray_cluster(ray_actors, reason=f"sampling error in XFuserSamplerCustom: {type(e).__name__}")
+            raise
 
 
 class DPSamplerCustom:
@@ -340,43 +345,47 @@ class DPSamplerCustom:
         latent_image,
     ):
         ray_actors = ray_actors[0]
-        add_noise = add_noise[0]
-        cfg = cfg[0]
-        positive = positive[0]
-        negative = negative[0]
-        sampler = sampler[0]
-        sigmas = sigmas[0]
-        latent_image = latent_image[0]
+        try:
+            add_noise = add_noise[0]
+            cfg = cfg[0]
+            positive = positive[0]
+            negative = negative[0]
+            sampler = sampler[0]
+            sigmas = sigmas[0]
+            latent_image = latent_image[0]
 
-        gc.collect()
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
-        gpu_actors = ray_actors["workers"]
+            gc.collect()
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache()
+            gpu_actors = ray_actors["workers"]
 
-        # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
-        ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+            # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
+            ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
 
-        # Re-apply LoRAs for this branch's config_hash if needed
-        lora_config_hash = ray_actors.get("lora_config_hash")
-        if lora_config_hash is not None:
-            print(f"[DPSamplerCustom] Ensuring LoRAs for config_hash={lora_config_hash}...")
-            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
+            # Re-apply LoRAs for this branch's config_hash if needed
+            lora_config_hash = ray_actors.get("lora_config_hash")
+            if lora_config_hash is not None:
+                print(f"[DPSamplerCustom] Ensuring LoRAs for config_hash={lora_config_hash}...")
+                ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
 
-        futures = [
-            actor.custom_sampler.remote(
-                add_noise,
-                noise_list[i],
-                cfg,
-                positive,
-                negative,
-                sampler,
-                sigmas,
-                latent_image,
-            )
-            for i, actor in enumerate(gpu_actors)
-        ]
-        out = ray.get(futures)
-        return (out,)
+            futures = [
+                actor.custom_sampler.remote(
+                    add_noise,
+                    noise_list[i],
+                    cfg,
+                    positive,
+                    negative,
+                    sampler,
+                    sigmas,
+                    latent_image,
+                )
+                for i, actor in enumerate(gpu_actors)
+            ]
+            out = ray.get(futures)
+            return (out,)
+        except Exception as e:
+            clear_ray_cluster(ray_actors, reason=f"sampling error in DPSamplerCustom: {type(e).__name__}")
+            raise
 
 
 class RayAddNoise:
