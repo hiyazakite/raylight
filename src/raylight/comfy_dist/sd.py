@@ -52,14 +52,14 @@ def fsdp_load_diffusion_model_stat_dict(sd, rank, device_mesh, is_cpu_offload, m
 
 
     load_device = model_management.get_torch_device()
-    model_config = model_detection.model_config_from_unet(sd, "")
+    model_config = model_detection.model_config_from_unet(sd, "", metadata=metadata)
 
     if model_config is not None:
         new_sd = sd
     else:
         new_sd = model_detection.convert_diffusers_mmdit(sd, "")
         if new_sd is not None:  # diffusers mmdit
-            model_config = model_detection.model_config_from_unet(new_sd, "")
+            model_config = model_detection.model_config_from_unet(new_sd, "", metadata=metadata)
             if model_config is None:
                 return None
         else:  # diffusers unet

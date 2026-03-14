@@ -189,7 +189,11 @@ class ModelContext(ABC):
 
             else:
                 print(f"[ModelContext] Standard Load: {os.path.basename(state.cache_key)}")
-                sd = self.load_state_dict_standard(state, config)
+                res = self.load_state_dict_standard(state, config)
+                if isinstance(res, tuple) and len(res) == 2:
+                    sd, metadata = res
+                else:
+                    sd = res
         
         if sd is None:
             raise RuntimeError(f"Failed to load state dict for {state.unet_path}")
@@ -587,15 +591,12 @@ class FSDPContext(ModelContext):
     """Context for FSDP model loading with optional mmap for safetensors."""
     
     def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Dict:
-        # Use safetensors mmap if file is .safetensors
-        if state.unet_path.lower().endswith(".safetensors"):
-            import safetensors.torch
-            return safetensors.torch.load_file(state.unet_path, device="cpu")
-        return self.load_state_dict_standard(state, config)
+        import comfy.utils
+        return comfy.utils.load_torch_file(state.unet_path, return_metadata=True)
     
     def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig") -> Dict:
         import comfy.utils
-        return comfy.utils.load_torch_file(state.unet_path)
+        return comfy.utils.load_torch_file(state.unet_path, return_metadata=True)
 
     def load(self, state: ModelState, config: "WorkerConfig", state_cache: Any) -> Any:
         """Override load to implement prefetch optimization for Safetensors."""
@@ -615,8 +616,10 @@ class FSDPContext(ModelContext):
              # 2. Fast Header Read (Dummy SD)
              from safetensors import safe_open
              dummy_sd = {}
+             metadata = None
              try:
                  with safe_open(state.unet_path, framework="pt") as f:
+                     metadata = f.metadata()
                      for k in f.keys():
                          t_slice = f.get_slice(k)
                          shape = t_slice.get_shape()
@@ -628,7 +631,7 @@ class FSDPContext(ModelContext):
 
              # 3. Instantiate with dummy_sd (Wrapping FSDP on CPU)
              try:
-                 model = self.instantiate_model(dummy_sd, state, config, metadata=None, load_weights=False)
+                 model = self.instantiate_model(dummy_sd, state, config, metadata=metadata, load_weights=False)
                  
                  # 4. Finalize
                  print("[FSDPContext] FSDP Wrapping done. Waiting for weights...")
