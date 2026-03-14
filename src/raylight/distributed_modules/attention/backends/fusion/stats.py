@@ -26,15 +26,7 @@ CALC_TOTAL_ERROR = os.environ.get("CALC_TOTAL_ERROR", "0") == "1"
 CALC_ERROR = os.environ.get("CALC_ERROR", "0") == "1"
 
 def stats_hello():
-    print("--- 📦  Statistics Configuration ---")
-    print(f"CALC_SIMILARITY: {CALC_SIMILARITY}")
-    print(f"CALC_MORE_SIMILARITY: {CALC_MORE_SIMILARITY}")
-    print(f"PRINT_ALL_ERROR: {PRINT_ALL_ERROR}")
-    print(f"REF_ACTIVATION_PATH: {REF_ACTIVATION_PATH}")
-    print(f"DUMP_ACTIVATIONS: {DUMP_ACTIVATIONS}")
-    print(f"CALC_TOTAL_ERROR: {CALC_TOTAL_ERROR}")
-    print(f"CALC_ERROR: {CALC_ERROR}")
-    print("------------------------------")
+    pass
 
 class StatsLogger:
     """Simple statistics logger for compression metrics."""
@@ -388,7 +380,6 @@ class StatsLogger:
             keys: List of layer keys to summarize (None for all)
         """
         if not self.stats:
-            print("No statistics logged yet.")
             return
 
         # Determine available keys
@@ -429,7 +420,6 @@ class StatsLogger:
             key: Layer key to summarize (None for all)
         """
         if not self.stats:
-            print("No statistics logged yet.")
             return
 
         keys = [key] if key else self.stats.keys()
@@ -456,11 +446,11 @@ class StatsLogger:
                 by_residual[res].append(stat)
 
             for res, stats in by_residual.items():
-                print(f"🔵 [{k}] res={res} (over {len(stats)} steps):")
+                # print(f"🔵 [{k}] res={res} (over {len(stats)} steps):")
                 # print ALL error
                 if PRINT_ALL_ERROR:
                     all_error = [s['error'] for s in stats]
-                    print(f"all error: {all_error}")
+                    # print(f"all error: {all_error}")
                 
                 # Compute averages
                 avg_error = np.mean([s['error'] for s in stats])
@@ -469,30 +459,30 @@ class StatsLogger:
                 avg_act_norm = np.mean([s['activation_norm'] for s in stats])
 
                 avg_rel_error = avg_error / avg_act_norm if avg_act_norm > 1e-8 else float('inf')
-                print(f"err: {avg_error:.3f}, rel_err: {avg_rel_error:.1%}" + (f", total_err: {avg_total_error:.3f}" if avg_total_error is not None else ""), end="")
-                print(f", act: {avg_act_norm:.3f}", end="")
+                # print(f"err: {avg_error:.3f}, rel_err: {avg_rel_error:.1%}" + (f", total_err: {avg_total_error:.3f}" if avg_total_error is not None else ""), end="")
+                # print(f", act: {avg_act_norm:.3f}", end="")
 
                 if res >= 1:
                     avg_delta_norm_vals = [s['delta_norm'] for s in stats if s['delta_norm'] is not None]
                     avg_delta_norm = np.mean(avg_delta_norm_vals) if avg_delta_norm_vals else 0
                     
                     delta_ratio = avg_delta_norm/avg_act_norm if avg_act_norm > 1e-8 else 0
-                    print(f", delta={avg_delta_norm:.3f}, d/a={delta_ratio:.2f}", end="")
+                    # print(f", delta={avg_delta_norm:.3f}, d/a={delta_ratio:.2f}", end="")
 
                     # Add delta before feedback stats 
                     dbf_norm_values = [s['delta_before_feedback_norm'] for s in stats if s.get('delta_before_feedback_norm') is not None]
                     if dbf_norm_values:
                         avg_dbf_norm = np.mean(dbf_norm_values)
                         dbf_ratio = avg_dbf_norm/avg_act_norm if avg_act_norm > 1e-8 else float('inf')
-                        print(f", dbf={avg_dbf_norm:.3f}, dbf/a={dbf_ratio:.2f}", end="")
+                        # print(f", dbf={avg_dbf_norm:.3f}, dbf/a={dbf_ratio:.2f}", end="")
 
                 if res >= 2:
                     avg_delta_delta_norm = np.mean([s['delta_delta_norm'] for s in stats if s['delta_delta_norm'] is not None])
                     if avg_delta_norm > 0:
                         dd_ratio = avg_delta_delta_norm/avg_delta_norm
-                        print(f", dd={avg_delta_delta_norm:.3f}, dd/d={dd_ratio:.2f}", end="")
+                        # print(f", dd={avg_delta_delta_norm:.3f}, dd/d={dd_ratio:.2f}", end="")
 
-                print() # Newline after norms
+                # print() # Newline after norms
 
                 # --- Helper function for adding average stats to lists ---
                 def _add_avg_stat(stats_list, stat_key, label, target_list):
@@ -514,12 +504,12 @@ class StatsLogger:
                 _add_avg_stat(stats, 'delta_before_feedback_lowrank_similarity', 'dbf_lr_sim', similarities)
 
                 if similarities:
-                    print("  " + ", ".join(similarities)) # Indent similarity line
+                    # print("  " + ", ".join(similarities)) # Indent similarity line
+                    pass
 
     def summary_compression_volume(self):
         """Prints the total data volume before and after compression and the ratio."""
         if self.total_original_volume == 0:
-            print("💾 No volume data logged yet.") # Keep emoji
             return
 
         orig_mb = self.total_original_volume / (1024**2)
@@ -534,7 +524,8 @@ class StatsLogger:
         else:
             summary_line += ", Ratio N/A"
 
-        print(summary_line)
+        # print(summary_line)
+        pass
 
     def summary_total_avg(self):
 
@@ -566,10 +557,10 @@ class StatsLogger:
         mean_dd = np.mean(dd_values) if dd_values else None
 
         # Print all averages on one line
-        print(f"🟫 avg activation: {mean_act:.3f}" + 
-              (f", avg delta: {mean_delta:.3f}" if mean_delta is not None else "") + 
-              (f", avg dbf: {mean_dbf:.3f}" if mean_dbf is not None else "") +
-              (f", avg delta-delta: {mean_dd:.3f}" if mean_dd is not None else ""))
+        # print(f"🟫 avg activation: {mean_act:.3f}" + 
+        #       (f", avg delta: {mean_delta:.3f}" if mean_delta is not None else "") + 
+        #       (f", avg dbf: {mean_dbf:.3f}" if mean_dbf is not None else "") +
+        #       (f", avg delta-delta: {mean_dd:.3f}" if mean_dd is not None else ""))
               
         # Helper function to calculate average of a similarity metric
         def calc_avg_similarity(metric_key):
@@ -601,7 +592,8 @@ class StatsLogger:
             sim_parts.append(f"tx_delta_sim: {mean_tx_delta_sim:.3f}")
             
         if sim_parts:
-            print(f"🟪 avg similarities: {', '.join(sim_parts)}")
+            # print(f"🟪 avg similarities: {', '.join(sim_parts)}")
+            pass
 
         mean_err = np.mean([np.mean([s['error'] for s in stats]) for stats in self.stats.values()])
 
@@ -613,17 +605,18 @@ class StatsLogger:
                     total_err_values.append(s['total_error'])
         mean_total_err = np.mean(total_err_values) if total_err_values else None
 
-        mean_rel_err = mean_err / mean_act if mean_act > 1e-8 else float('inf')
-        print(f"🟧 avg comp error: {mean_err:.3f}, avg rel err: {mean_rel_err:.1%}" + (f", avg total err: {mean_total_err:.3f}" if mean_total_err is not None else ", [total err not logged]"))
+        # print(f"🟧 avg comp error: {mean_err:.3f}, avg rel err: {mean_rel_err:.1%}" + (f", avg total err: {mean_total_err:.3f}" if mean_total_err is not None else ", [total err not logged]"))
+        pass
         from raylight.distributed_modules.attention.backends.fusion.utils import get_emoji
-        print(get_emoji())
+        # print(get_emoji())
+        pass
 
     def save_eigenvalues(self, save_dir="eigenvalues"):
         """
         Save profiled eigenvalues to a .pt file for each layer and each step.
         """
         if not self.eigenvalues:
-            print("No eigenvalue data available.")
+            # print("No eigenvalue data available.")
             return
 
         # Create a directory for saving eigenvalues
@@ -640,7 +633,8 @@ class StatsLogger:
                     # Save the eigenvalues as a PyTorch tensor
                     torch.save(eigenvalues, filepath)
 
-        print(f"Saved eigenvalues to {save_dir}")
+        # print(f"Saved eigenvalues to {save_dir}")
+        pass
 
     def plot_low_rank_factors(
         self,
@@ -703,7 +697,7 @@ def stats_clear():
 
 def stats_verbose(step_range=None, key=None, summary_keys=True):
     if _stats_logger is None:
-        print("No statistics logged.")
+        # print("No statistics logged.")
         return
     if summary_keys:
         _stats_logger.summary_over_keys(step_range, key)
@@ -734,7 +728,7 @@ def stats_verbose_steps(steps=None, keys=None):
         keys: List of layer keys to summarize (None for all)
     """
     if _stats_logger is None:
-        print("No statistics logged.")
+        # print("No statistics logged.")
         return
     _stats_logger.summary_over_steps(steps, keys)
 
@@ -751,7 +745,7 @@ def plot_eigenvalues(key=None, step=None, data_type='activation', save_dir=None,
         top_k: Number of top eigenvalues to plot (None for all)
     """
     if _stats_logger is None:
-        print("No statistics logged.")
+        # print("No statistics logged.")
         return
     if cum_sum:
         _stats_logger.plot_eigenvalue_cumsum(key, step, data_type, save_dir, log_scale, top_k)
@@ -763,7 +757,7 @@ def save_eigenvalues(save_dir="eigenvalues"):
     Global function to save profiled eigenvalues.
     """
     if _stats_logger is None:
-        print("No statistics logged.")
+        # print("No statistics logged.")
         return
     
     _stats_logger.save_eigenvalues(save_dir)
@@ -776,7 +770,7 @@ def dump_err_vs_steps(save_dir: str): # Renamed, save_dir mandatory
         save_dir: Directory to save the dumped data file.
     """
     if _stats_logger is None:
-        print("No statistics logged. Cannot dump data.")
+        # print("No statistics logged. Cannot dump data.")
         return
     _stats_logger.dump_average_error_vs_steps(save_dir) # Call renamed method
 
@@ -789,6 +783,6 @@ def dump_norms_sim_vs_steps(save_dir: str):
         save_dir: Directory to save the dumped data file.
     """
     if _stats_logger is None:
-        print("No statistics logged. Cannot dump data.")
+        # print("No statistics logged. Cannot dump data.")
         return
     _stats_logger.dump_average_norms_and_similarity_vs_steps(save_dir)

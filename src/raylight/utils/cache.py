@@ -40,9 +40,11 @@ class LRUStateCache:
         """
         if key in self._cache:
             self._cache.move_to_end(key)  # Mark as recently used
-            print(f"[LRUStateCache] Hit for key: {key} (size={len(self._cache)})")
+            # print(f"[LRUStateCache] Hit for key: {key} (size={len(self._cache)})")
+            pass
             return self._cache[key]
-        print(f"[LRUStateCache] Miss for key: {key}")
+        # print(f"[LRUStateCache] Miss for key: {key}")
+        pass
         return None
 
     def __getitem__(self, key: str) -> CachedState:
@@ -78,9 +80,11 @@ class LRUStateCache:
         else:
             if len(self._cache) >= self.max_size:
                 evicted_key, _ = self._cache.popitem(last=False)
-                print(f"[LRUStateCache] Evicted: {evicted_key}")
+                # print(f"[LRUStateCache] Evicted: {evicted_key}")
+                pass
             self._cache[key] = value
-            print(f"[LRUStateCache] Added key: {key} (size={len(self._cache)})")
+            # print(f"[LRUStateCache] Added key: {key} (size={len(self._cache)})")
+            pass
         
         return evicted_key
     

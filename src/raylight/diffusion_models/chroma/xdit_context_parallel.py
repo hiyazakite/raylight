@@ -59,7 +59,7 @@ def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
-def attention(q, k, v, pe, mask=None) -> Tensor:
+def attention(q, k, v, pe, mask=None, mod_idx=None, current_iter=None) -> Tensor:
     if pe is not None:
         q, k = apply_rope(q, k, pe)
 
@@ -69,7 +69,9 @@ def attention(q, k, v, pe, mask=None) -> Tensor:
         k,
         v,
         heads,
-        skip_reshape=True
+        skip_reshape=True,
+        mod_idx=mod_idx,
+        current_iter=current_iter,
     )
     return x
 
@@ -233,7 +235,9 @@ def usp_single_stream_forward(self, x: Tensor, pe: Tensor, vec: Tensor, attn_mas
     q, k = self.norm(q, k, v)
 
     # compute attention
-    attn = attention(q, k, v, pe=pe, mask=attn_mask)
+    from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
+    mod_idx = kwargs.get("block_index", None)
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, mod_idx=mod_idx, current_iter=compact_get_step())
     # compute activation in mlp stream, cat again and run second linear layer
     output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
     x.addcmul_(mod.gate, output)
@@ -258,11 +262,13 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: T
     txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
 
     # run actual attention
+    from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
+    mod_idx = kwargs.get("block_index", None)
     img_q, img_k = apply_rope(img_q, img_k, pe)
     attn = attention(torch.cat((txt_q, img_q), dim=1),
                      torch.cat((txt_k, img_k), dim=1),
                      torch.cat((txt_v, img_v), dim=1),
-                     pe=None, mask=attn_mask)
+                     pe=None, mask=attn_mask, mod_idx=mod_idx, current_iter=compact_get_step())
 
     txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 

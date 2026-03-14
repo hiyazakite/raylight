@@ -14,8 +14,8 @@ import logging
 from raylight.distributed_modules.attention.dispatcher import select_ring_attn_fn, prepare_ring_attn_kwargs
 
 try:
-    from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
-    get_profiler_scope = lambda x: Profiler.instance().scope(x)
+    from contextlib import nullcontext
+    get_profiler_scope = lambda x: nullcontext()
 except ImportError:
     from contextlib import nullcontext
     get_profiler_scope = lambda x: nullcontext()
@@ -139,25 +139,24 @@ class RaylightAttention(LongContextAttention):
         # Prof scope moved to top level for performance
 
         # Ulysses All2All
-        with get_profiler_scope("ulysses.all2all"):
-            if self.use_pack_qkv:
-                qkv = torch.cat([query, key, value]).contiguous()
-                qkv = SeqAllToAll4D.apply(
-                    self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx
-                )
-                assert qkv is not None
-                qkv_chunks = torch.chunk(qkv, 3, dim=0)
-                query_layer, key_layer, value_layer = qkv_chunks
-            else:
-                query_layer = SeqAllToAll4D.apply(
-                    self.ulysses_pg, query, self.scatter_idx, self.gather_idx
-                )
-                key_layer = SeqAllToAll4D.apply(
-                    self.ulysses_pg, key, self.scatter_idx, self.gather_idx
-                )
-                value_layer = SeqAllToAll4D.apply(
-                    self.ulysses_pg, value, self.scatter_idx, self.gather_idx
-                )
+        if self.use_pack_qkv:
+            qkv = torch.cat([query, key, value]).contiguous()
+            qkv = SeqAllToAll4D.apply(
+                self.ulysses_pg, qkv, self.scatter_idx, self.gather_idx
+            )
+            assert qkv is not None
+            qkv_chunks = torch.chunk(qkv, 3, dim=0)
+            query_layer, key_layer, value_layer = qkv_chunks
+        else:
+            query_layer = SeqAllToAll4D.apply(
+                self.ulysses_pg, query, self.scatter_idx, self.gather_idx
+            )
+            key_layer = SeqAllToAll4D.apply(
+                self.ulysses_pg, key, self.scatter_idx, self.gather_idx
+            )
+            value_layer = SeqAllToAll4D.apply(
+                self.ulysses_pg, value, self.scatter_idx, self.gather_idx
+            )
 
         # Use global counter for layer indexing. 
         # This supports "singleton" usage patterns where a single instance is reused.
@@ -213,10 +212,9 @@ class RaylightAttention(LongContextAttention):
             context_layer = out
 
         # Inverse Ulysses All2All
-        with get_profiler_scope("ulysses.all2all"):
-            output = SeqAllToAll4D.apply(
-                self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx
-            )
+        output = SeqAllToAll4D.apply(
+            self.ulysses_pg, context_layer, self.gather_idx, self.scatter_idx
+        )
 
         assert output is not None
         return output

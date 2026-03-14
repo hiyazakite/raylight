@@ -123,7 +123,6 @@ def prepare_ring_attn_kwargs(
     if is_compact:
         attn_kwargs["mod_idx"] = mod_idx
         attn_kwargs["current_iter"] = kwargs.get("current_iter", compact_get_step())
-        attn_kwargs["key_suffix"] = kwargs.get("key_suffix", "")
         attn_kwargs["mask"] = mask
     else:
         # standard xfuser ring or patched ring

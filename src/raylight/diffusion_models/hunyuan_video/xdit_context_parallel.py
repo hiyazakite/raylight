@@ -59,7 +59,8 @@ def usp_token_refiner_forward(self, x, c, mask, transformer_options={}):
     q, k, v = qkv.reshape(qkv.shape[0], qkv.shape[1], 3, self.heads, -1).permute(2, 0, 1, 3, 4)
     
     mod_idx = transformer_options.get("block_index")
-    attn = xfuser_optimized_attention(q, k, v, q.shape[2], skip_reshape=True, mod_idx=mod_idx)
+    from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
+    attn = xfuser_optimized_attention(q, k, v, q.shape[2], skip_reshape=True, mod_idx=mod_idx, current_iter=compact_get_step())
 
     x = x + self.self_attn.proj(attn) * mod1.unsqueeze(1)
     x = x + self.mlp(self.norm2(x)) * mod2.unsqueeze(1)
@@ -188,9 +189,11 @@ def usp_dit_forward(
     blocks_replace = patches_replace.get("dit", {})
     transformer_options["total_blocks"] = len(self.double_blocks)
     transformer_options["block_type"] = "double"
+    from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
+    current_iter = compact_get_step()
     for i, block in enumerate(self.double_blocks):
         transformer_options["block_index"] = i
-        if ("double_block", i) in blocks_replace:
+        transformer_options["current_iter"] = current_iter
             def block_wrap(args):
                 out = {}
                 out["img"],
@@ -244,9 +247,11 @@ def usp_dit_forward(
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     transformer_options["total_blocks"] = len(self.single_blocks)
     transformer_options["block_type"] = "single"
+    from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
+    current_iter = compact_get_step()
     for i, block in enumerate(self.single_blocks):
         transformer_options["block_index"] = i
-        if ("single_block", i) in blocks_replace:
+        transformer_options["current_iter"] = current_iter
             def block_wrap(args):
                 out = {}
                 out["img"] = block(args["img"],

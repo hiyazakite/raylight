@@ -52,7 +52,7 @@ def _compact_compress_fastpath(cache_key, x: torch.Tensor, compress_type: COMPAC
         )
     except AssertionError as e:
         msg = f"[CompactFusion] Error (key='{cache_key}'): {str(e)}"
-        print(msg)
+        # print(msg)
         raise AssertionError(msg) from e
     # q: (N, C//8), scale_u_nk: (N, K), scale_v_ck: (C, K), new_base: (N, C)
     if update_cache:

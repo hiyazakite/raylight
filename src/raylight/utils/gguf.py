@@ -13,10 +13,12 @@ def evict_page_cache(path):
             # POSIX_FADV_DONTNEED = 4 - tells kernel to evict pages from cache
             os.posix_fadvise(fd, 0, file_size, os.POSIX_FADV_DONTNEED)
             os.close(fd)
-            print(f"[Raylight] SUCCESS: Evicted {os.path.basename(path)} from page cache ({file_size / 1024**3:.2f} GB)")
+            # print(f"[Raylight] SUCCESS: Evicted {os.path.basename(path)} from page cache ({file_size / 1024**3:.2f} GB)")
+            pass
     except (OSError, AttributeError) as e:
         # posix_fadvise not available on all platforms
-        print(f"[Raylight] Note: Could not evict {os.path.basename(path)} from page cache: {e}")
+        # print(f"[Raylight] Note: Could not evict {os.path.basename(path)} from page cache: {e}")
+        pass
 
 def check_mmap_leak(path):
     """Checks /proc/self/maps to see if the file is still mapped."""
@@ -30,13 +32,16 @@ def check_mmap_leak(path):
         if path in maps:
             # Count occurrences
             count = maps.count(path)
-            print(f"[Raylight] WARNING: GGUF file is still mapped {count} times in memory: {path}")
+            # print(f"[Raylight] WARNING: GGUF file is still mapped {count} times in memory: {path}")
+            pass
             return True
         else:
-            print(f"[Raylight] SUCCESS: GGUF file is NOT mapped in memory (Clean Release): {path}")
+            # print(f"[Raylight] SUCCESS: GGUF file is NOT mapped in memory (Clean Release): {path}")
+            pass
             return False
     except Exception as e:
-        print(f"[Raylight] Failed to check maps: {e}")
+        # print(f"[Raylight] Failed to check maps: {e}")
+        pass
         return False
 
 

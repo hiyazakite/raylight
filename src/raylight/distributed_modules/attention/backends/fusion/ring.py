@@ -69,14 +69,14 @@ def compact_fwd(
     mod_idx=None,
     current_iter=None,
     mask=None,
-    key_suffix="",
 ):
     """
     Compact ring attention forward pass.
     """
     if _VERBOSE_ATTN:
         mask_info = f"Shape={mask.shape}" if mask is not None else "None"
-        print(f"📦 [Raylight] compact_fwd called (Layer: {mod_idx}, Iter: {current_iter}, mask={mask_info})")
+        # print(f"📦 [Raylight] compact_fwd called (Layer: {mod_idx}, Iter: {current_iter}, mask={mask_info})")
+        pass
     # Trust that higher-level logic (usp_dit_forward) has already 
     # stripped trivial masks to avoid GPU-CPU sync here.
     from xfuser.core.distributed import get_sequence_parallel_rank
@@ -90,13 +90,13 @@ def compact_fwd(
         return patch_gather_fwd(
             q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_attn_probs,
             deterministic, attn_layer, group, joint_tensor_key, joint_tensor_value, joint_strategy, mod_idx, current_iter,
-            mask=mask, key_suffix=key_suffix
+            mask=mask
         )
     else:
         return _compact_ring_fwd(
             q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, return_attn_probs,
             deterministic, attn_layer, group, joint_tensor_key, joint_tensor_value, joint_strategy, mod_idx, current_iter,
-            mask=mask, key_suffix=key_suffix
+            mask=mask
         )
 
 # env var USE_AWL
@@ -243,11 +243,11 @@ def _compact_ring_fwd(
     mod_idx=None,
     current_iter=None,
     mask=None,
-    key_suffix="",
 ):
     if _VERBOSE_ATTN:
         mask_info = f"Shape={mask.shape}" if mask is not None else "None"
-        print(f"🐳 [Raylight] _compact_ring_fwd loop (Layer: {mod_idx}, Step: {current_iter}, Q: {q.shape}, mask={mask_info})")
+        # print(f"🐳 [Raylight] _compact_ring_fwd loop (Layer: {mod_idx}, Step: {current_iter}, Q: {q.shape}, mask={mask_info})")
+        pass
     # (bs, seq_len, head_cnt, head_size)
     assert alibi_slopes is None
     if softmax_scale is None:
@@ -319,13 +319,13 @@ def _compact_ring_fwd(
     q_start = sp_rank * q_len
     # Pre-format base keys to avoid redundant f-string formatting in loops
     my_rank_mod = rank % world_size
-    k_my_cache_key = f"{mod_idx}-{my_rank_mod}-k{key_suffix}"
-    v_my_cache_key = f"{mod_idx}-{my_rank_mod}-v{key_suffix}"
+    k_my_cache_key = f"{mod_idx}-{my_rank_mod}-k"
+    v_my_cache_key = f"{mod_idx}-{my_rank_mod}-v"
     
     # Pre-calculate all recv_ranks and their cache keys
     recv_ranks = [(rank - s) % world_size for s in range(world_size)]
-    k_recv_keys = [f"{mod_idx}-{r}-k{key_suffix}" for r in recv_ranks]
-    v_recv_keys = [f"{mod_idx}-{r}-v{key_suffix}" for r in recv_ranks]
+    k_recv_keys = [f"{mod_idx}-{r}-k" for r in recv_ranks]
+    v_recv_keys = [f"{mod_idx}-{r}-v" for r in recv_ranks]
 
     original_k_shape = k.shape 
     original_v_shape = v.shape

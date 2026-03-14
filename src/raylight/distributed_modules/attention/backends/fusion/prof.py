@@ -9,8 +9,7 @@ class Profiler:
         self.enabled = False  # HARD DISABLED: Compact profiler is no longer used by request.
 
     def enable(self):
-        """Enable profiling - DEACTIVATED by request."""
-        # self.enabled = True 
+        """Enable profiling - COMPLETELY DISABLED."""
         pass
 
     def disable(self):
@@ -177,11 +176,7 @@ class Profiler:
         """
         Create a context manager for profiling a block of code.
         """
-        prof = Profiler.instance()
-        if not prof.enabled:
-            import contextlib
-            return contextlib.nullcontext()
-        return prof.ProfileContext(prof, name, stream, cpu)
+        return contextlib.nullcontext()
 
     @staticmethod
     def prof_func(name, cpu=False):
@@ -189,39 +184,14 @@ class Profiler:
         Decorator to profile a function using the CudaProfiler.
         """
         def decorator(func):
-            prof = Profiler.instance()
-            if not prof.enabled:
-                return func
-                
-            @functools.wraps(func)
-            def wrapper(*args, **kwargs):
-                # Start profiling
-                prof.start(name, cpu=cpu)
-                result = func(*args, **kwargs)
-                # Stop profiling
-                prof.stop(name, cpu=cpu)
-                return result
-            return wrapper
+            return func
         return decorator
 
 def prof_summary(profiler: Profiler, rank = None):
     """
-    prof result breakdown
+    prof result breakdown - SILENCED
     """
-    if rank is None:
-        rank='N/A'
-    total_times, avg_times = profiler.get_all_elapsed_times()
-    total_time, _ = profiler.elapsed_time('total')
-    split = "-" * 20
-    output_lines = []
-    output_lines.append(split)
-    output_lines.append(f"⚒️    Profiling Summary for Rank {rank}")
-    # sort by time
-    for key, total_times in sorted(total_times.items(), key=lambda item: item[1], reverse=True):
-        line = f"🔷 [Rank {rank}] [{key}] {total_times/1000:.2f}s {total_times/total_time:.2%} avg={avg_times[key]:.2f}ms"
-        output_lines.append(line)
-    output_lines.append(split)
-    return output_lines
+    return []
 
 
 _torch_profiler = None
