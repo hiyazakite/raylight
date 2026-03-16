@@ -440,11 +440,35 @@ class LazyTensorContext(ModelContext):
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path)
     
+    @staticmethod
+    def _make_pinned_cache(config: "WorkerConfig", model_path: str):
+        """Select shared or private pinned cache based on worker topology.
+
+        FSDP is excluded because each rank holds different shards.
+        All other multi-GPU modes (DP, xDiT) have identical full-weight
+        replicas — share one pinned buffer to save host RAM.
+        """
+        is_shared = config.global_world_size > 1 and not config.is_fsdp
+        if is_shared:
+            from raylight.distributed_modules.shared_pinned_param_cache import (
+                SharedPinnedParamCache, make_cache_id,
+            )
+            cache_id = make_cache_id(model_path)
+            is_writer = config.local_rank == 0
+            tag = "Writer" if is_writer else "Reader"
+            print(f"[LazyTensorContext] Shared pinned cache ({tag}): "
+                  f"{config.global_world_size} workers share 1 buffer.")
+            return SharedPinnedParamCache(cache_id=cache_id, is_writer=is_writer)
+        else:
+            from raylight.distributed_modules.pinned_param_cache import PinnedParamCache
+            return PinnedParamCache()
+
     def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None, **kwargs):
         """Instantiate model with lazy state dict (zero-copy until load)."""
         import comfy.sd
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
         from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
+        from raylight.comfy_dist.model_patcher import RaylightModelPatcher
         
         print("[LazyTensorContext] Wrapping state dict with LazySafetensors...")
         lazy_sd = wrap_state_dict_lazy(sd)
@@ -463,6 +487,15 @@ class LazyTensorContext(ModelContext):
             
         # Store mmap cache on the patcher for offload pointer-swapping
         model.mmap_cache = sd
+
+        # Upgrade to RaylightModelPatcher for pinned-cache-aware unpatch_model
+        model.__class__ = RaylightModelPatcher
+
+        # Attach pinned cache — shared for DP, private for single-GPU.
+        # Will be lazily built on first offload (params on CUDA after first forward).
+        model.pinned_param_cache = self._make_pinned_cache(config, state.unet_path)
+        print("[LazyTensorContext] Pinned param cache attached (will build on first offload).")
+
         return model
     
     def instantiate_model_with_fallback(self, sd: Dict, state: ModelState, config: "WorkerConfig"):
@@ -481,6 +514,8 @@ class LazyTensorContext(ModelContext):
             self._streaming_enabled = False  # Disable for future loads
         
         # Fallback: full clone (safe but higher RAM)
+        from raylight.comfy_dist.model_patcher import RaylightModelPatcher
+
         isolated = {k: v.clone() for k, v in sd.items()}
         
         load_options = state.model_options.copy()
@@ -493,7 +528,10 @@ class LazyTensorContext(ModelContext):
         
         if cast_dtype and hasattr(model, "model"):
             model.model.manual_cast_dtype = cast_dtype
-        
+
+        model.__class__ = RaylightModelPatcher
+        model.pinned_param_cache = self._make_pinned_cache(config, state.unet_path)
+
         return model
     
     def stream_to_device(self, model: Any, device: torch.device) -> bool:
@@ -526,65 +564,118 @@ class LazyTensorContext(ModelContext):
             return False
     
     def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig") -> bool:
-        """Pointer-swap offload: swap GPU tensors back to mmap refs (like GGUF)."""
+        """Fast pinned-RAM offload: cache CUDA params, free VRAM via storage resize.
+
+        Falls back to legacy mmap pointer-swap if no pinned cache is available.
+        """
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import swap_model_to_mmap
-         
-        if model is not None:
-            print(f"[LazyTensorContext {config.local_rank}] Soft-Offload: Performing Pointer Swap...")
-            
-            # 1. Clear LoRA GPU refs via manager
+
+        if model is None:
+            return False
+
+        pinned_cache = getattr(model, "pinned_param_cache", None)
+        diffusion_model = getattr(model, "model", None)
+
+        # --- Pinned-cache fast path ---
+        if pinned_cache is not None and diffusion_model is not None:
+            print(f"[LazyTensorContext {config.local_rank}] Pinned-RAM Offload: CUDA → pinned CPU...")
+
+            # 1. Clear LoRA GPU refs
             if lora_manager:
                 lora_manager.clear_gpu_refs(model, config)
-            
-            # 3. Unpatch first!
+
+            # 2. Unpatch LoRA weight patches (restores base weights)
             if hasattr(model, "unpatch_model"):
                 model.unpatch_model(device_to=None, unpatch_weights=True)
-            
-            # 4. Swap GPU tensors to mmap refs
-            mmap_cache = getattr(model, "mmap_cache", None)
-            diffusion_model = getattr(model, "model", None)
-            if diffusion_model is not None and mmap_cache:
-                swap_model_to_mmap(diffusion_model, mmap_cache)
-                
-                # Swapped GPU tensors back to mmap refs.
-                # No need to store back to worker_mmap_cache as ModelContext.load already manages
-                # the rich CachedState (checksum, metadata) in the cache.
-                pass
-            
+
+            # 3. Offload via pinned cache (lazy build + storage resize)
+            try:
+                pinned_cache.offload_to_cpu(diffusion_model)
+                # Drop mmap reference — pinned cache is now the sole reload source.
+                # Frees ~model_size of OS page cache RAM.
+                if hasattr(model, 'mmap_cache'):
+                    del model.mmap_cache
+            except Exception as e:
+                print(f"[LazyTensorContext {config.local_rank}] Pinned offload error: {e}")
+
             model.current_device = torch.device('cpu')
-            
-            # 5. Shared cleanup
-            self._common_offload_cleanup(model, lora_manager, config)
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            print(f"[LazyTensorContext {config.local_rank}] Soft-Offload Complete.")
-            
+
+            # 4. Clean up cached PE tensors and other non-param CUDA attributes
+            for target in (diffusion_model, getattr(diffusion_model, 'diffusion_model', None)):
+                if target is None:
+                    continue
+                for attr in ('_cached_pe', 'cached_pe', 'pe_cache', '_pe'):
+                    if hasattr(target, attr):
+                        delattr(target, attr)
+
+            if lora_manager:
+                lora_manager.clear_tracking()
+
+            from raylight.utils.common import cleanup_memory
+            cleanup_memory()
+
+            mem = torch.cuda.memory_allocated(config.device) / 1e9
+            print(f"[LazyTensorContext {config.local_rank}] Post-Offload VRAM: {mem:.2f} GB")
+            return False
+
+        # --- Legacy fallback: mmap pointer swap ---
+        print(f"[LazyTensorContext {config.local_rank}] Soft-Offload: Performing Pointer Swap (legacy)...")
+
+        if lora_manager:
+            lora_manager.clear_gpu_refs(model, config)
+
+        if hasattr(model, "unpatch_model"):
+            model.unpatch_model(device_to=None, unpatch_weights=True)
+
+        mmap_cache = getattr(model, "mmap_cache", None)
+        if diffusion_model is not None and mmap_cache:
+            swap_model_to_mmap(diffusion_model, mmap_cache)
+
+        model.current_device = torch.device('cpu')
+        self._common_offload_cleanup(model, lora_manager, config)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print(f"[LazyTensorContext {config.local_rank}] Soft-Offload Complete (legacy).")
         return False
 
     
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
-        """Hot reload: re-materialize from mmap refs to GPU (like GGUF)."""
-        print(f"[LazyTensorContext] Hot reload to {device}...")
-        
-        # Verify checksum if available
+        """Hot reload: restore from pinned RAM (fast) or mmap (legacy)."""
+        pinned_cache = getattr(model, "pinned_param_cache", None)
+        diffusion_model = getattr(model, "model", None)
+
+        # --- Pinned-cache fast path ---
+        if pinned_cache is not None and pinned_cache.built and diffusion_model is not None:
+            print(f"[LazyTensorContext] Pinned-RAM Hot-Reload: pinned CPU → CUDA...")
+            try:
+                pinned_cache.reload_to_cuda(diffusion_model)
+                if diffusion_model is not None:
+                    model.model.device = device
+                # Now call model.load() to re-apply LoRA patches, lowvram hooks, etc.
+                # Params are already on CUDA so move_weight_functions is essentially free.
+                if hasattr(model, 'load'):
+                    model.load(device)
+                model.current_device = device
+                print("[LazyTensorContext] Pinned-RAM Hot-Reload complete.")
+                return
+            except Exception as e:
+                print(f"[LazyTensorContext] Pinned-RAM reload failed: {e}, falling back to mmap...")
+
+        # --- Legacy fallback: mmap streaming ---
+        print(f"[LazyTensorContext] Hot reload to {device} (mmap)...")
+
         unet_path = getattr(model, "unet_path", None)
         if unet_path and unet_path in state_cache:
             cached = state_cache.get(unet_path)
-            
-            # Structured CachedState
             if isinstance(cached, CachedState) and cached.checksum:
-                if isinstance(model.mmap_cache, dict):
+                if isinstance(getattr(model, 'mmap_cache', None), dict):
                     verify_model_checksum(model.mmap_cache, cached.checksum, cached.metadata, context_tag="LazyTensorContext")
-        
-        # Model structure still exists, just reload weights to GPU
+
         if model is not None and hasattr(model, 'load'):
             model.load(device)
             model.current_device = device
-        else:
-            # Should have been handled by shared reload_if_needed logic for Full Reload
-            pass
 
 
 class FSDPContext(ModelContext):
