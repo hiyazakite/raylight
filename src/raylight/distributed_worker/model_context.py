@@ -385,7 +385,7 @@ class GGUFContext(ModelContext):
         from multiprocessing.shared_memory import SharedMemory
         import torch.distributed as dist
         from raylight.expansion.comfyui_gguf.ops import GGMLTensor
-        from raylight.distributed_modules.shared_pinned_param_cache import (
+        from raylight.distributed_modules.pinned_cache import (
             _align_up, _cuda_host_register, _ALIGNMENT,
         )
 
@@ -628,16 +628,23 @@ class GGUFContext(ModelContext):
         return False
     
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
-        """GGUF Hot-Reload: pinned mmap_cache → CUDA via DMA.
+        """GGUF Hot-Reload: fast path bypassing ``model.load()``.
 
-        ``model.load()`` reads from ``mmap_cache`` which was already swapped to
-        pinned RAM at load time.  ``patch_weight_to_device`` calls ``.to(device)``
-        on pinned tensors → async DMA, no page-faulting through mmap.
+        GGUF weights never live on CUDA — they dequantize on-the-fly during
+        forward via ``comfy_cast_weights`` hooks.  The standard ``model.load()``
+        is expensive because it runs ``_load_list()`` (iterates every module,
+        computes memory, sorts) then calls ``patch_weight_to_device`` per key —
+        all pure Python overhead with zero data movement.
+
+        This fast path re-enables the lowvram hooks in a single tight loop
+        over modules, then re-attaches LoRA ``.patches`` directly.
         """
         if model is None:
             return
 
-        print(f"[GGUFContext] Hot-loading to {device} (pinned DMA)...")
+        import time
+        t0 = time.perf_counter()
+        print(f"[GGUFContext] Hot-loading to {device} (fast path)...")
 
         # Restore GGUF ops configuration (class attrs may have been reset)
         if hasattr(model, "model_options"):
@@ -658,10 +665,85 @@ class GGUFContext(ModelContext):
                     print(f"[GGUFContext] Re-hydrating mmap_cache from cache")
                     model.mmap_cache = cached.state_dict
 
-        if hasattr(model, "load"):
-            model.load(device, force_patch_weights=True)
-            model.current_device = device
-            print(f"[GGUFContext] Hot-load complete.")
+        inner = getattr(model, "model", None)
+        if inner is None:
+            # Fallback to standard load if model structure is unexpected
+            if hasattr(model, "load"):
+                model.load(device, force_patch_weights=True)
+                model.current_device = device
+            print(f"[GGUFContext] Hot-load complete (fallback).")
+            return
+
+        # === FAST RELOAD: bypass model.load() ===
+        try:
+            self._fast_reload(model, inner, device)
+        except Exception as e:
+            print(f"[GGUFContext] Fast reload failed: {e}, falling back to model.load()...")
+            if hasattr(model, "load"):
+                model.load(device, force_patch_weights=True)
+
+        model.current_device = device
+        dt = (time.perf_counter() - t0) * 1000
+        print(f"[GGUFContext] Hot-load complete ({dt:.0f} ms).")
+
+    def _fast_reload(self, model: Any, inner: Any, device: torch.device):
+        """Fast-path internals: re-enable lowvram hooks + LoRA patches."""
+        from comfy.patcher_extension import CallbacksMP
+
+        with model.use_ejected():
+            model.unpatch_hooks()
+
+            force_cast = getattr(model, "force_cast_weights", False)
+            wrapper_patches = getattr(model, "weight_wrapper_patches", {})
+
+            # (1) Re-enable lowvram hooks on every castable module
+            for n, m in inner.named_modules():
+                if not hasattr(m, "comfy_cast_weights"):
+                    continue
+                # Initialise function lists (cleared by wipe_lowvram_weight)
+                m.weight_function = []
+                m.bias_function = []
+                m.comfy_force_cast_weights = force_cast
+                # Save + override cast flag
+                if not hasattr(m, "prev_comfy_cast_weights"):
+                    m.prev_comfy_cast_weights = m.comfy_cast_weights
+                m.comfy_cast_weights = True
+                m.comfy_patched_weights = True
+                # Re-attach any weight_wrapper_patches
+                wk = f"{n}.weight"
+                bk = f"{n}.bias"
+                if wk in wrapper_patches:
+                    m.weight_function.extend(wrapper_patches[wk])
+                if bk in wrapper_patches:
+                    m.bias_function.extend(wrapper_patches[bk])
+
+            # (2) Re-attach LoRA .patches to quantized GGMLTensors
+            patches = getattr(model, "patches", None)
+            if patches:
+                from raylight.expansion.comfyui_gguf.ops import move_patch_to_device
+                from raylight.expansion.comfyui_gguf.dequant import is_quantized
+                mmap_cache = getattr(model, "mmap_cache", {})
+                patch_dev = (model.load_device
+                             if getattr(model, "patch_on_device", False)
+                             else model.offload_device)
+                for key, patch_list in patches.items():
+                    w = mmap_cache.get(key)
+                    if w is not None and is_quantized(w):
+                        w.patches = [(move_patch_to_device(patch_list, patch_dev), key)]
+
+            # (3) Set model state flags
+            patches = getattr(model, "patches", None)
+            inner.model_lowvram = True
+            inner.device = device
+            inner.model_loaded_weight_memory = 0
+            inner.model_offload_buffer_memory = 0
+            inner.lowvram_patch_counter = len(patches) if patches else 0
+            inner.current_weight_patches_uuid = getattr(model, "patches_uuid", None)
+
+            # (4) ON_LOAD callbacks + forced hooks
+            for cb in model.get_all_callbacks(CallbacksMP.ON_LOAD):
+                cb(model, device, 0, False, False)
+            model.apply_hooks(getattr(model, "forced_hooks", None), force_apply=True)
 
 
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
@@ -698,7 +780,7 @@ class LazyTensorContext(ModelContext):
         """
         is_shared = config.global_world_size > 1 and not config.is_fsdp
         if is_shared:
-            from raylight.distributed_modules.shared_pinned_param_cache import (
+            from raylight.distributed_modules.pinned_cache import (
                 SharedPinnedParamCache, make_cache_id,
             )
             cache_id = make_cache_id(model_path)
@@ -708,7 +790,7 @@ class LazyTensorContext(ModelContext):
                   f"{config.global_world_size} workers share 1 buffer.")
             return SharedPinnedParamCache(cache_id=cache_id, is_writer=is_writer)
         else:
-            from raylight.distributed_modules.pinned_param_cache import PinnedParamCache
+            from raylight.distributed_modules.pinned_cache import PinnedParamCache
             return PinnedParamCache()
 
     def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None, **kwargs):
@@ -1060,7 +1142,7 @@ class FSDPContext(ModelContext):
         # (Building here would capture 0 shards for deferred-load models like Lightricks.)
         fsdp_cpu_offload = config.parallel_dict.get("fsdp_cpu_offload", False)
         if not fsdp_cpu_offload:
-            from raylight.distributed_modules.fsdp_shard_cache import FSDPShardPinnedCache
+            from raylight.distributed_modules.pinned_cache import FSDPShardPinnedCache
             model.fsdp_shard_cache = FSDPShardPinnedCache()
             print(f"[FSDPContext {config.local_rank}] Shard cache attached (will build on first offload).")
 
@@ -1137,11 +1219,17 @@ class FSDPContext(ModelContext):
                 # Restore device marker
                 if model.model is not None:
                     model.model.device = device
+                model.current_device = device
                 print("[FSDPContext] Hot-Reload complete.")
+                return
             except Exception as e:
-                print(f"[FSDPContext] Hot-Reload failed: {e}")
-        else:
-            print("[FSDPContext] Hot-Reload: no shard cache — full reload required.")
+                print(f"[FSDPContext] Hot-Reload failed: {e}, falling back to full reload...")
+
+        # Fallback: full model.load() from whatever state dict is available
+        print("[FSDPContext] Hot-Reload: no shard cache or pinned reload failed — full reload.")
+        if model is not None and hasattr(model, "load"):
+            model.load(device)
+            model.current_device = device
 
 
 class VAEContext(LazyTensorContext):
