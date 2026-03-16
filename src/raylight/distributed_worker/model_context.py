@@ -5,7 +5,7 @@ across different formats (GGUF, Safetensors, FSDP) with optional mmap caching.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional, TYPE_CHECKING
+from typing import Dict, Any, Optional, Tuple, TYPE_CHECKING
 import os
 
 import torch
@@ -247,7 +247,254 @@ class ModelContext(ABC):
 
 class GGUFContext(ModelContext):
     """Context for GGUF model loading with mmap support."""
-    
+
+    # ─── Pinned mmap_cache swap ──────────────────────────────
+
+    def load(self, state: ModelState, config: "WorkerConfig", state_cache: Any) -> Any:
+        """Override base load to pin mmap_cache for DMA-speed reloads.
+
+        After the base class sets ``model.mmap_cache = sd`` (mmap-backed),
+        we swap every tensor with a pinned-RAM copy.  All subsequent
+        ``model.load()`` / ``unpatch_model()`` read from pinned tensors,
+        so CUDA transfers use DMA instead of page-faulting through mmap.
+
+        For multi-GPU DP/xDiT the pinned copy lives in ``/dev/shm`` so
+        all workers share ONE host-RAM copy instead of N.
+        """
+        model = super().load(state, config, state_cache)
+
+        if model is not None and getattr(model, "mmap_cache", None):
+            pinned, shm_handle = self._pin_mmap_cache(
+                model.mmap_cache, config, state.unet_path
+            )
+            if pinned is not None:
+                model.mmap_cache = pinned
+                # Keep SharedMemory alive as long as model lives
+                # (torch.frombuffer views reference the buffer).
+                if shm_handle is not None:
+                    model._pinned_shm = shm_handle
+                # Replace mmap-backed sd in state_cache with the pinned
+                # dict so the OS can unmap the GGUF file.
+                cached = state_cache.get(state.cache_key)
+                if isinstance(cached, CachedState):
+                    cached.state_dict = pinned
+                # Replace model's own nn.Parameters with pinned copies.
+                # GGUF model.load() does NOT move quantised weights to GPU
+                # (they stay on CPU, dequantised on-the-fly during forward),
+                # so the original mmap-backed GGMLTensors set during
+                # instantiate_model remain as the model's parameters.
+                # Swapping them here removes the last mmap reference and
+                # lets the OS unmap the file.
+                self._swap_params_to_pinned(model, pinned)
+                print("[GGUFContext] mmap_cache swapped to pinned RAM.")
+
+        return model
+
+    @staticmethod
+    def _swap_params_to_pinned(model, pinned: Dict[str, torch.Tensor]) -> None:
+        """Replace mmap-backed model parameters with their pinned copies."""
+        import gc
+        import comfy.utils
+
+        diff_model = getattr(model, "model", None)
+        if diff_model is None:
+            return
+
+        # Build param name → param lookup once
+        param_dict = dict(diff_model.named_parameters())
+
+        swapped = 0
+        for key, pinned_tensor in pinned.items():
+            # sd keys may or may not have a 'diffusion_model.' prefix
+            for full_key in (key, f"diffusion_model.{key}"):
+                if full_key in param_dict:
+                    comfy.utils.set_attr_param(diff_model, full_key, pinned_tensor)
+                    swapped += 1
+                    break
+
+        if swapped > 0:
+            gc.collect()
+            print(f"[GGUFContext] Replaced {swapped}/{len(pinned)} model params with pinned tensors.")
+
+    @staticmethod
+    def _pin_mmap_cache(
+        mmap_cache: Dict[str, torch.Tensor],
+        config: "WorkerConfig",
+        model_path: str,
+    ) -> Tuple[Optional[Dict[str, torch.Tensor]], Any]:
+        """Replace mmap-backed tensors with pinned-RAM copies.
+
+        Returns ``(pinned_dict, shm_handle)``.  The caller must keep
+        ``shm_handle`` alive for as long as the pinned views are in use
+        (only non-None for the shared-memory multi-GPU path).
+
+        Single-GPU  → private ``pin_memory()`` per tensor.
+        Multi-GPU   → one shared ``/dev/shm`` buffer + ``cudaHostRegister``.
+        FSDP        → skip (shards differ across ranks).
+        """
+        is_shared = config.global_world_size > 1 and not config.is_fsdp
+        if is_shared:
+            return GGUFContext._pin_mmap_shared(mmap_cache, config, model_path)
+        else:
+            return GGUFContext._pin_mmap_private(mmap_cache), None
+
+    @staticmethod
+    def _pin_mmap_private(mmap_cache: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Single-GPU: ``clone().pin_memory()`` each tensor, wrap as GGMLTensor."""
+        from raylight.expansion.comfyui_gguf.ops import GGMLTensor
+
+        pinned: Dict[str, torch.Tensor] = {}
+        total_bytes = 0
+        for key, tensor in mmap_cache.items():
+            is_ggml = isinstance(tensor, GGMLTensor)
+            raw = tensor.as_subclass(torch.Tensor) if is_ggml else tensor
+            p = raw.clone().pin_memory()
+            total_bytes += p.nbytes
+            if is_ggml:
+                pinned[key] = GGMLTensor(
+                    p,
+                    tensor_type=tensor.tensor_type,
+                    tensor_shape=tensor.tensor_shape,
+                )
+            else:
+                pinned[key] = p
+        print(
+            f"[GGUFContext] Pinned mmap→RAM (private): "
+            f"{len(pinned)} tensors, {total_bytes / 1e9:.2f} GB"
+        )
+        return pinned
+
+    @staticmethod
+    def _pin_mmap_shared(
+        mmap_cache: Dict[str, torch.Tensor],
+        config: "WorkerConfig",
+        model_path: str,
+    ) -> Tuple[Dict[str, torch.Tensor], Any]:
+        """Multi-GPU shared: one ``/dev/shm`` buffer + ``cudaHostRegister``.
+
+        Returns ``(pinned_dict, shm_handle)``.
+
+        Rank 0 (writer) creates the segment and copies mmap data in.
+        Other ranks wait at a barrier, then attach and create views.
+        All ranks get a dict of pinned GGMLTensor views into the same
+        physical pages — N workers share 1× model-size of host RAM.
+        """
+        import ctypes
+        import hashlib
+        import time
+        from multiprocessing.shared_memory import SharedMemory
+        import torch.distributed as dist
+        from raylight.expansion.comfyui_gguf.ops import GGMLTensor
+        from raylight.distributed_modules.shared_pinned_param_cache import (
+            _align_up, _cuda_host_register, _ALIGNMENT,
+        )
+
+        is_writer = config.local_rank == 0
+        cache_id = hashlib.md5(model_path.encode()).hexdigest()[:16]
+        shm_name = f"raylight_gguf_{cache_id}"
+
+        # --- deterministic layout from sorted keys -----------------------
+        layout = []   # (key, offset, nbytes, storage_shape, dtype, tensor_type, tensor_shape)
+        offset = 0
+        for key in sorted(mmap_cache.keys()):
+            tensor = mmap_cache[key]
+            is_ggml = isinstance(tensor, GGMLTensor)
+            raw = tensor.as_subclass(torch.Tensor) if is_ggml else tensor
+            aligned = _align_up(offset)
+            nb = raw.nbytes
+            layout.append((
+                key, aligned, nb,
+                tuple(raw.shape), raw.dtype,
+                getattr(tensor, "tensor_type", None),
+                getattr(tensor, "tensor_shape", raw.shape),
+            ))
+            offset = aligned + nb
+        total_bytes = _align_up(offset)
+
+        if total_bytes == 0:
+            return mmap_cache, None  # nothing to pin
+
+        # --- writer: create + copy + register + barrier ------------------
+        if is_writer:
+            # Clean up stale segment
+            try:
+                old = SharedMemory(name=shm_name, create=False)
+                old.close(); old.unlink()
+            except FileNotFoundError:
+                pass
+
+            shm = SharedMemory(name=shm_name, create=True, size=total_bytes)
+            ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+            ok = _cuda_host_register(ptr, total_bytes)
+            if not ok:
+                print("[GGUFContext] WARNING: cudaHostRegister failed (DMA will use staging buffer).")
+
+            for key, off, nb, s_shape, dtype, tt, ts in layout:
+                src = mmap_cache[key]
+                raw = src.as_subclass(torch.Tensor) if isinstance(src, GGMLTensor) else src
+                dst = torch.frombuffer(memoryview(shm.buf)[off:off + nb], dtype=dtype).reshape(s_shape)
+                dst.copy_(raw)
+
+            if dist.is_initialized():
+                dist.barrier()
+
+            pinned: Dict[str, torch.Tensor] = {}
+            for key, off, nb, s_shape, dtype, tt, ts in layout:
+                view = torch.frombuffer(memoryview(shm.buf)[off:off + nb], dtype=dtype).reshape(s_shape)
+                if tt is not None:
+                    pinned[key] = GGMLTensor(view, tensor_type=tt, tensor_shape=ts)
+                else:
+                    pinned[key] = view
+
+            print(
+                f"[GGUFContext] Pinned mmap→shm (Writer): "
+                f"{len(pinned)} tensors, {total_bytes / 1e9:.2f} GB "
+                f"(shm={shm_name})"
+            )
+            return pinned, shm
+
+        # --- reader: barrier + attach + create views ---------------------
+        if dist.is_initialized():
+            dist.barrier()
+
+        retries = 50
+        for i in range(retries):
+            try:
+                shm = SharedMemory(name=shm_name, create=False)
+                break
+            except FileNotFoundError:
+                if i < retries - 1:
+                    time.sleep(0.2)
+        else:
+            raise RuntimeError(
+                f"[GGUFContext] Reader timed out waiting for shm '{shm_name}'"
+            )
+
+        if shm.size < total_bytes:
+            raise RuntimeError(
+                f"[GGUFContext] shm size mismatch: need {total_bytes}, got {shm.size}"
+            )
+
+        ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+        _cuda_host_register(ptr, total_bytes)
+
+        pinned = {}
+        for key, off, nb, s_shape, dtype, tt, ts in layout:
+            view = torch.frombuffer(memoryview(shm.buf)[off:off + nb], dtype=dtype).reshape(s_shape)
+            if tt is not None:
+                pinned[key] = GGMLTensor(view, tensor_type=tt, tensor_shape=ts)
+            else:
+                pinned[key] = view
+
+        print(
+            f"[GGUFContext] Pinned mmap→shm (Reader): "
+            f"{len(pinned)} tensors, {total_bytes / 1e9:.2f} GB "
+            f"(shm={shm_name})"
+        )
+        return pinned, shm
+
+    # ─── Disk loading ────────────────────────────────────────
+
     def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Any:
         from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader
         sd, extra = gguf_sd_loader(state.unet_path)
@@ -329,6 +576,7 @@ class GGUFContext(ModelContext):
         
         model = GGUFModelPatcher.clone(model)
         model.gguf_metadata = gguf_meta
+
         return model
     
 
@@ -356,64 +604,64 @@ class GGUFContext(ModelContext):
 
 
     def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
-        """GGUF Soft-Offload: Restore mmap pointers to clear VRAM without copies."""
-        if model is not None:
-            print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload: Performing Zero-Copy Pointer Swap...")
-            
-            # 1. Clear LoRA GPU refs via manager
-            if lora_manager:
-                lora_manager.clear_gpu_refs(model, config)
-            
-            # 2. Restore mmap pointers
-            model.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
-            model.current_device = torch.device('cpu')
-            
-            # 3. Shared cleanup
-            self._common_offload_cleanup(model, lora_manager, config)
-            print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload Complete.")
-            
+        """GGUF Soft-Offload via pointer swap.
+
+        Because mmap_cache was already swapped to pinned RAM at load time,
+        ``GGUFModelPatcher.unpatch_model()`` replaces CUDA params with the
+        pinned-backed ``mmap_cache`` entries.  Old CUDA tensors are GC'd,
+        VRAM is freed, and no extra host-RAM copy is needed.
+        """
+        if model is None:
+            return False
+
+        print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload: pointer swap to pinned mmap_cache...")
+
+        if lora_manager:
+            lora_manager.clear_gpu_refs(model, config)
+
+        model.unpatch_model(device_to=torch.device('cpu'), unpatch_weights=True)
+        model.current_device = torch.device('cpu')
+
+        self._common_offload_cleanup(model, lora_manager, config)
+        print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload Complete.")
+
         return False
     
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
+        """GGUF Hot-Reload: pinned mmap_cache → CUDA via DMA.
+
+        ``model.load()`` reads from ``mmap_cache`` which was already swapped to
+        pinned RAM at load time.  ``patch_weight_to_device`` calls ``.to(device)``
+        on pinned tensors → async DMA, no page-faulting through mmap.
+        """
         if model is None:
             return
-            
-        print(f"[GGUFContext] Hot-loading to {device}...")
 
-        # Restore GGUF ops configuration (Critical for performance!)
-        # The global class attributes on GGMLOps.Linear might have been lost/reset
+        print(f"[GGUFContext] Hot-loading to {device} (pinned DMA)...")
+
+        # Restore GGUF ops configuration (class attrs may have been reset)
         if hasattr(model, "model_options"):
             ops = model.model_options.get("custom_operations")
             if ops:
                 self._apply_ops_config(
-                    ops, 
-                    reload_params.get("dequant_dtype"), 
-                    reload_params.get("patch_dtype")
+                    ops,
+                    reload_params.get("dequant_dtype"),
+                    reload_params.get("patch_dtype"),
                 )
 
-
-        # Re-hydrate mmap_cache from worker cache if needed
-        unet_path = getattr(model, "unet_path", None)
-        
+        # Re-hydrate mmap_cache if somehow lost (safety net)
         if not getattr(model, "mmap_cache", None):
+            unet_path = getattr(model, "unet_path", None)
             if unet_path and unet_path in state_cache:
-                print(f"[GGUFContext] Re-hydrating mmap_cache from LRU cache: {os.path.basename(unet_path)}")
                 cached = state_cache.get(unet_path)
-                
-                # Structured CachedState hit
                 if isinstance(cached, CachedState):
+                    print(f"[GGUFContext] Re-hydrating mmap_cache from cache")
                     model.mmap_cache = cached.state_dict
-        
-        # ALWAYS Verify checksum if available in cache (ensure we didn't corrupt it)
-        if getattr(model, "mmap_cache", None) and unet_path and unet_path in state_cache:
-             cached = state_cache.get(unet_path)
-             if isinstance(cached, CachedState) and cached.checksum:
-                 if isinstance(model.mmap_cache, dict):
-                     verify_model_checksum(model.mmap_cache, cached.checksum, cached.metadata, context_tag="GGUFContext")
-        
+
         if hasattr(model, "load"):
             model.load(device, force_patch_weights=True)
             model.current_device = device
+            print(f"[GGUFContext] Hot-load complete.")
 
 
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
