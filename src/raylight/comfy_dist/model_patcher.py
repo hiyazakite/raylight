@@ -49,6 +49,102 @@ def wipe_lowvram_weight(m):
         m.bias_function = []
 
 
+class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
+    """Model patcher for non-FSDP flows with pinned-RAM offload support.
+
+    Overrides ``unpatch_model`` to use the pinned param cache instead of
+    ``model.to(cpu)`` when a cache is available.  This avoids crashing on
+    models whose CUDA storages have been resized to 0 by the cache, and
+    enables fast H2D reload via async pinned-memory copies.
+
+    Overrides ``load`` to auto-restore from pinned cache when storages have
+    been freed (safety net if Comfy's model management calls ``load`` without
+    going through ``LazyTensorContext.hot_load``).
+    """
+
+    def clone(self, *args, **kwargs):
+        n = super().clone(*args, **kwargs)
+        n.__class__ = RaylightModelPatcher
+        n.pinned_param_cache = getattr(self, "pinned_param_cache", None)
+        return n
+
+    # ------------------------------------------------------------------ load
+
+    def load(self, device_to=None, **kwargs):
+        """Auto-restore from pinned cache if storages were freed, then delegate."""
+        pinned_cache = getattr(self, "pinned_param_cache", None)
+        if (
+            pinned_cache is not None
+            and pinned_cache.built
+            and not pinned_cache.params_on_cuda
+        ):
+            logging.info("[RaylightModelPatcher] Auto-reloading from pinned cache before load()...")
+            pinned_cache.reload_to_cuda(self.model)
+        return super().load(device_to=device_to, **kwargs)
+
+    # ------------------------------------------------------------- unpatch
+
+    def unpatch_model(self, device_to=None, unpatch_weights=True):
+        if self.model is None:
+            return
+
+        self.eject_model()
+        if unpatch_weights:
+            self.unpatch_hooks()
+            self.unpin_all_weights()
+            if self.model.model_lowvram:
+                for m in self.model.modules():
+                    move_weight_functions(m, device_to)
+                    wipe_lowvram_weight(m)
+                self.model.model_lowvram = False
+                self.model.lowvram_patch_counter = 0
+
+            keys = list(self.backup.keys())
+            for k in keys:
+                bk = self.backup[k]
+                if bk.inplace_update:
+                    comfy.utils.copy_to_param(self.model, k, bk.weight)
+                else:
+                    comfy.utils.set_attr_param(self.model, k, bk.weight)
+
+            self.model.current_weight_patches_uuid = None
+            self.backup.clear()
+
+            if device_to is not None:
+                pinned_cache = getattr(self, "pinned_param_cache", None)
+                if (
+                    pinned_cache is not None
+                    and pinned_cache.built
+                    and pinned_cache.params_on_cuda
+                    and str(device_to) == "cpu"
+                ):
+                    # Use pinned cache to offload — do NOT call model.to(cpu)
+                    # which would crash on resized-to-0 storages or cause a
+                    # slow full-model CPU copy.
+                    try:
+                        pinned_cache.offload_to_cpu(self.model)
+                    except Exception as e:
+                        logging.warning(f"[RaylightModelPatcher] Pinned offload failed: {e}")
+                        # Fallback to normal move
+                        self.model.to(device_to)
+                    self.model.device = device_to
+                else:
+                    self.model.to(device_to)
+                    self.model.device = device_to
+
+            self.model.model_loaded_weight_memory = 0
+            self.model.model_offload_buffer_memory = 0
+
+            for m in self.model.modules():
+                if hasattr(m, "comfy_patched_weights"):
+                    del m.comfy_patched_weights
+
+        keys = list(self.object_patches_backup.keys())
+        for k in keys:
+            comfy.utils.set_attr(self.model, k, self.object_patches_backup[k])
+        self.object_patches_backup.clear()
+
+
 class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
     def __init__(
         self,
