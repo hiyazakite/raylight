@@ -64,25 +64,34 @@ def _align_up(offset: int, alignment: int = _ALIGNMENT) -> int:
 def _cuda_host_register(ptr: int, size: int) -> bool:
     """Pin existing host pages for CUDA DMA via ``cudaHostRegister``."""
     try:
+        # Ensure CUDA context exists (cudaHostRegister requires one).
+        if not torch.cuda.is_available():
+            return False
+        torch.cuda.current_device()  # lazily initializes CUDA
+
         cudart = torch.cuda.cudart()
         # cudaHostRegisterPortable = 1  (visible to all CUDA contexts)
-        err = cudart.cudaHostRegister(
-            ctypes.c_void_p(ptr), ctypes.c_size_t(size), ctypes.c_uint(1)
-        )
+        # pybind11 binding expects plain Python ints, NOT ctypes wrappers.
+        err = cudart.cudaHostRegister(int(ptr), int(size), int(1))
         if isinstance(err, tuple):
             err = err[0]
-        return err == 0
-    except Exception:
+        # err is a cudaError enum — compare by value, not identity.
+        ok = int(err) == 0
+        if not ok:
+            print(f"[SharedPinnedParamCache] cudaHostRegister returned error {err}")
+        return ok
+    except Exception as e:
+        print(f"[SharedPinnedParamCache] cudaHostRegister exception: {e}")
         return False
 
 
 def _cuda_host_unregister(ptr: int) -> bool:
     try:
         cudart = torch.cuda.cudart()
-        err = cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
+        err = cudart.cudaHostUnregister(int(ptr))
         if isinstance(err, tuple):
             err = err[0]
-        return err == 0
+        return int(err) == 0
     except Exception:
         return False
 
