@@ -714,39 +714,95 @@ class FSDPContext(ModelContext):
         
         # Mark as baked so RayWorker knows to reload on LoRA change
         model.is_fsdp_baked = True
+
+        # Attach an empty shard cache now; it will be built lazily on the first
+        # offload_to_cpu() call, after the first forward has triggered set_model_state_dict
+        # and all DTensor shards are guaranteed to be resident on CUDA.
+        # (Building here would capture 0 shards for deferred-load models like Lightricks.)
+        fsdp_cpu_offload = config.parallel_dict.get("fsdp_cpu_offload", False)
+        if not fsdp_cpu_offload:
+            from raylight.distributed_modules.fsdp_shard_cache import FSDPShardPinnedCache
+            model.fsdp_shard_cache = FSDPShardPinnedCache()
+            print(f"[FSDPContext {config.local_rank}] Shard cache attached (will build on first offload).")
+
         return model
-    
+
     def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig"):
         """
-        FSDP offload: release both model and state dict
-        FSDP requires full reload currently due to its nature (sharding)
+        FSDP soft offload: move per-rank local shards from CUDA to pinned CPU RAM, freeing
+        VRAM without destroying the FSDP-wrapped model structure.  On the next load the shards
+        are restored with a fast H2D memcpy — no collective communication, no disk I/O.
+
+        Falls back to hard offload (model destroyed) if no shard cache is available.
         """
-        print(f"[FSDPContext {config.local_rank}] FSDP Hard-Offload: Releasing all resources...")
-        
-        # 0. Clear GPU refs (weight_functions, patches) that might hold cyclic refs
-        if lora_manager:
-            lora_manager.clear_gpu_refs(model, config)
-        
-        if model is not None:
-            # Explicitly release DTensor/FSDP storage
-            if hasattr(model, "release_memory"):
+        shard_cache = getattr(model, "fsdp_shard_cache", None) if model is not None else None
+
+        if shard_cache is not None:
+            # offload_to_cpu() handles lazy build internally — do NOT gate on shard_cache.built
+            print(f"[FSDPContext {config.local_rank}] FSDP Soft-Offload: shards → pinned CPU RAM...")
+
+            # Clear weight_function handles so LoRA patches don't hold stale CUDA refs
+            if lora_manager:
+                lora_manager.clear_gpu_refs(model, config)
+
+            # Move every FSDP DTensor local shard CUDA → pinned RAM
+            try:
+                shard_cache.offload_to_cpu(model.model.diffusion_model)
+            except Exception as e:
+                print(f"[FSDPContext {config.local_rank}] Shard cache offload error: {e}")
+
+            # Update device marker so reload_if_needed knows to call hot_load
+            if model.model is not None:
+                model.model.device = torch.device("cpu")
+
+            if lora_manager:
+                lora_manager.clear_tracking()
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            mem = torch.cuda.memory_allocated(config.device) / 1e9
+            print(f"[FSDPContext {config.local_rank}] Post-Soft-Offload VRAM: {mem:.2f} GB")
+
+            return False  # soft offload — model object preserved for hot_load
+
+        else:
+            # No shard cache yet (first run was skipped or cache build failed)
+            # Fall back to the original hard-offload path.
+            print(f"[FSDPContext {config.local_rank}] FSDP Hard-Offload: no shard cache, releasing all resources...")
+
+            if lora_manager:
+                lora_manager.clear_gpu_refs(model, config)
+
+            if model is not None and hasattr(model, "release_memory"):
                 model.release_memory()
 
-        # 2. Trigger shared cleanup
-        self._common_offload_cleanup(model, lora_manager, config)
-        
-        # 4. Final VRAM flush
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-        return True
-    
+            self._common_offload_cleanup(model, lora_manager, config)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            return True
+
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
         """
-        FSDP requires full reload currently due to its nature (sharding)
+        Restore FSDP local shards from pinned CPU RAM back to CUDA.
+        Called by reload_if_needed when model.current_device != target_device.
+        No reshard, no collective communication — pure async H2D memcpy.
         """
-        # This shouldn't be reached if we follow reload_if_needed logic correctly for "None" model
-        pass
+        shard_cache = getattr(model, "fsdp_shard_cache", None)
+        if shard_cache is not None and shard_cache.built:
+            print("[FSDPContext] FSDP Hot-Reload: pinned CPU RAM → CUDA...")
+            try:
+                shard_cache.reload_to_cuda(model.model.diffusion_model)
+                # Restore device marker
+                if model.model is not None:
+                    model.model.device = device
+                print("[FSDPContext] Hot-Reload complete.")
+            except Exception as e:
+                print(f"[FSDPContext] Hot-Reload failed: {e}")
+        else:
+            print("[FSDPContext] Hot-Reload: no shard cache — full reload required.")
 
 
 class VAEContext(LazyTensorContext):

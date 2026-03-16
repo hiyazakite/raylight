@@ -1,3 +1,5 @@
+import os
+import torch.distributed as dist
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffload
 from raylight.distributed_modules.utils import align_model_to_cuda
 from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateDictOptions
@@ -5,8 +7,9 @@ from torch.distributed.checkpoint.state_dict import set_model_state_dict, StateD
 
 def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload, patcher=None):
     diffusion_model = model.diffusion_model
-    # Shard only the blocks, since other modules have different dtype
+    use_parallel_disk = os.environ.get("RAYLIGHT_FSDP_PARALLEL_LOAD", "1") == "1"
 
+    # Shard only the blocks, since other modules have different dtype
     for i, block in enumerate(diffusion_model.blocks):
         diffusion_model.blocks[i] = fully_shard(
             module=block,
@@ -20,7 +23,6 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload, patcher=None)
     model.diffusion_model = diffusion_model
 
     # Sync before loading
-    import torch.distributed as dist
     if dist.is_initialized():
         dist.barrier()
 
@@ -28,20 +30,22 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload, patcher=None)
     if not enable_cpu_offload:
         align_model_to_cuda(model)
 
-    # CPU OFFLOAD ONLY FOR LOW END OF THE LOWEND
     # If broadcast_from_rank0 is True, only rank 0 needs to load the state dict.
     # Other ranks can clear their local state dict to save massive amounts of RAM/VRAM.
-    if dist.is_initialized() and dist.get_rank() > 0:
-        model_state_dict.clear()
+    broadcast_from_rank0 = not use_parallel_disk
 
-    set_model_state_dict(
-        model=model,
-        model_state_dict=model_state_dict,
-        options=StateDictOptions(
-            full_state_dict=True,
-            broadcast_from_rank0=True,
-            cpu_offload=enable_cpu_offload
-        ),
-    )
+    if model_state_dict is not None:
+        if dist.is_initialized() and dist.get_rank() > 0 and broadcast_from_rank0:
+            model_state_dict.clear()
+
+        set_model_state_dict(
+            model=model,
+            model_state_dict=model_state_dict,
+            options=StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=broadcast_from_rank0,
+                cpu_offload=enable_cpu_offload
+            ),
+        )
 
     return model
