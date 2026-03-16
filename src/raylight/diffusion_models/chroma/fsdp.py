@@ -69,6 +69,7 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
     model.diffusion_model = diffusion_model
 
     # Sync before loading
+    import os
     import torch.distributed as dist
     if dist.is_initialized():
         dist.barrier()
@@ -79,17 +80,21 @@ def shard_model_fsdp2(model, model_state_dict, enable_cpu_offload):
 
     # If broadcast_from_rank0 is True, only rank 0 needs to load the state dict.
     # Other ranks can clear their local state dict to save massive amounts of RAM/VRAM.
-    if dist.is_initialized() and dist.get_rank() > 0:
-        model_state_dict.clear()
+    use_parallel_disk = os.environ.get("RAYLIGHT_FSDP_PARALLEL_LOAD", "1") == "1"
+    broadcast_from_rank0 = not use_parallel_disk
 
-    set_model_state_dict(
-        model=model,
-        model_state_dict=model_state_dict,
-        options=StateDictOptions(
-            full_state_dict=True,
-            broadcast_from_rank0=True,
-            cpu_offload=enable_cpu_offload
-        ),
-    )
+    if model_state_dict is not None:
+        if dist.is_initialized() and dist.get_rank() > 0 and broadcast_from_rank0:
+            model_state_dict.clear()
+
+        set_model_state_dict(
+            model=model,
+            model_state_dict=model_state_dict,
+            options=StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=broadcast_from_rank0,
+                cpu_offload=enable_cpu_offload
+            ),
+        )
 
     return model

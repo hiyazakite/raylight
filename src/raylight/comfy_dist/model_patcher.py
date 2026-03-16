@@ -122,6 +122,8 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         n.fsdp_state_dict = self.fsdp_state_dict
         n.device_mesh = self.device_mesh
         n.is_cpu_offload = self.is_cpu_offload
+        # Share the shard cache reference — both patcher instances back the same model
+        n.fsdp_shard_cache = getattr(self, "fsdp_shard_cache", None)
 
         return n
 
@@ -155,7 +157,24 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             if not isinstance(self.model.diffusion_model, FSDPModule) and not force_patch_weights:
                 self.patch_fsdp()
             else:
-                pass
+                # FSDP already wrapped — model was soft-offloaded to pinned CPU RAM.
+                # Restore shards via the cache (fast H2D), or fall back to align_model_to_cuda
+                # if no cache is present (e.g. cold start before first offload cycle).
+                # Skip entirely when CPUOffload is active — FSDP manages shard placement.
+                if not self.is_cpu_offload:
+                    shard_cache = getattr(self, "fsdp_shard_cache", None)
+                    if shard_cache is not None and shard_cache.built and not shard_cache.shards_on_cuda:
+                        try:
+                            shard_cache.reload_to_cuda(self.model.diffusion_model)
+                        except Exception as e:
+                            logging.warning(f"[FSDPModelPatcher] Shard cache reload failed: {e}")
+                    elif shard_cache is None or not shard_cache.built:
+                        # No cache yet — fall back to the legacy align helper
+                        from raylight.distributed_modules.utils import align_model_to_cuda
+                        try:
+                            align_model_to_cuda(self.model)
+                        except Exception as e:
+                            logging.warning(f"[FSDPModelPatcher] Could not realign FSDP shards to CUDA: {e}")
             self.unpatch_hooks()
             mem_counter = 0
             patch_counter = 0
@@ -302,6 +321,26 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
             if device_to is not None:
                 if next(model.parameters()).device == torch.device("meta"):
                     pass
+                elif isinstance(model.diffusion_model, FSDPModule):
+                    # CRITICAL: Do NOT call model.to(cpu) on an FSDP-wrapped model.
+                    # That would blindly move all DTensor local shards to CPU, causing
+                    # FSDP to all-gather from CPU on the next forward (only ~2.7 GB resident).
+                    #
+                    # Explicit offload (VAE needs VRAM): use the shard cache to move shards
+                    # to pinned CPU RAM efficiently, then free CUDA storage.
+                    # Implicit post-inference cleanup: shards stay on CUDA — no action needed.
+                    shard_cache = getattr(self, "fsdp_shard_cache", None)
+                    if (
+                        shard_cache is not None
+                        and shard_cache.built
+                        and shard_cache.shards_on_cuda
+                        and device_to is not None
+                        and str(device_to) == "cpu"
+                    ):
+                        try:
+                            shard_cache.offload_to_cpu(model.diffusion_model)
+                        except Exception as e:
+                            logging.warning(f"[FSDPModelPatcher] Shard cache offload failed: {e}")
                 else:
                     model.to(device_to)
                     model.device = device_to
