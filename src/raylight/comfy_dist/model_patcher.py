@@ -68,19 +68,99 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
         n.pinned_param_cache = getattr(self, "pinned_param_cache", None)
         return n
 
+    # ------------------------------------------------------- pin guard
+
+    def pin_weight_to_device(self, key):
+        """Skip ComfyUI's per-tensor cudaHostRegister when our cache already
+        covers the memory region.
+
+        ``SharedPinnedParamCache`` uses a single ``cudaHostRegister`` over the
+        entire ``/dev/shm`` segment, but ``tensor.is_pinned()`` still returns
+        ``False`` (only ``cudaHostAlloc`` sets that flag).  ComfyUI's
+        ``pin_memory()`` would then re-register the sub-region → CUDA error +
+        ``discard_cuda_async_error()`` sync on every offloaded module.
+
+        For ``PinnedParamCache`` the tensors are allocated with
+        ``pin_memory()`` so ``is_pinned()`` is True and ComfyUI's guard
+        already works — but we skip the call anyway to avoid the overhead.
+        """
+        pinned_cache = getattr(self, "pinned_param_cache", None)
+        if pinned_cache is not None and pinned_cache.built:
+            return  # already pinned / registered — nothing to do
+        super().pin_weight_to_device(key)
+
     # ------------------------------------------------------------------ load
 
     def load(self, device_to=None, **kwargs):
-        """Auto-restore from pinned cache if storages were freed, then delegate."""
+        """Auto-restore from pinned cache if storages were freed, then delegate.
+
+        Budget enforcement
+        ~~~~~~~~~~~~~~~~~~
+        ComfyUI's ``load_models_gpu`` → ``partially_load`` chain computes
+        its own VRAM budget from ``get_free_memory()`` and passes it as
+        ``lowvram_model_memory``.  On a GPU with lots of free VRAM this
+        value can exceed what the user requested via ``vram_limit_gb``.
+        We intercept here and cap the budget so the user's limit is
+        always honoured.
+
+        Auto-restore
+        ~~~~~~~~~~~~
+        When no lowvram budget is active, the pinned cache is used to
+        bulk-copy all weights back to CUDA before ``super().load()``
+        re-applies LoRA patches / hooks.
+        """
+        # ── Enforce user VRAM budget ──────────────────────────────────
+        vram_limit = getattr(self, "vram_limit_bytes", 0)
+        if vram_limit > 0 and device_to is not None:
+            try:
+                from raylight.distributed_worker.model_context import _compute_vram_budget
+                model_bytes = self.model_size()
+                budget = _compute_vram_budget(
+                    device_to, model_bytes, vram_limit_bytes=vram_limit,
+                )
+                if budget > 0:
+                    # Partial load required — cap whatever ComfyUI passed.
+                    incoming = kwargs.get("lowvram_model_memory", 0)
+                    if incoming == 0 or incoming > budget:
+                        kwargs["lowvram_model_memory"] = budget
+                    kwargs["full_load"] = False
+                    logging.info(
+                        "[RaylightModelPatcher] VRAM limit %.1f GB → "
+                        "weight budget capped to %.0f MB (was %.0f MB)",
+                        vram_limit / 1e9,
+                        budget / (1024 ** 2),
+                        incoming / (1024 ** 2),
+                    )
+            except Exception as e:
+                logging.warning(
+                    "[RaylightModelPatcher] Budget cap failed: %s", e,
+                )
+
+        # ── Auto-restore from pinned cache ────────────────────────────
+        # After offload_to_cpu(), CUDA storages are resized to 0 and
+        # param.data references the empty storage.  We must restore the
+        # data BEFORE super().load() tries to move modules around.
+        #
+        # Always bulk-copy to CUDA first.  If a partial-load budget is
+        # active super().load() will re-split: budget-worth stays on
+        # CUDA, the rest gets lowvram hooks — but starting from live
+        # CUDA tensors (fast) instead of zero-sized dead storages (crash).
         pinned_cache = getattr(self, "pinned_param_cache", None)
-        if (
-            pinned_cache is not None
-            and pinned_cache.built
-            and not pinned_cache.params_on_cuda
-        ):
-            logging.info("[RaylightModelPatcher] Auto-reloading from pinned cache before load()...")
+        skip_restore = getattr(self, "_skip_pinned_auto_restore", False)
+        if pinned_cache is not None and pinned_cache.built and not pinned_cache.params_on_cuda and not skip_restore:
+            logging.info("[RaylightModelPatcher] Auto-reloading from pinned cache (full → CUDA)...")
             pinned_cache.reload_to_cuda(self.model)
-        return super().load(device_to=device_to, **kwargs)
+
+        result = super().load(device_to=device_to, **kwargs)
+
+        # ── Update pinned cache CUDA flag ─────────────────────────────
+        # After super().load() finishes, some or all params are on CUDA.
+        # Keep the cache state consistent so the next offload works.
+        if pinned_cache is not None and pinned_cache.built:
+            if device_to is not None and str(device_to) != "cpu":
+                pinned_cache._on_cuda = True
+
+        return result
 
     # ------------------------------------------------------------- unpatch
 
@@ -115,18 +195,21 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
                 if (
                     pinned_cache is not None
                     and pinned_cache.built
-                    and pinned_cache.params_on_cuda
                     and str(device_to) == "cpu"
                 ):
-                    # Use pinned cache to offload — do NOT call model.to(cpu)
-                    # which would crash on resized-to-0 storages or cause a
-                    # slow full-model CPU copy.
-                    try:
-                        pinned_cache.offload_to_cpu(self.model)
-                    except Exception as e:
-                        logging.warning(f"[RaylightModelPatcher] Pinned offload failed: {e}")
-                        # Fallback to normal move
-                        self.model.to(device_to)
+                    if pinned_cache.params_on_cuda:
+                        # Use pinned cache to offload — do NOT call model.to(cpu)
+                        # which would crash on resized-to-0 storages or cause a
+                        # slow full-model CPU copy.
+                        try:
+                            pinned_cache.offload_to_cpu(self.model)
+                        except Exception as e:
+                            logging.warning(f"[RaylightModelPatcher] Pinned offload failed: {e}")
+                            # Fallback to normal move
+                            self.model.to(device_to)
+                    # else: already offloaded — CUDA storages are freed (size 0).
+                    # Do NOT call model.to(cpu) which would crash on zero-sized
+                    # CUDA storages left behind by offload_cuda_only / offload_to_cpu.
                     self.model.device = device_to
                 else:
                     self.model.to(device_to)
@@ -143,6 +226,14 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
         for k in keys:
             comfy.utils.set_attr(self.model, k, self.object_patches_backup[k])
         self.object_patches_backup.clear()
+
+    def __del__(self):
+        cache = getattr(self, "pinned_param_cache", None)
+        if cache is not None:
+            try:
+                cache.cleanup()
+            except Exception:
+                pass
 
 
 class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
