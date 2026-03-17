@@ -26,11 +26,75 @@ from .comfy_dist.utils import cancellable_get, clear_ray_cluster, get_ray_cluste
 from raylight.utils.memory import monitor_memory
 
 
-        
 try:
     import server
 except ImportError:
     server = None
+
+# ---------------------------------------------------------------------------
+# Global worker tracking + pinned-cache lifecycle
+# ---------------------------------------------------------------------------
+# The pinned RAM cache lives in host memory (/dev/shm or private pinned pages)
+# and is designed to survive VRAM unloads so that models can be hot-reloaded in
+# milliseconds.  We must NOT destroy it when ComfyUI calls unload_all_models()
+# — that function is about reclaiming VRAM, and ComfyUI's execution engine
+# calls it in several normal-operation scenarios (DISABLE_SMART_MEMORY, OOM
+# recovery, etc.).
+#
+# Pinned caches are released only when:
+#   1. Workers are being replaced (model change → _need_restart path in
+#      ray_worker._maybe_restart_actors releases caches before killing actors).
+#   2. The user explicitly requests it via release_all_pinned_caches() (exposed
+#      for future "deep clean" nodes or manual use).
+# ---------------------------------------------------------------------------
+_active_workers: list = []  # Current Ray actor handles (set by loader nodes)
+
+
+def _register_workers(gpu_actors: list):
+    """Store a reference to the current set of Ray worker actors."""
+    global _active_workers
+    _active_workers = list(gpu_actors)
+
+
+def release_all_pinned_caches():
+    """Tell every live Ray worker to free its pinned RAM cache.
+
+    This is intentionally NOT hooked into ComfyUI's unload_all_models.
+    Call it explicitly when workers are being torn down or a deep memory
+    cleanup is needed.
+    """
+    if not _active_workers:
+        return
+    futures = []
+    for actor in _active_workers:
+        try:
+            futures.append(actor.release_pinned_cache.remote())
+        except Exception:
+            pass  # actor may already be dead
+    if futures:
+        try:
+            ray.get(futures, timeout=30)
+        except Exception as e:
+            print(f"[Raylight] Pinned cache release warning: {e}")
+
+
+def _cleanup_stale_shm():
+    """Remove orphaned /dev/shm segments from previous Raylight sessions.
+
+    Safe to call only at startup before workers are created — it removes ALL
+    raylight shm segments, including any that might belong to a running session.
+    """
+    import glob
+    for pattern in ("/dev/shm/raylight_pc_*", "/dev/shm/raylight_vae_*"):
+        for f in glob.glob(pattern):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+# Run stale-shm cleanup once at import time (before any workers exist).
+_cleanup_stale_shm()
 
 # Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
 # since in FSDPModelPatcher mode, ray cannot pickle None type cause by getattr
@@ -76,7 +140,11 @@ def _ensure_runtime_workdir(module_dir: Path) -> Path:
 
 
 def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
-    python_path_entries = [str(repo_root)]
+    # For local clusters, avoid py_modules and working_dir entirely.
+    # py_modules triggers zipping/uploading the module (~5-10s),
+    # working_dir triggers hashing the directory tree (~2-5s).
+    # Instead, rely on PYTHONPATH so workers import directly from disk.
+    python_path_entries = [str(module_dir.parent), str(repo_root)]
     existing = os.environ.get('PYTHONPATH')
     if existing:
         python_path_entries.extend(part for part in existing.split(os.pathsep) if part)
@@ -91,10 +159,7 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
     }
 
     return {
-        'py_modules': [str(module_dir)],
-        'working_dir': str(runtime_workdir),
         'env_vars': env_vars,
-        'config': {'eager_install': False},  # Defer module install until actors spawn
     }
 
 
@@ -124,11 +189,35 @@ def _build_remote_runtime_env(module_dir: Path, repo_root: Path):
 _RAYLIGHT_MODULE_PATH = _resolve_module_dir(raylight)
 _COMFY_ROOT_PATH = _resolve_repo_root()
 _RAYLIGHT_RUNTIME_WORKDIR = _ensure_runtime_workdir(_RAYLIGHT_MODULE_PATH)
+
+# ---------------------------------------------------------------------------
+# CRITICAL: Set PYTHONPATH in os.environ BEFORE ray.init() so that ALL Ray
+# worker processes (forked by the Raylet) inherit it at startup and populate
+# sys.path correctly.  runtime_env.env_vars only sets os.environ on the
+# worker but does NOT update sys.path — Python reads PYTHONPATH once at
+# interpreter startup, and Ray reuses long-lived worker processes.
+# ---------------------------------------------------------------------------
+_python_path_entries = [str(_RAYLIGHT_MODULE_PATH.parent), str(_COMFY_ROOT_PATH)]
+_existing_pypath = os.environ.get('PYTHONPATH', '')
+if _existing_pypath:
+    _python_path_entries.extend(p for p in _existing_pypath.split(os.pathsep) if p)
+os.environ['PYTHONPATH'] = os.pathsep.join(dict.fromkeys(_python_path_entries))
+
 _RAY_RUNTIME_ENV_LOCAL = _build_local_runtime_env(
     _RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH, _RAYLIGHT_RUNTIME_WORKDIR
 )
 _RAY_RUNTIME_ENV_REMOTE = _build_remote_runtime_env(_RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH)
 _LOCAL_CLUSTER_ADDRESSES = {None, '', 'local', 'LOCAL'}
+
+# ---------------------------------------------------------------------------
+# Pre-set Ray env vars at import time so the head node itself boots faster.
+# These must be in the OS environment BEFORE ray.init() is called.
+# ---------------------------------------------------------------------------
+os.environ.setdefault('RAY_USAGE_STATS_ENABLED', '0')        # skip usage-stats phone-home
+os.environ.setdefault('RAY_enable_metrics_collection', '0')   # no Prometheus metrics agent
+os.environ.setdefault('RAY_METRICS_EXPORT_INTERVAL_MS', '0')  # fully disable metrics export
+os.environ.setdefault('RAY_DEDUP_LOGS', '0')                  # skip log deduplication
+os.environ.setdefault('PYTHON_GIL', '1')                      # silence PEP 703 warning
 
 
 class RayInitializer:
@@ -206,6 +295,13 @@ class RayInitializer:
                     "max": 100,
                     "tooltip": "Number of models to keep in mmap cache (NOT GB). Zero-copy, so high values are cheap."
                 }),
+                "vram_limit_gb": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 128.0,
+                    "step": 0.5,
+                    "tooltip": "Max VRAM (GB) per GPU for model weights. 0 = auto (use all available). Useful for sharing VRAM with other tasks or forcing CPU offload for large models."
+                }),
             }
         }
 
@@ -245,6 +341,7 @@ class RayInitializer:
         delta_compression: str = "BINARY",
         compact_warmup_steps: int = 1,
         ring_impl_type: str = "basic",
+        vram_limit_gb: float = 0.0,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # THIS IS PYTORCH DIST ADDRESS
@@ -315,6 +412,11 @@ class RayInitializer:
             self.parallel_dict["delta_compression"] = delta_compression
             self.parallel_dict["compact_warmup_steps"] = compact_warmup_steps
 
+            # VRAM budget limit (0 = auto)
+            if vram_limit_gb > 0:
+                self.parallel_dict["vram_limit_bytes"] = int(vram_limit_gb * (1024 ** 3))
+                print(f"[Raylight] VRAM limit set to {vram_limit_gb:.1f} GB per GPU.")
+
             if FSDP:
                 self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
                 self.parallel_dict["is_fsdp"] = True
@@ -378,6 +480,8 @@ class RayInitializer:
                         'dashboard_host': dashboard_host,
                         'dashboard_port': dashboard_port,
                         '_metrics_export_port': None,  # Disable metrics agent to avoid connection retries
+                        'configure_logging': False,     # Skip Ray's logging setup
+                        'logging_level': 'warning',     # Reduce log processing overhead
                     }
                     
                     # Only set object_store_memory if explicitly configured (not for reused clusters)
@@ -417,7 +521,10 @@ class RayInitializer:
             else:
                 # Default: 0, 1, 2, ...
                 ray_actors["gpu_indices"] = list(range(world_size))
-            
+
+            # Track workers for the unload hook (will be updated by loader nodes)
+            _register_workers(ray_actors["workers"])
+
             return ([ray_actors, ray_actor_fn],)
 
 
@@ -503,6 +610,13 @@ class RayInitializerAdvanced(RayInitializer):
                     "min": 1,
                     "max": 10,
                     "tooltip": "LRU cache size for mmap'd model state dicts."
+                }),
+                "vram_limit_gb": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 128.0,
+                    "step": 0.5,
+                    "tooltip": "Max VRAM (GB) per GPU for model weights. 0 = auto (use all available). Useful for sharing VRAM with other tasks or forcing CPU offload for large models."
                 }),
             }
         }
@@ -605,6 +719,9 @@ class RayUNETLoader:
                 print("[Raylight] Sequential CFG Patching...")
                 for actor in gpu_actors:
                     cancellable_get(actor.patch_cfg.remote())
+
+        # Track workers globally so the unload hook can reach them
+        _register_workers(gpu_actors)
 
         return (ray_actors,)
 

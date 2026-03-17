@@ -64,12 +64,20 @@ def align_model_to_cuda(model):
     if not torch.cuda.is_available():
         return
 
+    needs_sync = False
+
     # Move non-sharded parameters
     for p in model.parameters():
         if not isinstance(p, FlatParameter) and p.device.type != 'cuda':
-            p.data = p.to("cuda")
+            p.data = p.to("cuda", non_blocking=True)
+            needs_sync = True
 
     # Move all buffers
     for b in model.buffers():
         if b.device.type != 'cuda':
-            b.data = b.to("cuda")
+            b.data = b.to("cuda", non_blocking=True)
+            needs_sync = True
+
+    # Single sync point for all async H2D transfers
+    if needs_sync:
+        torch.cuda.synchronize()

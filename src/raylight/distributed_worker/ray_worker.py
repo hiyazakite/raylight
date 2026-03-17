@@ -99,6 +99,56 @@ class RayWorker:
         
         print(f"[RayWorker {self.local_rank}] Applied global monkey-patches.")
 
+        self._init_device_and_comms(local_rank)
+
+    # ------------------------------------------------------------------ cache
+
+    def _teardown_pinned_cache(self):
+        """Explicitly free all pinned RAM held by the current model's cache.
+
+        Called on: model switch, kill, error-triggered destruction.
+        Safe to call when no model / no cache is attached.
+        """
+        cache = getattr(self.model, "pinned_param_cache", None) if self.model else None
+        if cache is not None:
+            try:
+                cache.cleanup()
+            except Exception as e:
+                print(f"[RayWorker {self.local_rank}] Pinned cache cleanup error: {e}")
+
+    def release_pinned_cache(self):
+        """Public remote-callable wrapper: free pinned RAM on demand.
+
+        Called when workers are being torn down or an explicit deep cleanup
+        is requested.  After this call the model's parameters are empty
+        tensors, so ``is_model_loaded`` is set to False to force a full
+        reload from disk on the next invocation.
+        """
+        # Detach model params from pinned/shm tensors BEFORE cache cleanup.
+        # Otherwise the model's nn.Parameters still hold references into
+        # the shm buffer and prevent SharedMemory.close().
+        if self.model is not None:
+            diff_model = getattr(self.model, "model", None)
+            if diff_model is not None:
+                for p in diff_model.parameters():
+                    # Replace with a tiny empty tensor to release the shm view
+                    p.data = torch.empty(0, dtype=p.dtype, device="cpu")
+                for b in diff_model.buffers():
+                    b.data = torch.empty(0, dtype=b.dtype, device="cpu")
+        self._teardown_pinned_cache()
+        # Mark the model as NOT loaded so the next run does a full disk reload
+        # instead of trying to hot-load from the (now-empty) parameters.
+        self.is_model_loaded = False
+        import gc as _gc
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"[RayWorker {self.local_rank}] Pinned cache released via remote call.")
+
+    # ------------------------------------------------------------------ init (continued)
+
+    def _init_device_and_comms(self, local_rank):
+        """Second phase of __init__: device, process group, device mesh."""
         self.device = torch.device(f"cuda:{self.device_id}")
         self.device_mesh = None
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
@@ -145,7 +195,7 @@ class RayWorker:
             xfuser_attn.set_sync_ulysses(self.parallel_dict["sync_ulysses"])
             xfuser_attn.set_ring_impl_type(self.parallel_dict.get("ring_impl_type", "basic"))
 
-            self.cp_degree = self.parallel_dict["ulysses_degree"] * parallel_dict["ring_degree"]
+            self.cp_degree = self.parallel_dict["ulysses_degree"] * self.parallel_dict["ring_degree"]
             self.cfg_degree = self.parallel_dict["cfg_degree"]
             self.ulysses_degree = self.parallel_dict["ulysses_degree"]
             self.ring_degree = self.parallel_dict["ring_degree"]
@@ -242,6 +292,7 @@ class RayWorker:
         is_destroyed = ctx.offload(self.model, self.lora_manager, self.state_cache, self.config)
         if is_destroyed:
             print(f"[RayWorker {self.local_rank}] Model offload resulted in destruction. Clearing reference.")
+            self._teardown_pinned_cache()
             self.model = None
         else:
              # Soft offload, keep reference but mark current device as cpu (done by context)
@@ -268,18 +319,19 @@ class RayWorker:
                 try:
                     for name, buf in diffusion_model.named_buffers():
                         if buf is not None and buf.device.type == 'cuda':
-                            buf.data = buf.data.to('cpu')
+                            buf.data = buf.data.to('cpu', non_blocking=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                 except Exception as e:
                     print(f"[RayWorker {self.local_rank}] Buffer cleanup warning: {e}")
                 
                 # Delete cached PE tensors
+                inner = getattr(diffusion_model, 'diffusion_model', None)
                 for attr in ['_cached_pe', 'cached_pe', 'pe_cache', '_pe']:
                     if hasattr(diffusion_model, attr):
                         delattr(diffusion_model, attr)
-                    if hasattr(diffusion_model, 'diffusion_model'):
-                        inner = diffusion_model.diffusion_model
-                        if hasattr(inner, attr):
-                            delattr(inner, attr)
+                    if inner is not None and hasattr(inner, attr):
+                        delattr(inner, attr)
         
         # Force garbage collection and CUDA cleanup
         cleanup_memory()
@@ -373,12 +425,18 @@ class RayWorker:
         # OPTIMIZATION: Clear existing model before loading new one to prevent memory spike (2x weights)
         if self.model is not None:
             print(f"[RayWorker {self.local_rank}] Clearing previous model to free memory before reload...")
+            self._teardown_pinned_cache()
             self.model = None
             cleanup_memory()
         
         # FUNCTIONAL LOAD: Update references from return values
         self.model = ctx.load(state, self.config, self.state_cache)
         
+        # Stamp user VRAM limit on model for hot_load budget calculation
+        vram_limit = self.parallel_dict.get("vram_limit_bytes", 0)
+        if self.model is not None and vram_limit > 0:
+            self.model.vram_limit_bytes = vram_limit
+
         # Format flags and coordinating refs
         self.is_gguf = unet_path.lower().endswith(".gguf") or dequant_dtype is not None
         if self.is_gguf and self.model is not None and hasattr(self.model, "load"):
@@ -615,6 +673,7 @@ class RayWorker:
 
 
     def kill(self):
+        self._teardown_pinned_cache()
         self.model = None
         dist.destroy_process_group()
         ray.actor.exit_actor()
@@ -813,6 +872,17 @@ def make_ray_actor_fn(
         gpu_actor = ray.remote(RayWorker)
         gpu_actors = []
 
+        # Kill any stale actors left over from a previous session (crash, Ctrl+C, etc.)
+        # Collect all stale handles first, then kill in parallel.
+        stale_actors = []
+        for local_rank in range(world_size):
+            try:
+                stale_actors.append(ray.get_actor(f"RayWorker:{local_rank}"))
+            except ValueError:
+                pass  # No stale actor with this name — expected on clean start
+        for stale in stale_actors:
+            ray.kill(stale, no_restart=True)
+
         for local_rank in range(world_size):
             # Prepare runtime_env for backend config
             init_runtime_env = {}
@@ -881,16 +951,34 @@ def ensure_fresh_actors(ray_actors_init):
         needs_restart = True
 
     if needs_restart:
+        # Best-effort: release pinned caches before killing actors.
+        # If actors are dead/crashed this will simply fail silently.
+        release_refs = []
         for actor in gpu_actors:
             try:
-                # Fire and forget kill, then assume they're gone or will be
-                actor.kill.remote()
+                release_refs.append(actor.release_pinned_cache.remote())
             except Exception:
                 pass
-        
-        # Give Ray a moment to cleanup references before re-spawning
-        import time
-        time.sleep(1)
+        if release_refs:
+            try:
+                ray.get(release_refs, timeout=10)
+            except Exception:
+                pass
+
+        for actor in gpu_actors:
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+
+        # Clean up any orphaned /dev/shm segments that survived the kill
+        import glob
+        for pattern in ("/dev/shm/raylight_pc_*", "/dev/shm/raylight_vae_*"):
+            for f in glob.glob(pattern):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
         
         # Re-initialize using the factory function (which closure-captures the config)
         ray_actors = ray_actor_fn()

@@ -11,12 +11,12 @@ def compute_model_checksum(sd: Dict[str, Any], metadata: Optional[Dict[str, Any]
         String checksum signature
     """
     try:
-        keys = sorted(list(sd.keys()))
+        keys = sorted(sd.keys())
         if not keys:
             return "empty"
         
-        # Sample first, middle, last
-        indices = [0, len(keys)//2, len(keys)-1]
+        # Sample first, middle, last (deduplicated for small dicts)
+        indices = sorted(set([0, len(keys)//2, len(keys)-1]))
         checksum_parts = []
         for idx in indices:
             k = keys[idx]
@@ -28,15 +28,20 @@ def compute_model_checksum(sd: Dict[str, Any], metadata: Optional[Dict[str, Any]
                     meta += f":{v.tensor_type}"
                 
                 # Add small data sample (first value)
-                # Use .flatten()[0] to avoid shape issues, verify it's a tensor
+                # Use .view(-1) when contiguous to avoid full-tensor copy
                 if v.numel() > 0:
-                    val = v.flatten()[0].item() if not v.is_meta else 0
+                    if v.is_meta:
+                        val = 0
+                    elif v.is_contiguous():
+                        val = v.view(-1)[0].item()
+                    else:
+                        val = v.flatten()[0].item()
                     meta += f":{val:.4f}"
                 checksum_parts.append(meta)
         
         # Incorporate metadata keys if present
         if metadata:
-            meta_keys = sorted(list(metadata.keys()))
+            meta_keys = sorted(metadata.keys())
             # Hash the keys and a simplified representation of values
             meta_imp = f"|meta:{len(meta_keys)}"
             if meta_keys:

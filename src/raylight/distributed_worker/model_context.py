@@ -21,6 +21,66 @@ if TYPE_CHECKING:
     from .managers.lora_manager import LoraManager
 
 
+# ---------------------------------------------------------------------------
+# VRAM budget helpers
+# ---------------------------------------------------------------------------
+
+def _compute_vram_budget(
+    device: torch.device,
+    model_size: int,
+    min_inference_mem: Optional[int] = None,
+    vram_limit_bytes: int = 0,
+) -> int:
+    """Decide how much VRAM to allocate for model weights.
+
+    Uses the same heuristic as ComfyUI's ``load_models_gpu`` so the split
+    between CUDA-resident and CPU-offloaded modules stays consistent.
+
+    Parameters
+    ----------
+    vram_limit_bytes : int
+        Optional hard cap on VRAM for weights (from user setting).
+        0 = auto (use all available minus inference reserve).
+
+    Returns
+    -------
+    0
+        Model fits entirely in free VRAM → caller should do a full load.
+    >0
+        Partial budget in bytes → pass as ``lowvram_model_memory`` to
+        ``model.load()`` so ComfyUI puts only this much on CUDA and
+        streams the rest per-layer via ``comfy_cast_weights`` hooks.
+    """
+    if not torch.cuda.is_available():
+        return 0
+
+    # Mirror ComfyUI: minimum_inference_memory ≈ 0.8 GB + reserve_vram
+    if min_inference_mem is None:
+        try:
+            import comfy.model_management as _mm
+            min_inference_mem = int(_mm.minimum_inference_memory())
+        except Exception:
+            min_inference_mem = int(0.8 * (1024 ** 3))  # 0.8 GB fallback
+
+    free = torch.cuda.mem_get_info(device)[0]
+
+    # User-specified VRAM cap: treat as the effective "free" memory.
+    if vram_limit_bytes > 0:
+        effective_free = min(free, vram_limit_bytes)
+    else:
+        effective_free = free
+
+    # Comfortable headroom → full load
+    if model_size <= effective_free - min_inference_mem:
+        return 0
+
+    # Budget = effective free minus inference reserve (at least 1 byte to
+    # avoid the ``lowvram_model_memory=0`` path which ComfyUI treats as
+    # "load all as lowvram").
+    budget = max(1, effective_free - min_inference_mem)
+    return budget
+
+
 @dataclass
 class ModelState:
     """Immutable snapshot of model loading parameters."""
@@ -108,18 +168,21 @@ class ModelContext(ABC):
                     
                     for name, buf in diffusion_model.named_buffers():
                         if buf is not None and buf.device.type == 'cuda':
-                            buf.data = buf.data.to('cpu')
+                            buf.data = buf.data.to('cpu', non_blocking=True)
                 except Exception as e:
                     print(f"[RayWorker {config.local_rank}] Module/Buffer cleanup warning: {e}")
                 
+                # Sync any non_blocking transfers before proceeding
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
                 # Delete cached PE tensors
+                inner = getattr(diffusion_model, 'diffusion_model', None)
                 for attr in ['_cached_pe', 'cached_pe', 'pe_cache', '_pe']:
                     if hasattr(diffusion_model, attr):
                         delattr(diffusion_model, attr)
-                    if hasattr(diffusion_model, 'diffusion_model'):
-                        inner = diffusion_model.diffusion_model
-                        if hasattr(inner, attr):
-                            delattr(inner, attr)
+                    if inner is not None and hasattr(inner, attr):
+                        delattr(inner, attr)
         
         # Force garbage collection and CUDA cleanup
         from raylight.utils.common import cleanup_memory
@@ -340,7 +403,7 @@ class GGUFContext(ModelContext):
 
     @staticmethod
     def _pin_mmap_private(mmap_cache: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Single-GPU: ``clone().pin_memory()`` each tensor, wrap as GGMLTensor."""
+        """Single-GPU: pre-allocate pinned destination + copy once (no double-copy)."""
         from raylight.expansion.comfyui_gguf.ops import GGMLTensor
 
         pinned: Dict[str, torch.Tensor] = {}
@@ -348,7 +411,10 @@ class GGUFContext(ModelContext):
         for key, tensor in mmap_cache.items():
             is_ggml = isinstance(tensor, GGMLTensor)
             raw = tensor.as_subclass(torch.Tensor) if is_ggml else tensor
-            p = raw.clone().pin_memory()
+            # Pre-allocate pinned destination and copy directly — avoids
+            # clone() (pageable alloc) + pin_memory() (second alloc + copy).
+            p = torch.empty_like(raw).pin_memory()
+            p.copy_(raw)
             total_bytes += p.nbytes
             if is_ggml:
                 pinned[key] = GGMLTensor(
@@ -762,13 +828,22 @@ class LazyTensorContext(ModelContext):
         super().__init__(use_mmap)
         self._streaming_enabled = True  # Can be disabled if issues detected
     
-    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig") -> Dict:
+    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfig"):
         import safetensors.torch
-        return safetensors.torch.load_file(state.unet_path, device="cpu")
+        import safetensors
+        sd = safetensors.torch.load_file(state.unet_path, device="cpu")
+        # Read safetensors header metadata (needed for model variant detection,
+        # e.g. LTX 2.3 embeds {"config": {"transformer": {"cross_attention_adaln": true}}})
+        try:
+            with safetensors.safe_open(state.unet_path, framework="pt") as f:
+                metadata = f.metadata() or {}
+        except Exception:
+            metadata = {}
+        return sd, metadata
     
-    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig") -> Dict:
+    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfig"):
         import comfy.utils
-        return comfy.utils.load_torch_file(state.unet_path)
+        return comfy.utils.load_torch_file(state.unet_path, return_metadata=True)
     
     @staticmethod
     def _make_pinned_cache(config: "WorkerConfig", model_path: str):
@@ -807,7 +882,9 @@ class LazyTensorContext(ModelContext):
         cast_dtype = load_options.pop("dtype", None)
         load_options["custom_operations"] = SafetensorOps
         
-        model = comfy.sd.load_diffusion_model_state_dict(lazy_sd, model_options=load_options)
+        model = comfy.sd.load_diffusion_model_state_dict(
+            lazy_sd, model_options=load_options, metadata=metadata,
+        )
         
         if model is None:
             raise RuntimeError(f"Could not load model: {state.unet_path}")
@@ -893,6 +970,66 @@ class LazyTensorContext(ModelContext):
                 model.model.to(device)
             return False
     
+    @staticmethod
+    def _fast_reload_full(model, inner, device):
+        """Bypass model.load() after reload_to_cuda — params already on CUDA.
+
+        model.load() spends most of its time in ``_load_list()`` (iterates
+        every module, computes sizes, sorts) then calls per-module ``.to()``
+        + ``torch.cuda.synchronize()`` for each.  All of that is wasted
+        when the pinned cache already DMA'd everything to CUDA.
+
+        This fast path re-applies LoRA patches and hooks directly, mirroring
+        what GGUFContext._fast_reload does for GGUF models.
+        """
+        from comfy.patcher_extension import CallbacksMP
+
+        with model.use_ejected():
+            model.unpatch_hooks()
+
+            patches = getattr(model, "patches", {})
+            wrapper_patches = getattr(model, "weight_wrapper_patches", {})
+            force_cast = getattr(model, "force_cast_weights", False)
+
+            # (1) Re-apply LoRA / weight patches to CUDA params.
+            if patches:
+                for key in patches:
+                    model.patch_weight_to_device(key, device_to=device)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+            # (2) Mark all modules as patched (prevents model.load from
+            #     re-doing work if something later calls it).
+            for n, m in inner.named_modules():
+                if hasattr(m, "comfy_cast_weights"):
+                    if not hasattr(m, "prev_comfy_cast_weights"):
+                        m.prev_comfy_cast_weights = m.comfy_cast_weights
+                    m.comfy_force_cast_weights = force_cast
+                    # Reset + re-attach wrapper patches (reset avoids
+                    # duplicates on repeated reloads).
+                    wk = f"{n}.weight"
+                    bk = f"{n}.bias"
+                    m.weight_function = list(wrapper_patches.get(wk, []))
+                    m.bias_function = list(wrapper_patches.get(bk, []))
+                m.comfy_patched_weights = True
+
+            # (3) Set model state flags
+            inner.model_lowvram = False
+            inner.device = device
+            inner.model_loaded_weight_memory = sum(
+                p.nbytes for p in inner.parameters()
+            )
+            inner.model_offload_buffer_memory = 0
+            inner.lowvram_patch_counter = 0
+            inner.current_weight_patches_uuid = getattr(model, "patches_uuid", None)
+
+            # (4) ON_LOAD callbacks + forced hooks
+            for cb in model.get_all_callbacks(CallbacksMP.ON_LOAD):
+                cb(model, device, 0, False, True)
+            model.apply_hooks(getattr(model, "forced_hooks", None), force_apply=True)
+
+        model.inject_model()
+
     def offload(self, model: Any, lora_manager: Optional["LoraManager"], worker_mmap_cache: Any, config: "WorkerConfig") -> bool:
         """Fast pinned-RAM offload: cache CUDA params, free VRAM via storage resize.
 
@@ -910,6 +1047,9 @@ class LazyTensorContext(ModelContext):
         if pinned_cache is not None and diffusion_model is not None:
             print(f"[LazyTensorContext {config.local_rank}] Pinned-RAM Offload: CUDA → pinned CPU...")
 
+            # Capture partial-load flag BEFORE unpatch_model clears it.
+            is_partial = getattr(diffusion_model, "model_lowvram", False)
+
             # 1. Clear LoRA GPU refs
             if lora_manager:
                 lora_manager.clear_gpu_refs(model, config)
@@ -919,8 +1059,13 @@ class LazyTensorContext(ModelContext):
                 model.unpatch_model(device_to=None, unpatch_weights=True)
 
             # 3. Offload via pinned cache (lazy build + storage resize)
+            #    If model was partially loaded (lowvram), only snapshot the
+            #    CUDA-resident params — the CPU ones never left pinned RAM.
             try:
-                pinned_cache.offload_to_cpu(diffusion_model)
+                if is_partial:
+                    pinned_cache.offload_cuda_only(diffusion_model)
+                else:
+                    pinned_cache.offload_to_cpu(diffusion_model)
                 # Drop mmap reference — pinned cache is now the sole reload source.
                 # Frees ~model_size of OS page cache RAM.
                 if hasattr(model, 'mmap_cache'):
@@ -972,26 +1117,111 @@ class LazyTensorContext(ModelContext):
 
     
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
-        """Hot reload: restore from pinned RAM (fast) or mmap (legacy)."""
+        """Hot reload: restore from pinned RAM (fast) or mmap (legacy).
+
+        Budget-aware: if the model does not fit entirely in VRAM the
+        pinned-cache path keeps CPU-resident params in pinned RAM and
+        passes ``lowvram_model_memory`` to ``model.load()`` so ComfyUI
+        splits modules into CUDA-resident vs streamed-per-layer.
+        """
         pinned_cache = getattr(model, "pinned_param_cache", None)
         diffusion_model = getattr(model, "model", None)
 
+        # --- Eagerly build cache if not built yet (first run) ---
+        # When the model was just loaded (params on CPU, cache empty),
+        # build now so the budget-aware path can use it immediately.
+        if (
+            pinned_cache is not None
+            and not pinned_cache.built
+            and diffusion_model is not None
+        ):
+            print("[LazyTensorContext] Building pinned cache from CPU params...")
+            try:
+                pinned_cache.build(diffusion_model)
+                # Params now point at shm views.  Drop the original CPU
+                # state-dict references so the ~model-size heap copy is GC'd.
+                if hasattr(model, 'mmap_cache'):
+                    del model.mmap_cache
+                if state_cache is not None:
+                    unet_path = getattr(model, 'unet_path', None)
+                    if unet_path:
+                        cached = state_cache.get(unet_path)
+                        if cached is not None and hasattr(cached, 'state_dict'):
+                            cached.state_dict = None
+            except Exception as e:
+                print(f"[LazyTensorContext] Eager cache build failed: {e}")
+
         # --- Pinned-cache fast path ---
         if pinned_cache is not None and pinned_cache.built and diffusion_model is not None:
-            print(f"[LazyTensorContext] Pinned-RAM Hot-Reload: pinned CPU → CUDA...")
-            try:
-                pinned_cache.reload_to_cuda(diffusion_model)
-                if diffusion_model is not None:
-                    model.model.device = device
-                # Now call model.load() to re-apply LoRA patches, lowvram hooks, etc.
-                # Params are already on CUDA so move_weight_functions is essentially free.
-                if hasattr(model, 'load'):
-                    model.load(device)
-                model.current_device = device
-                print("[LazyTensorContext] Pinned-RAM Hot-Reload complete.")
-                return
-            except Exception as e:
-                print(f"[LazyTensorContext] Pinned-RAM reload failed: {e}, falling back to mmap...")
+            vram_limit = getattr(model, "vram_limit_bytes", 0)
+            model_bytes = model.model_size() if hasattr(model, "model_size") else 0
+            budget = _compute_vram_budget(device, model_bytes, vram_limit_bytes=vram_limit) if model_bytes > 0 else 0
+
+            if budget == 0:
+                # ── FULL CUDA: model fits in VRAM ──
+                import time as _time
+                t0 = _time.perf_counter()
+                print(f"[LazyTensorContext] Pinned-RAM Hot-Reload (full): pinned CPU → CUDA...")
+                try:
+                    pinned_cache.reload_to_cuda(diffusion_model)
+                    diffusion_model.device = device
+
+                    # Fast path: bypass model.load() entirely.
+                    # model.load() runs _load_list() (pure-Python iteration
+                    # over every module + sort) then per-module .to(device) +
+                    # synchronize — all wasted when params are already on CUDA.
+                    # Instead, directly re-apply LoRA patches + hooks.
+                    self._fast_reload_full(model, diffusion_model, device)
+
+                    model.current_device = device
+                    dt = (_time.perf_counter() - t0) * 1000
+                    print(f"[LazyTensorContext] Pinned-RAM Hot-Reload (full) complete ({dt:.0f} ms).")
+                    return
+                except Exception as e:
+                    print(f"[LazyTensorContext] Pinned-RAM full reload failed: {e}, falling back to model.load()...")
+                    try:
+                        if hasattr(model, 'load'):
+                            model.load(device)
+                        model.current_device = device
+                        return
+                    except Exception as e2:
+                        print(f"[LazyTensorContext] model.load() fallback also failed: {e2}, trying mmap...")
+            else:
+                # ── PARTIAL CUDA: model exceeds VRAM ──
+                # Do NOT bulk-copy to CUDA.  Let model.load() decide which
+                # modules fit: those that do get DMA'd from pinned RAM,
+                # the rest stay pinned and are streamed per-layer via
+                # comfy_cast_weights hooks (also DMA from pinned → fast).
+                budget_mb = budget / (1024 ** 2)
+                model_mb = model_bytes / (1024 ** 2)
+                print(
+                    f"[LazyTensorContext] Pinned-RAM Hot-Reload (partial): "
+                    f"model {model_mb:.0f} MB, VRAM budget {budget_mb:.0f} MB — "
+                    f"streaming overflow from pinned RAM..."
+                )
+                try:
+                    # Ensure params are on CPU in pinned RAM (they should
+                    # already be after offload, but guard against edge cases).
+                    pinned_cache.reload_to_cpu(diffusion_model)
+                    if diffusion_model is not None:
+                        model.model.device = torch.device("cpu")
+                    # Let ComfyUI split: budget-worth → CUDA, rest → LowVramPatch hooks.
+                    # Skip auto-restore in RaylightModelPatcher.load() — we already
+                    # placed params on CPU pinned RAM; super().load() will DMA only
+                    # the budget-worth of modules to CUDA (efficient).
+                    if hasattr(model, 'load'):
+                        model._skip_pinned_auto_restore = True
+                        try:
+                            model.load(device, lowvram_model_memory=budget)
+                        finally:
+                            model._skip_pinned_auto_restore = False
+                    model.current_device = device
+                    # Some params are now on CUDA — update cache state.
+                    pinned_cache._on_cuda = True
+                    print("[LazyTensorContext] Pinned-RAM Hot-Reload (partial) complete.")
+                    return
+                except Exception as e:
+                    print(f"[LazyTensorContext] Pinned-RAM partial reload failed: {e}, falling back to mmap...")
 
         # --- Legacy fallback: mmap streaming ---
         print(f"[LazyTensorContext] Hot reload to {device} (mmap)...")

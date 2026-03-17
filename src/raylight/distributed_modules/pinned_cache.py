@@ -108,16 +108,12 @@ def _compute_layout(
     offset = 0
 
     for name, param in module.named_parameters():
-        if param.device.type != "cuda":
-            continue
         aligned = _align_up(offset)
         nb = param.data.nbytes
         param_layout.append((name, aligned, nb, param.data.shape, param.data.dtype))
         offset = aligned + nb
 
     for name, buf in module.named_buffers():
-        if buf.device.type != "cuda":
-            continue
         aligned = _align_up(offset)
         nb = buf.data.nbytes
         buffer_layout.append((name, aligned, nb, buf.data.shape, buf.data.dtype))
@@ -179,7 +175,10 @@ class BasePinnedCache(ABC):
             return
         self._do_build(module)
         self._built = True
-        self._on_cuda = True
+        # Detect actual state: if ANY param is on CUDA, treat as on-CUDA.
+        self._on_cuda = any(
+            p.device.type == "cuda" for p in module.parameters()
+        )
 
     def offload_to_cpu(
         self,
@@ -219,6 +218,83 @@ class BasePinnedCache(ABC):
             f"{len(self._freed_storages)} CUDA storages ({freed_gb:.2f} GB)."
         )
         return offloaded
+
+    def offload_cuda_only(
+        self,
+        module: torch.nn.Module,
+        non_blocking: bool = True,
+    ) -> int:
+        """Selective offload: snapshot only CUDA-resident params, free their VRAM.
+
+        Used after a *partial* CUDA load where ``model.load(lowvram_model_memory=N)``
+        moved some modules to CUDA and left the rest on pinned CPU.  This method:
+
+        1. Copies CUDA-resident params back to pinned cache (refresh).
+        2. Frees the corresponding CUDA storages.
+        3. Leaves CPU-resident params untouched — they never left pinned RAM.
+
+        After this call the model is fully on (pinned) CPU, ready for the
+        next ``reload_to_cpu`` → ``model.load(lowvram_model_memory=…)`` cycle.
+        """
+        if not self._built:
+            print(f"[{self._tag}] First offload — building cache now...")
+            self.build(module)
+
+        freed_ptrs: set = set()
+        self._freed_storages = []
+
+        cuda_count, cpu_count = self._snapshot_cuda_only(
+            module, non_blocking, freed_ptrs
+        )
+
+        # Sync D2H copies BEFORE freeing storages
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        self._pre_free_hook()
+
+        # Free CUDA storages that were on GPU
+        for s, _ in self._freed_storages:
+            s.resize_(0)
+
+        torch.cuda.empty_cache()
+        self._on_cuda = False
+
+        freed_gb = sum(nb for _, nb in self._freed_storages) / 1e9
+        print(
+            f"[{self._tag}] Selective offload: {cuda_count} CUDA params saved + freed "
+            f"({freed_gb:.2f} GB), {cpu_count} CPU params untouched."
+        )
+        return cuda_count
+
+    def reload_to_cpu(
+        self,
+        module: torch.nn.Module,
+    ) -> int:
+        """Restore params from pinned cache to CPU tensors (no CUDA alloc).
+
+        After ``offload_to_cpu`` the model's param storages are zeroed.
+        This replaces each param's ``.data`` with the corresponding pinned
+        CPU tensor so that a subsequent ``model.load(device, lowvram_model_memory=N)``
+        can DMA only the budget-worth of modules to CUDA and leave the
+        rest in pinned RAM for per-layer streaming.
+
+        Unlike ``reload_to_cuda`` this does NOT restore CUDA storages;
+        ``_freed_storages`` is cleared because ``model.load()`` will create
+        fresh CUDA tensors for the modules it moves to GPU.
+        """
+        if not self._built:
+            print(f"[{self._tag}] Not built — cannot reload to CPU.")
+            return 0
+
+        # Discard stale CUDA storage refs — model.load() will handle CUDA.
+        self._freed_storages = []
+
+        restored = self._swap_to_cpu(module)
+
+        self._on_cuda = False
+        print(f"[{self._tag}] Restored {restored} params to pinned CPU.")
+        return restored
 
     def reload_to_cuda(
         self,
@@ -285,6 +361,26 @@ class BasePinnedCache(ABC):
     ) -> int:
         """Subclass: copy pinned data → CUDA params.  Return count."""
 
+    @abstractmethod
+    def _swap_to_cpu(
+        self,
+        module: torch.nn.Module,
+    ) -> int:
+        """Subclass: replace param.data with pinned CPU tensor.  Return count."""
+
+    @abstractmethod
+    def _snapshot_cuda_only(
+        self,
+        module: torch.nn.Module,
+        non_blocking: bool,
+        freed_ptrs: set,
+    ) -> tuple:
+        """Subclass: refresh pinned cache for CUDA params only.
+
+        Returns ``(cuda_count, cpu_count)``.
+        Must append CUDA storages to ``self._freed_storages``.
+        """
+
     def _pre_free_hook(self) -> None:
         """Optional hook called after sync but before storage.resize_(0).
 
@@ -313,6 +409,24 @@ class BasePinnedCache(ABC):
         except Exception:
             return tensor
 
+    # ------------------------------------------------------------ cleanup
+
+    def cleanup(self) -> None:
+        """Release all pinned RAM held by this cache.
+
+        Subclasses override to free format-specific resources (e.g. /dev/shm)
+        and must call ``super().cleanup()``.
+        """
+        self._freed_storages = []
+        self._built = False
+        self._on_cuda = False
+
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PinnedParamCache — single-GPU, private pinned RAM
@@ -329,29 +443,49 @@ class PinnedParamCache(BasePinnedCache):
     # -- build --
 
     def _do_build(self, module: torch.nn.Module) -> None:
-        param_count = buf_count = skipped_cpu = 0
+        param_count = buf_count = pinned_cpu = 0
+        needs_sync = False
 
         for name, param in module.named_parameters():
-            if param.device.type != "cuda":
-                skipped_cpu += 1
-                continue
-            self._cpu_params[name] = self._pin(
-                param.data.detach().to("cpu", non_blocking=False)
-            )
+            if param.device.type == "cuda":
+                # Pre-allocate pinned destination and async DMA — avoids the
+                # double-copy of .to("cpu") + .pin_memory() and pipelines
+                # all transfers on the GPU's copy engine.
+                pinned = torch.empty_like(param.data, device="cpu").pin_memory()
+                pinned.copy_(param.data, non_blocking=True)
+                self._cpu_params[name] = pinned
+                needs_sync = True
+            else:
+                # Already on CPU — pin in-place: pin_memory() allocates a
+                # new page-locked tensor, then we swap param.data to it so
+                # the original unpinned tensor is freed immediately (refcount
+                # drops to 0).  Net RAM delta ≈ one param's worth at peak.
+                pinned = self._pin(param.data.detach().clone())
+                self._cpu_params[name] = pinned
+                param.data = pinned          # swap — original freed by RC
+                pinned_cpu += 1
             param_count += 1
 
         for name, buf in module.named_buffers():
-            if buf.device.type != "cuda":
-                continue
-            self._cpu_buffers[name] = self._pin(
-                buf.data.detach().to("cpu", non_blocking=False)
-            )
+            if buf.device.type == "cuda":
+                pinned = torch.empty_like(buf.data, device="cpu").pin_memory()
+                pinned.copy_(buf.data, non_blocking=True)
+                self._cpu_buffers[name] = pinned
+                needs_sync = True
+            else:
+                pinned = self._pin(buf.data.detach().clone())
+                self._cpu_buffers[name] = pinned
+                buf.data = pinned
             buf_count += 1
+
+        # Single sync point for all async D2H transfers
+        if needs_sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         print(
             f"[{self._tag}] Built: {param_count} params + {buf_count} buffers, "
             f"{self.pinned_ram_bytes() / 1e9:.2f} GB pinned. "
-            f"(skipped_cpu={skipped_cpu})"
+            f"(pinned_in_place={pinned_cpu})"
         )
 
     # -- offload --
@@ -364,9 +498,10 @@ class PinnedParamCache(BasePinnedCache):
             if name in self._cpu_params:
                 self._cpu_params[name].copy_(param.data, non_blocking=non_blocking)
             else:
-                self._cpu_params[name] = self._pin(
-                    param.data.detach().to("cpu", non_blocking=False)
-                )
+                # Cache miss: pre-allocate pinned + async DMA (no double-copy)
+                pinned = torch.empty_like(param.data, device="cpu").pin_memory()
+                pinned.copy_(param.data, non_blocking=True)
+                self._cpu_params[name] = pinned
             self._collect_storage(param.data, freed_ptrs)
             offloaded += 1
 
@@ -376,9 +511,9 @@ class PinnedParamCache(BasePinnedCache):
             if name in self._cpu_buffers:
                 self._cpu_buffers[name].copy_(buf.data, non_blocking=non_blocking)
             else:
-                self._cpu_buffers[name] = self._pin(
-                    buf.data.detach().to("cpu", non_blocking=False)
-                )
+                pinned = torch.empty_like(buf.data, device="cpu").pin_memory()
+                pinned.copy_(buf.data, non_blocking=True)
+                self._cpu_buffers[name] = pinned
             self._collect_storage(buf.data, freed_ptrs)
 
         return offloaded
@@ -400,6 +535,50 @@ class PinnedParamCache(BasePinnedCache):
 
         return reloaded
 
+    def _swap_to_cpu(self, module) -> int:
+        """Point param.data directly at pinned CPU tensors."""
+        restored = 0
+        for name, param in module.named_parameters():
+            cpu_buf = self._cpu_params.get(name)
+            if cpu_buf is not None:
+                param.data = cpu_buf
+                restored += 1
+
+        for name, buf in module.named_buffers():
+            cpu_copy = self._cpu_buffers.get(name)
+            if cpu_copy is not None:
+                buf.data = cpu_copy
+
+        return restored
+
+    def _snapshot_cuda_only(self, module, non_blocking, freed_ptrs) -> tuple:
+        cuda_count = cpu_count = 0
+        for name, param in module.named_parameters():
+            if param.device.type == "cuda":
+                if name in self._cpu_params:
+                    self._cpu_params[name].copy_(param.data, non_blocking=non_blocking)
+                else:
+                    # Cache miss: pre-allocate pinned + async DMA (no double-copy)
+                    pinned = torch.empty_like(param.data, device="cpu").pin_memory()
+                    pinned.copy_(param.data, non_blocking=True)
+                    self._cpu_params[name] = pinned
+                self._collect_storage(param.data, freed_ptrs)
+                cuda_count += 1
+            else:
+                cpu_count += 1
+
+        for name, buf in module.named_buffers():
+            if buf.device.type == "cuda":
+                if name in self._cpu_buffers:
+                    self._cpu_buffers[name].copy_(buf.data, non_blocking=non_blocking)
+                else:
+                    pinned = torch.empty_like(buf.data, device="cpu").pin_memory()
+                    pinned.copy_(buf.data, non_blocking=True)
+                    self._cpu_buffers[name] = pinned
+                self._collect_storage(buf.data, freed_ptrs)
+
+        return cuda_count, cpu_count
+
     # -- info --
 
     def param_count(self) -> int:
@@ -408,6 +587,15 @@ class PinnedParamCache(BasePinnedCache):
     def pinned_ram_bytes(self) -> int:
         return (sum(t.nbytes for t in self._cpu_params.values())
                 + sum(t.nbytes for t in self._cpu_buffers.values()))
+
+    def cleanup(self) -> None:
+        """Release all pinned tensors and reset state."""
+        gb = self.pinned_ram_bytes() / 1e9 if self._cpu_params else 0
+        self._cpu_params.clear()
+        self._cpu_buffers.clear()
+        super().cleanup()
+        if gb > 0:
+            print(f"[{self._tag}] Cleanup: freed {gb:.2f} GB pinned RAM.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -442,13 +630,13 @@ class SharedPinnedParamCache(BasePinnedCache):
         self._total_bytes = total_bytes
 
         if total_bytes == 0:
-            print(f"[{self._tag}] No CUDA params found — nothing to cache.")
+            print(f"[{self._tag}] No params found — nothing to cache.")
             return
 
         if self._is_writer:
             self._build_writer(module, param_layout, buffer_layout, total_bytes)
         else:
-            self._build_reader(param_layout, buffer_layout, total_bytes)
+            self._build_reader(module, param_layout, buffer_layout, total_bytes)
 
     def _build_writer(self, module, param_layout, buffer_layout, total_bytes):
         # Clean up stale segment
@@ -468,6 +656,8 @@ class SharedPinnedParamCache(BasePinnedCache):
             ).reshape(shape)
             view.copy_(param_dict[name].data.cpu())
             self._cpu_params[name] = view
+            # Swap param.data → shm view so originals can be GC'd
+            param_dict[name].data = view
 
         buf_dict = dict(module.named_buffers())
         for name, off, nb, shape, dtype in buffer_layout:
@@ -476,6 +666,7 @@ class SharedPinnedParamCache(BasePinnedCache):
             ).reshape(shape)
             view.copy_(buf_dict[name].data.cpu())
             self._cpu_buffers[name] = view
+            buf_dict[name].data = view
 
         # Signal readers
         import torch.distributed as dist
@@ -488,7 +679,7 @@ class SharedPinnedParamCache(BasePinnedCache):
             f"(shm={self._shm_name})"
         )
 
-    def _build_reader(self, param_layout, buffer_layout, total_bytes):
+    def _build_reader(self, module, param_layout, buffer_layout, total_bytes):
         import torch.distributed as dist
         if dist.is_initialized():
             dist.barrier()
@@ -515,15 +706,24 @@ class SharedPinnedParamCache(BasePinnedCache):
 
         self._register_shm(total_bytes)
 
+        param_dict = dict(module.named_parameters())
         for name, off, nb, shape, dtype in param_layout:
-            self._cpu_params[name] = torch.frombuffer(
+            view = torch.frombuffer(
                 memoryview(self._shm.buf)[off:off + nb], dtype=dtype
             ).reshape(shape)
+            self._cpu_params[name] = view
+            # Swap param.data → shm view so originals can be GC'd
+            if name in param_dict:
+                param_dict[name].data = view
 
+        buf_dict = dict(module.named_buffers())
         for name, off, nb, shape, dtype in buffer_layout:
-            self._cpu_buffers[name] = torch.frombuffer(
+            view = torch.frombuffer(
                 memoryview(self._shm.buf)[off:off + nb], dtype=dtype
             ).reshape(shape)
+            self._cpu_buffers[name] = view
+            if name in buf_dict:
+                buf_dict[name].data = view
 
         print(
             f"[{self._tag}] Reader attached: {len(param_layout)} params, "
@@ -584,6 +784,53 @@ class SharedPinnedParamCache(BasePinnedCache):
 
         return reloaded
 
+    def _swap_to_cpu(self, module) -> int:
+        """Point param.data directly at pinned CPU tensors."""
+        restored = 0
+        for name, param in module.named_parameters():
+            cpu_buf = self._cpu_params.get(name)
+            if cpu_buf is not None:
+                param.data = cpu_buf
+                restored += 1
+
+        for name, buf in module.named_buffers():
+            cpu_copy = self._cpu_buffers.get(name)
+            if cpu_copy is not None:
+                buf.data = cpu_copy
+
+        return restored
+
+    def _snapshot_cuda_only(self, module, non_blocking, freed_ptrs) -> tuple:
+        cuda_count = cpu_count = 0
+        for name, param in module.named_parameters():
+            if param.device.type == "cuda":
+                if name in self._cpu_params:
+                    # Writer refreshes shared buffer; readers skip the copy
+                    if self._is_writer:
+                        self._cpu_params[name].copy_(param.data, non_blocking=non_blocking)
+                    self._collect_storage(param.data, freed_ptrs)
+                    cuda_count += 1
+                else:
+                    # Param was on CPU at build time but ended up on CUDA
+                    # (VRAM budget changed). Shared layout is fixed — we
+                    # cannot add new entries. Skip freeing to avoid data loss;
+                    # model.load() will move it to CPU next cycle.
+                    logging.warning(
+                        f"[{self._tag}] CUDA param '{name}' not in shared cache "
+                        f"— skipping (cannot grow shared layout)."
+                    )
+            else:
+                cpu_count += 1
+
+        for name, buf in module.named_buffers():
+            if buf.device.type == "cuda":
+                if name in self._cpu_buffers:
+                    if self._is_writer:
+                        self._cpu_buffers[name].copy_(buf.data, non_blocking=non_blocking)
+                    self._collect_storage(buf.data, freed_ptrs)
+
+        return cuda_count, cpu_count
+
     # -- info --
 
     def param_count(self) -> int:
@@ -595,18 +842,37 @@ class SharedPinnedParamCache(BasePinnedCache):
     # -- cleanup --
 
     def cleanup(self) -> None:
-        """Unpin and release shared memory."""
+        """Unpin, release shared memory, and clear all cached tensors."""
+        gb = self.pinned_ram_bytes() / 1e9 if self._cpu_params else 0
+
+        # 1. Drop all tensor views into shm FIRST — they hold references
+        #    to the shm buffer that prevent close().
+        self._cpu_params.clear()
+        self._cpu_buffers.clear()
+        self._freed_storages = []
+        self._total_bytes = 0
+
+        # 2. Unregister CUDA host pinning.
         if self._registered_ptr is not None:
             _cuda_host_unregister(self._registered_ptr)
             self._registered_ptr = None
+
+        # 3. Close / unlink shm now that no tensors reference it.
         if self._shm is not None:
-            self._shm.close()
+            try:
+                self._shm.close()
+            except Exception:
+                pass  # may already be closed
             if self._is_writer:
                 try:
                     self._shm.unlink()
                 except FileNotFoundError:
                     pass
             self._shm = None
+
+        super().cleanup()
+        if gb > 0:
+            print(f"[{self._tag}] Cleanup: freed {gb:.2f} GB shared pinned RAM.")
 
     def __del__(self):
         try:
@@ -656,6 +922,7 @@ class FSDPShardPinnedCache(BasePinnedCache):
 
     def _do_build(self, module: torch.nn.Module) -> None:
         count = skipped_cpu = skipped_not_dt = total = 0
+        needs_sync = False
 
         for name, param in module.named_parameters():
             total += 1
@@ -666,10 +933,16 @@ class FSDPShardPinnedCache(BasePinnedCache):
             if local is None:
                 skipped_cpu += 1
                 continue
-            self._cpu_shards[name] = self._pin(
-                local.detach().to("cpu", non_blocking=False)
-            )
+            # Pre-allocate pinned + async DMA (no double-copy)
+            pinned = torch.empty_like(local, device="cpu").pin_memory()
+            pinned.copy_(local, non_blocking=True)
+            self._cpu_shards[name] = pinned
+            needs_sync = True
             count += 1
+
+        # Single sync point for all async D2H transfers
+        if needs_sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         if skipped_cpu:
             print(
@@ -701,16 +974,17 @@ class FSDPShardPinnedCache(BasePinnedCache):
             if name in self._cpu_shards:
                 self._cpu_shards[name].copy_(local, non_blocking=non_blocking)
             else:
-                self._cpu_shards[name] = self._pin(
-                    local.detach().to("cpu", non_blocking=False)
-                )
+                # Cache miss: pre-allocate pinned + async DMA (no double-copy)
+                pinned = torch.empty_like(local, device="cpu").pin_memory()
+                pinned.copy_(local, non_blocking=True)
+                self._cpu_shards[name] = pinned
             self._collect_storage(local, freed_ptrs)
             offloaded += 1
 
         # Move small non-param buffers to CPU
         for buf in module.buffers():
             if buf.device.type == "cuda":
-                buf.data = buf.data.to("cpu", non_blocking=False)
+                buf.data = buf.data.to("cpu", non_blocking=non_blocking)
 
         return offloaded
 
@@ -736,9 +1010,19 @@ class FSDPShardPinnedCache(BasePinnedCache):
         # Restore buffers
         for buf in module.buffers():
             if buf.device.type != "cuda":
-                buf.data = buf.data.to("cuda", non_blocking=False)
+                buf.data = buf.data.to("cuda", non_blocking=non_blocking)
 
         return reloaded
+
+    def _swap_to_cpu(self, module) -> int:
+        raise NotImplementedError(
+            "FSDPShardPinnedCache does not support partial CUDA load."
+        )
+
+    def _snapshot_cuda_only(self, module, non_blocking, freed_ptrs) -> tuple:
+        raise NotImplementedError(
+            "FSDPShardPinnedCache does not support selective offload."
+        )
 
     # -- info --
 
@@ -750,3 +1034,11 @@ class FSDPShardPinnedCache(BasePinnedCache):
 
     def pinned_ram_bytes(self) -> int:
         return sum(t.nbytes for t in self._cpu_shards.values())
+
+    def cleanup(self) -> None:
+        """Release all pinned shard tensors and reset state."""
+        gb = self.pinned_ram_bytes() / 1e9 if self._cpu_shards else 0
+        self._cpu_shards.clear()
+        super().cleanup()
+        if gb > 0:
+            print(f"[{self._tag}] Cleanup: freed {gb:.2f} GB pinned shard RAM.")
