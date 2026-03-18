@@ -141,15 +141,27 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
         # param.data references the empty storage.  We must restore the
         # data BEFORE super().load() tries to move modules around.
         #
-        # Always bulk-copy to CUDA first.  If a partial-load budget is
-        # active super().load() will re-split: budget-worth stays on
-        # CUDA, the rest gets lowvram hooks — but starting from live
-        # CUDA tensors (fast) instead of zero-sized dead storages (crash).
+        # Two modes:
+        #   • Full load (no budget): bulk-copy pinned → CUDA so
+        #     super().load() only re-applies LoRA patches / hooks.
+        #   • Partial load (budget > 0): restore to pinned CPU tensors
+        #     so super().load() can DMA only the budget-worth of modules
+        #     to CUDA and leave the rest in pinned RAM with lowvram hooks.
         pinned_cache = getattr(self, "pinned_param_cache", None)
         skip_restore = getattr(self, "_skip_pinned_auto_restore", False)
         if pinned_cache is not None and pinned_cache.built and not pinned_cache.params_on_cuda and not skip_restore:
-            logging.info("[RaylightModelPatcher] Auto-reloading from pinned cache (full → CUDA)...")
-            pinned_cache.reload_to_cuda(self.model)
+            effective_budget = kwargs.get("lowvram_model_memory", 0)
+            need_partial = 0 < effective_budget < self.model_size()
+            if need_partial:
+                # Partial load: restore to pinned CPU — super().load()
+                # will DMA the budget-worth to CUDA (fast from pinned RAM)
+                # and install lowvram hooks for the overflow modules.
+                logging.info("[RaylightModelPatcher] Auto-restoring to pinned CPU for partial load...")
+                pinned_cache.reload_to_cpu(self.model)
+            else:
+                # Full load: bulk-copy to CUDA
+                logging.info("[RaylightModelPatcher] Auto-reloading from pinned cache (full → CUDA)...")
+                pinned_cache.reload_to_cuda(self.model)
 
         result = super().load(device_to=device_to, **kwargs)
 

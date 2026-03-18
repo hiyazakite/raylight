@@ -130,8 +130,4 @@ def prepare_ring_attn_kwargs(
         if mask is not None:
             attn_kwargs["mask"] = mask
 
-    # Verification Logging (Temporary)
-    if kwargs.get("current_iter", 0) == 0 and mod_idx is not None and mod_idx < 3:
-        print(f"[Dispatcher DEBUG] Layer {layer_idx} | mod_idx {mod_idx} | ring_fn {ring_fn.__name__ if hasattr(ring_fn, '__name__') else 'unknown'}")
-
     return attn_kwargs
