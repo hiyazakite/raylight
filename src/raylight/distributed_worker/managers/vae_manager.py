@@ -114,17 +114,18 @@ class VaeManager:
         output_offset=0,
         config: Optional[WorkerConfig] = None,
         lora_manager: Optional[Any] = None,
-        state_cache: Optional[Any] = None
+        state_cache: Optional[Any] = None,
+        latent_ref=None,
+        latent_slice_start=None,
+        latent_slice_end=None,
     ):
         if config is None:
              raise ValueError("WorkerConfig must be passed to decode")
 
-        with monitor_memory(f"RayWorker {config.local_rank} - ray_vae_decode", device=config.device):
-            print(f"[RayWorker {config.local_rank}] Entering ray_vae_decode (direct method call) for shard {shard_index}...")
-            
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
+        # NOTE: Removed eager gc.collect() + torch.cuda.empty_cache() that blocked CPU/GPU
+        # for hundreds of ms at the start of every decode call. Cleanup happens in the
+        # finally block after decode completes.
+        print(f"[RayWorker {config.local_rank}] Entering ray_vae_decode for shard {shard_index}")
         
         if tile_size < overlap * 4:
             overlap = tile_size // 4
@@ -151,16 +152,21 @@ class VaeManager:
             self.vae_model.vae_dtype = dtype
             
             # 2. Transfer Latents (Optimized)
-            latents_to_decode = samples["samples"].to(config.device, dtype=dtype)
-            print(f"[RayWorker {config.local_rank}] latents_to_decode shape: {latents_to_decode.shape}")
-            print(f"[RayWorker {config.local_rank}] tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
+            # If latent_ref is provided, it's already resolved by Ray's actor call
+            # mechanism (ObjectRefs passed to .remote() are auto-deserialized).
+            # We just slice the full tensor directly — zero-copy from shared memory.
+            if latent_ref is not None and latent_slice_start is not None:
+                shard_latents = latent_ref[:, :, latent_slice_start:latent_slice_end]
+            else:
+                shard_latents = samples["samples"]
             
-            # DEBUG: Verify decoder is on correct device before decode
-            for name, param in self.vae_model.first_stage_model.named_parameters():
-                if 'decoder' in name:
-                    print(f"[RayWorker {config.local_rank}] DECODER PARAM CHECK: {name} device={param.device}, mean={param.float().mean().item():.6f}")
-                    break
-            print(f"[RayWorker {config.local_rank}] VAE self.device={self.vae_model.device}, latents device={latents_to_decode.device}")
+            # Use non_blocking=True to overlap PCIe transfer with CPU setup work
+            latents_to_decode = shard_latents.to(config.device, dtype=dtype, non_blocking=True)
+            del shard_latents
+            print(f"[RayWorker {config.local_rank}] latents shape: {latents_to_decode.shape}, tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
+    
+            # Sync the non_blocking transfer before decode begins
+            torch.cuda.current_stream(config.device).synchronize()
     
             # 3. Decode
             # ComfyUI's decode_tiled returns [B, T, H, W, C] for 3D or [B, H, W, C] for 2D

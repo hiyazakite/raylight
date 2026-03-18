@@ -1079,11 +1079,11 @@ class RayVAEDecodeDistributed:
         gpu_actors = ray_actors["workers"]
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
 
-        # 1. Load VAE on all workers
-        futures = [actor.ray_vae_loader.remote(vae_path) for actor in gpu_actors]
-        cancellable_get(futures)
+        # === PIPELINED VAE DECODE ===
+        # Fire VAE load on all workers (returns compression factors)
+        load_futures = [actor.ray_vae_loader.remote(vae_path) for actor in gpu_actors]
 
-        # 2. Shard samples temporally
+        # While VAE loads on GPU workers, prepare sharding info on CPU (no blocking wait)
         latents = samples["samples"]
         num_workers = len(gpu_actors)
         total_frames = latents.shape[2]
@@ -1094,10 +1094,15 @@ class RayVAEDecodeDistributed:
         if temporal_size < temporal_overlap * 2:
             temporal_overlap = temporal_overlap // 2
 
-        # Pre-calculate total output size and compression factors early
-        # Retrieve compression factors directly from the worker that just loaded the VAE
-        temporal_compression = cancellable_get(gpu_actors[0].get_vae_temporal_compression.remote()) or 1
-        spatial_compression = cancellable_get(gpu_actors[0].get_vae_spatial_compression.remote()) or 1
+        # Put entire latent tensor into Ray object store ONCE (zero-copy shared memory)
+        # Workers will slice their own portion — avoids N CPU clones on master
+        latent_ref = ray.put(latents)
+
+        # NOW wait for VAE load + compression factors (load was running in parallel)
+        load_results = cancellable_get(load_futures)
+        temporal_compression, spatial_compression = load_results[0]
+        temporal_compression = temporal_compression or 1
+        spatial_compression = spatial_compression or 1
 
         # Causal VAE output formula: (Latent_T - 1) * compression + 1
         if isinstance(temporal_compression, (int, float)) and temporal_compression > 1:
@@ -1150,45 +1155,34 @@ class RayVAEDecodeDistributed:
                 # actual_end: Each shard must produce frames up to the START of the next shard.
                 actual_end = min(end + (1 if i < num_workers - 1 else 0), total_frames)
                 
-                shard_samples = {
-                    "samples": latents[:, :, context_start:actual_end].clone()
-                }
-                
                 # Pass how many latent frames to discard from the beginning of the result
                 discard_latent_frames = start - context_start
                 
                 # Calculate Output Offset due to temporal compression
-                # For causal VAEs, the first shard starts at frame 0.
-                # Subsequent shards start at shard_index * frames_per_shard.
-                # But because they share 1 frame of context, we need to align the output properly.
                 if isinstance(temporal_compression, (int, float)) and temporal_compression > 1:
-                    # Causal VAE: Frame 0 in latents -> Frame 0 in video
-                    # Frame 1 in latents -> Frame (1)*comp in video? No.
-                    # Formula: output_frame = latent_frame * comp
-                    # But the first shard (start=0) starts at 0.
-                    # Shard 1 (start=N) starts at video frame (N * comp).
-                    # Actually, the formula (total_frames - 1) * comp + 1 suggests:
-                    # latent 0 -> video 0
-                    # latent 1 -> video comp
-                    # latent 2 -> video 2*comp
                     start_video_frame = start * temporal_compression
                 else:
                     start_video_frame = start
                 
-                print(f"[RayVAEDecode] Shard {i}: Latents {context_start} to {end} (discard {discard_latent_frames}) -> Video Frame {start_video_frame}")
+                print(f"[RayVAEDecode] Shard {i}: Latents {context_start}:{actual_end} (discard {discard_latent_frames}) -> Video Frame {start_video_frame}")
                 
+                # Zero-copy dispatch: pass latent_ref + slice indices
+                # Workers resolve from Ray object store (shared memory) and slice locally
                 futures.append(actor.ray_vae_decode.remote(
                     i, # shard_index
-                    shard_samples,
+                    {},  # empty samples dict (latent_ref used instead)
                     tile_size,
                     overlap=overlap,
-                    temporal_size=temporal_size,  # Pass raw value, decode_tiled handles scaling
-                    temporal_overlap=temporal_overlap,  # Pass raw value, decode_tiled handles scaling
+                    temporal_size=temporal_size,
+                    temporal_overlap=temporal_overlap,
                     discard_latent_frames=discard_latent_frames,
                     vae_dtype=vae_dtype,
-                    mmap_path=mmap_path,     # DIRECT WRITING
-                    mmap_shape=master_shape, # DIRECT WRITING
-                    output_offset=start_video_frame # DIRECT WRITING
+                    mmap_path=mmap_path,
+                    mmap_shape=master_shape,
+                    output_offset=start_video_frame,
+                    latent_ref=latent_ref,
+                    latent_slice_start=context_start,
+                    latent_slice_end=actual_end,
                 ))
     
             print(f"[RayVAEDecode] Dispatched {len(futures)} shards. Direct-to-disk mode enabled.")
@@ -1250,7 +1244,10 @@ class RayVAEDecodeDistributed:
                         del shard_data
 
             del remaining
-            del futures 
+            del futures
+            
+            # Release the shared latent tensor from Ray object store
+            del latent_ref
 
             try:
                 os.unlink(mmap_path)
