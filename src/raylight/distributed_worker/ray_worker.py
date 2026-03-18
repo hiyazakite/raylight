@@ -681,6 +681,11 @@ class RayWorker:
     def ray_vae_loader(self, vae_path):
         self.vae_manager.load_vae(vae_path, self.config, self.state_cache)
         self.vae_model = self.vae_manager.vae_model
+        # Return compression factors to avoid extra round-trips
+        return (
+            self.vae_manager.get_temporal_compression(),
+            self.vae_manager.get_spatial_compression(),
+        )
 
     def ray_vae_release(self):
         result = self.vae_manager.release_vae(self.local_rank)
@@ -709,6 +714,9 @@ class RayWorker:
         mmap_path=None,
         mmap_shape=None,
         output_offset=0,
+        latent_ref=None,
+        latent_slice_start=None,
+        latent_slice_end=None,
     ):
         return self.vae_manager.decode(
             shard_index,
@@ -725,6 +733,9 @@ class RayWorker:
             config=self.config,
             lora_manager=self.lora_manager,
             state_cache=self.state_cache,
+            latent_ref=latent_ref,
+            latent_slice_start=latent_slice_start,
+            latent_slice_end=latent_slice_end,
         )
 
 
