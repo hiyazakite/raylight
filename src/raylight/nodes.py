@@ -763,18 +763,23 @@ class RayUNETLoader:
         cancellable_get(loaded_futures)
         loaded_futures = []
 
-        # Patching: Done SEQUENTIALLY to avoid RAM spikes
-        # For safetensors with lazy wrappers, patching triggers model instantiation
-        # Sequential ensures only one worker's RAM usage peaks at a time
+        # Patching: Done in small batches to limit peak RAM while still
+        # overlapping work across independent GPU workers.  Each actor runs
+        # in its own process so memory pressure is per-worker, but issuing
+        # all at once can spike the Ray object store.  Batches of 2 keep
+        # wall-clock time ~halved vs fully sequential for 4+ GPUs.
+        _PATCH_BATCH = 2
         if parallel_dict["is_xdit"]:
             if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
-                print("[Raylight] Sequential USP Patching: Instantiating workers one at a time...")
-                for actor in gpu_actors:
-                    cancellable_get(actor.patch_usp.remote())
+                print(f"[Raylight] Batched USP Patching ({_PATCH_BATCH} workers at a time)...")
+                for i in range(0, len(gpu_actors), _PATCH_BATCH):
+                    batch = gpu_actors[i:i + _PATCH_BATCH]
+                    cancellable_get([a.patch_usp.remote() for a in batch])
             if parallel_dict["cfg_degree"] > 1:
-                print("[Raylight] Sequential CFG Patching...")
-                for actor in gpu_actors:
-                    cancellable_get(actor.patch_cfg.remote())
+                print(f"[Raylight] Batched CFG Patching ({_PATCH_BATCH} workers at a time)...")
+                for i in range(0, len(gpu_actors), _PATCH_BATCH):
+                    batch = gpu_actors[i:i + _PATCH_BATCH]
+                    cancellable_get([a.patch_cfg.remote() for a in batch])
 
         # Track workers globally so the unload hook can reach them
         _register_workers(gpu_actors)

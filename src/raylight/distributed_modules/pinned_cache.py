@@ -638,20 +638,42 @@ class PinnedParamCache(BasePinnedCache):
 class SharedPinnedParamCache(BasePinnedCache):
     """Cross-process shared pinned-RAM cache for data-parallel workers.
 
-    Rank 0 is the **writer** (creates ``/dev/shm`` segment, copies data).
-    Other ranks are **readers** (attach to existing segment).
-    All ranks call ``cudaHostRegister`` for async DMA.
+    All ranks cooperate during build:
+
+    1. Rank 0 creates the ``/dev/shm`` segment (allocation only).
+    2. Barrier — all ranks attach and ``cudaHostRegister``.
+    3. Each rank copies its assigned **slice** of params (round-robin by
+       index, non-overlapping — no synchronisation needed within the copy
+       phase).  Buffers are copied by rank 0 only (typically tiny).
+    4. Barrier — all data is in place.
+    5. All ranks create views and swap ``param.data``.
+
+    The result is identical to the old serial writer pattern but the
+    memcpy work is distributed across *N* workers.
     """
 
-    def __init__(self, cache_id: str, is_writer: bool = False) -> None:
+    def __init__(
+        self,
+        cache_id: str,
+        is_writer: bool = False,
+        local_rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
         super().__init__(tag="SharedPinnedParamCache")
         self._cache_id = cache_id
         self._is_writer = is_writer
+        self._local_rank = local_rank
+        self._world_size = world_size
 
         self._shm_name = f"raylight_pc_{cache_id}"
         self._shm: Optional[SharedMemory] = None
         self._registered_ptr: Optional[int] = None
         self._total_bytes: int = 0
+
+        # Deterministic round-robin assignment: param at sorted-index *i*
+        # is owned by rank ``i % world_size``.
+        self._owned_params: set = set()   # param names this rank copies
+        self._owned_buffers: set = set()  # buffer names this rank copies
 
         self._cpu_params: Dict[str, torch.Tensor] = {}
         self._cpu_buffers: Dict[str, torch.Tensor] = {}
@@ -666,101 +688,100 @@ class SharedPinnedParamCache(BasePinnedCache):
             print(f"[{self._tag}] No params found — nothing to cache.")
             return
 
+        self._build_parallel(module, param_layout, buffer_layout, total_bytes)
+
+    def _build_parallel(self, module, param_layout, buffer_layout, total_bytes):
+        """Cooperative build: all ranks create views, each copies its slice."""
+        import torch.distributed as dist
+        t_start = time.perf_counter()
+
+        # ── Step 1: Rank 0 creates /dev/shm segment ────────────────────
         if self._is_writer:
-            self._build_writer(module, param_layout, buffer_layout, total_bytes)
-        else:
-            self._build_reader(module, param_layout, buffer_layout, total_bytes)
-
-    def _build_writer(self, module, param_layout, buffer_layout, total_bytes):
-        # Clean up stale segment
-        try:
-            old = SharedMemory(name=self._shm_name, create=False)
-            old.close(); old.unlink()
-        except FileNotFoundError:
-            pass
-
-        self._shm = SharedMemory(name=self._shm_name, create=True, size=total_bytes)
-        self._register_shm(total_bytes)
-
-        param_dict = dict(module.named_parameters())
-        for name, off, nb, shape, dtype in param_layout:
-            view = torch.frombuffer(
-                memoryview(self._shm.buf)[off:off + nb], dtype=dtype
-            ).reshape(shape)
-            view.copy_(param_dict[name].data.cpu())
-            self._cpu_params[name] = view
-            # Swap param.data → shm view so originals can be GC'd
-            param_dict[name].data = view
-
-        buf_dict = dict(module.named_buffers())
-        for name, off, nb, shape, dtype in buffer_layout:
-            view = torch.frombuffer(
-                memoryview(self._shm.buf)[off:off + nb], dtype=dtype
-            ).reshape(shape)
-            view.copy_(buf_dict[name].data.cpu())
-            self._cpu_buffers[name] = view
-            buf_dict[name].data = view
-
-        # Signal readers
-        import torch.distributed as dist
-        if dist.is_initialized():
-            dist.barrier()
-
-        print(
-            f"[{self._tag}] Writer built: {len(param_layout)} params + "
-            f"{len(buffer_layout)} buffers, {total_bytes / 1e9:.2f} GB shared "
-            f"(shm={self._shm_name})"
-        )
-
-    def _build_reader(self, module, param_layout, buffer_layout, total_bytes):
-        import torch.distributed as dist
-        if dist.is_initialized():
-            dist.barrier()
-
-        # Attach to existing segment
-        for i in range(50):
             try:
-                self._shm = SharedMemory(name=self._shm_name, create=False)
-                break
+                old = SharedMemory(name=self._shm_name, create=False)
+                old.close(); old.unlink()
             except FileNotFoundError:
-                if i < 49:
-                    time.sleep(0.2)
-        else:
-            raise RuntimeError(
-                f"[{self._tag}] Reader timed out waiting for "
-                f"shared memory '{self._shm_name}' (10s)."
+                pass
+            self._shm = SharedMemory(
+                name=self._shm_name, create=True, size=total_bytes,
             )
 
-        if self._shm.size < total_bytes:
-            raise RuntimeError(
-                f"[{self._tag}] Size mismatch: expected {total_bytes}, "
-                f"got {self._shm.size}."
-            )
+        # ── Step 2: Barrier — wait for creation, then all attach ───────
+        if dist.is_initialized():
+            dist.barrier()
 
+        if not self._is_writer:
+            for attempt in range(50):
+                try:
+                    self._shm = SharedMemory(
+                        name=self._shm_name, create=False,
+                    )
+                    break
+                except FileNotFoundError:
+                    if attempt < 49:
+                        time.sleep(0.2)
+            else:
+                raise RuntimeError(
+                    f"[{self._tag}] Rank {self._local_rank} timed out "
+                    f"waiting for shared memory '{self._shm_name}' (10s)."
+                )
+
+            if self._shm.size < total_bytes:
+                raise RuntimeError(
+                    f"[{self._tag}] Size mismatch: expected {total_bytes}, "
+                    f"got {self._shm.size}."
+                )
+
+        # All ranks: pin the pages for async CUDA DMA
         self._register_shm(total_bytes)
 
+        # ── Step 3: Build ownership sets + create views ────────────────
+        #   Round-robin: param at sorted-index *i* is owned by rank
+        #   i % world_size.  All ranks create ALL views (needed for
+        #   reload_to_cuda), but each rank only .copy_() its own slice.
         param_dict = dict(module.named_parameters())
-        for name, off, nb, shape, dtype in param_layout:
+        buf_dict = dict(module.named_buffers())
+
+        for i, (name, off, nb, shape, dtype) in enumerate(param_layout):
             view = torch.frombuffer(
-                memoryview(self._shm.buf)[off:off + nb], dtype=dtype
+                memoryview(self._shm.buf)[off:off + nb], dtype=dtype,
             ).reshape(shape)
             self._cpu_params[name] = view
-            # Swap param.data → shm view so originals can be GC'd
-            if name in param_dict:
-                param_dict[name].data = view
+            if i % self._world_size == self._local_rank:
+                self._owned_params.add(name)
+                # Copy this param — our responsibility
+                view.copy_(param_dict[name].data.cpu())
 
-        buf_dict = dict(module.named_buffers())
-        for name, off, nb, shape, dtype in buffer_layout:
+        # Buffers are tiny; rank 0 copies them all.
+        for i, (name, off, nb, shape, dtype) in enumerate(buffer_layout):
             view = torch.frombuffer(
-                memoryview(self._shm.buf)[off:off + nb], dtype=dtype
+                memoryview(self._shm.buf)[off:off + nb], dtype=dtype,
             ).reshape(shape)
             self._cpu_buffers[name] = view
-            if name in buf_dict:
-                buf_dict[name].data = view
+            if i % self._world_size == self._local_rank:
+                self._owned_buffers.add(name)
+                view.copy_(buf_dict[name].data.cpu())
 
+        # ── Step 4: Barrier — all copies complete ──────────────────────
+        if dist.is_initialized():
+            dist.barrier()
+
+        # ── Step 5: Swap param.data → shm views on ALL ranks ──────────
+        for name in self._cpu_params:
+            if name in param_dict:
+                param_dict[name].data = self._cpu_params[name]
+        for name in self._cpu_buffers:
+            if name in buf_dict:
+                buf_dict[name].data = self._cpu_buffers[name]
+
+        dt_ms = (time.perf_counter() - t_start) * 1000
+        my_params = len(self._owned_params)
+        my_bufs = len(self._owned_buffers)
         print(
-            f"[{self._tag}] Reader attached: {len(param_layout)} params, "
-            f"{total_bytes / 1e9:.2f} GB shared (shm={self._shm_name})"
+            f"[{self._tag}] Parallel build (rank {self._local_rank}): "
+            f"{len(param_layout)} params + {len(buffer_layout)} buffers, "
+            f"{total_bytes / 1e9:.2f} GB shared — copied {my_params} params "
+            f"+ {my_bufs} buffers ({dt_ms:.0f} ms, shm={self._shm_name})"
         )
 
     def _register_shm(self, total_bytes: int) -> None:
@@ -779,8 +800,8 @@ class SharedPinnedParamCache(BasePinnedCache):
         for name, param in module.named_parameters():
             if param.device.type != "cuda":
                 continue
-            # Writer refreshes shared buffer; readers skip the copy
-            if self._is_writer and name in self._cpu_params:
+            # Each rank refreshes only the params it owns
+            if name in self._owned_params and name in self._cpu_params:
                 self._cpu_params[name].copy_(param.data, non_blocking=non_blocking)
             self._collect_storage(param.data, freed_ptrs)
             offloaded += 1
@@ -788,7 +809,7 @@ class SharedPinnedParamCache(BasePinnedCache):
         for name, buf in module.named_buffers():
             if buf.device.type != "cuda":
                 continue
-            if self._is_writer and name in self._cpu_buffers:
+            if name in self._owned_buffers and name in self._cpu_buffers:
                 self._cpu_buffers[name].copy_(buf.data, non_blocking=non_blocking)
             self._collect_storage(buf.data, freed_ptrs)
 
@@ -838,8 +859,8 @@ class SharedPinnedParamCache(BasePinnedCache):
         for name, param in module.named_parameters():
             if param.device.type == "cuda":
                 if name in self._cpu_params:
-                    # Writer refreshes shared buffer; readers skip the copy
-                    if self._is_writer:
+                    # Each rank refreshes only the params it owns
+                    if name in self._owned_params:
                         self._cpu_params[name].copy_(param.data, non_blocking=non_blocking)
                     self._collect_storage(param.data, freed_ptrs)
                     cuda_count += 1
@@ -858,7 +879,7 @@ class SharedPinnedParamCache(BasePinnedCache):
         for name, buf in module.named_buffers():
             if buf.device.type == "cuda":
                 if name in self._cpu_buffers:
-                    if self._is_writer:
+                    if name in self._owned_buffers:
                         self._cpu_buffers[name].copy_(buf.data, non_blocking=non_blocking)
                     self._collect_storage(buf.data, freed_ptrs)
 
