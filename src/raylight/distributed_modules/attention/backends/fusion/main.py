@@ -56,7 +56,19 @@ def compact_set_step(step):
         reset_attn_layer_idx()
     except (ImportError, AttributeError):
         pass
+    # Invalidate the mask triviality cache so that masks reused across steps
+    # are re-checked with fresh content.
+    try:
+        from raylight.distributed_modules.attention import invalidate_mask_cache
+        invalidate_mask_cache()
+    except (ImportError, AttributeError):
+        pass
     context.compact_set_step(step)
+    # Flush dequant cache at step boundaries — the underlying quantized data
+    # is about to be overwritten by new compress/put calls, so stale dequant
+    # entries must be dropped.
+    if context._cache is not None and hasattr(context._cache, '_dequant_cache'):
+        context._cache._dequant_cache.clear()
 
 def compact_get_step():
     return context.compact_get_step()
@@ -74,6 +86,13 @@ def compact_reset():
     try:
         from raylight.distributed_modules.attention.layer import reset_attn_layer_idx
         reset_attn_layer_idx()
+    except (ImportError, AttributeError):
+        pass
+
+    # Clear mask triviality cache between generation runs.
+    try:
+        from raylight.distributed_modules.attention import invalidate_mask_cache
+        invalidate_mask_cache()
     except (ImportError, AttributeError):
         pass
 

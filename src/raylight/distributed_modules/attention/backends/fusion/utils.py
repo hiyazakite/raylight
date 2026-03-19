@@ -139,9 +139,21 @@ class CompactCache:
         self.quant_bits = quant_bits
         self.base = {}
         self.delta_base = {}
+        # OPT: LRU dequantized-base cache.  Avoids redundant INT8/INT4 → FP16
+        # conversions when the same key is fetched multiple times within a single
+        # ring forward pass (compress reads it once, decompress reads it again
+        # world_size-1 times).  Bounded to _DEQUANT_CACHE_MAX entries so that
+        # memory usage stays proportional to the number of live layers.
+        self._dequant_cache: dict[str, torch.Tensor] = {}
+        _DEQUANT_CACHE_MAX = 512  # well above typical layer counts
+        self._dequant_cache_max = _DEQUANT_CACHE_MAX
         if quantize:
             assert ALLOW_DEPRECATED or quant_bits in [4, 8]
         self.passed_count = 0
+
+    def _invalidate_dequant(self, key: str):
+        """Drop the dequant cache entry for *key* after a put() overwrites raw data."""
+        self._dequant_cache.pop(key, None)
 
     # @Profiler.prof_func("compact.CompactCache.put")
     def put(self, key, base, delta_base):
@@ -160,12 +172,7 @@ class CompactCache:
                 else:
                     base = quantize_int4(base)
         self.base[key] = base
-        # from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
-        # from raylight.distributed_modules.collector.collector import collect
-        # if "k" in key:
-        #     collect(base, "kbase", compact_get_step(), int(key.split("-")[0]))
-        # elif "v" in key:
-        #     collect(base, "vbase", compact_get_step(), int(key.split("-")[0]))
+        self._invalidate_dequant(key)  # raw data changed → cached dequant stale
         # Compress or store delta_base
         if delta_base is not None:
             self.delta_base[key] = delta_base
@@ -174,6 +181,15 @@ class CompactCache:
 
     # @Profiler.prof_func("compact.CompactCache.get_base")
     def get_base(self, key, expected_shape: tuple = None, expected_dtype: torch.dtype = None):
+        # Fast path: return cached dequantized tensor if available
+        cached = self._dequant_cache.get(key)
+        if cached is not None:
+            if ((expected_shape is None or cached.shape == expected_shape) and
+                    (expected_dtype is None or cached.dtype == expected_dtype)):
+                return cached
+            # Shape/dtype mismatch → stale entry
+            self._dequant_cache.pop(key, None)
+
         base = self.base.get(key, None)
         if self.quantize:
             if base is not None:
@@ -193,6 +209,9 @@ class CompactCache:
             # Check dtype
             if expected_dtype is not None and base.dtype != expected_dtype:
                 return None
+            # Populate dequant cache (bounded size)
+            if self.quantize and len(self._dequant_cache) < self._dequant_cache_max:
+                self._dequant_cache[key] = base
         return base
 
     # @Profiler.prof_func("compact.CompactCache.get_delta_base") 

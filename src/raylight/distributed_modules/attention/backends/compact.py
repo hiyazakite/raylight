@@ -93,6 +93,11 @@ class CompactAttentionBackend(AttentionBackend):
         )
 
         # 4. Wrapper Function (same signature as Standard)
+        # OPT: Pre-computed softmax_scale per head_dim avoids redundant
+        # exponentiation on every attention call.  head_dim is constant for
+        # the lifetime of a model, so we cache after the first call.
+        _softmax_scale_cache: dict[int, float] = {}
+
         def _attention_xfuser_compact_unmask(
                 q, k, v, heads,
                 join_q=None, join_k=None, join_v=None,
@@ -125,6 +130,12 @@ class CompactAttentionBackend(AttentionBackend):
                  if mask.ndim == 2: mask = mask.unsqueeze(0)
                  if mask.ndim == 3: mask = mask.unsqueeze(1)
             
+            # OPT: Pre-compute softmax_scale once per head_dim (constant for model lifetime)
+            scale = _softmax_scale_cache.get(dim_head)
+            if scale is None:
+                scale = dim_head ** -0.5
+                _softmax_scale_cache[dim_head] = scale
+
             if join_q is not None:
                 assert join_k is not None and join_v is not None
                 out = xfuser_attn(
@@ -135,6 +146,7 @@ class CompactAttentionBackend(AttentionBackend):
                     joint_tensor_key=join_k,
                     joint_tensor_value=join_v,
                     mask=mask,
+                    softmax_scale=scale,
                     mod_idx=kwargs.get("mod_idx"),
                     current_iter=kwargs.get("current_iter"),
                 )
@@ -143,6 +155,7 @@ class CompactAttentionBackend(AttentionBackend):
                     None,
                     q, k, v,
                     mask=mask,
+                    softmax_scale=scale,
                     mod_idx=kwargs.get("mod_idx"),
                     current_iter=kwargs.get("current_iter"),
                 )

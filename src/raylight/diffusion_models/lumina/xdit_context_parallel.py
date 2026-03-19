@@ -10,11 +10,9 @@ import raylight.distributed_modules.attention as xfuser_attn
 from raylight.distributed_modules.sequence_parallel import extract_local_tensor
 import comfy
 
-attn_type = xfuser_attn.get_attn_type()
-sync_ulysses = xfuser_attn.get_sync_ulysses()
 # Lumina is non-causal, so we force "basic" ring implementation to avoid zigzag overhead/assertion
 ring_impl_type = "basic"
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
+xfuser_optimized_attention = xfuser_attn.make_lazy_attention(ring_impl_type_override="basic")
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):

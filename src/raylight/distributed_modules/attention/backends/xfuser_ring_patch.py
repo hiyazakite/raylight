@@ -250,15 +250,8 @@ def xdit_ring_zigzag_flash_attn_forward_patched(
         k = k.contiguous()
         v = v.contiguous()
 
-    has_nontrivial_mask = False
-    if mask is not None:
-        if mask.numel() <= 1:
-            has_nontrivial_mask = not (mask.item() == 0)
-        else:
-            flat = mask.reshape(-1)
-            sample_indices = [0, flat.numel() // 2, flat.numel() - 1]
-            sampled = flat[sample_indices]
-            has_nontrivial_mask = not (sampled.eq(0).all().item())
+    from raylight.distributed_modules.attention import check_mask_nontrivial
+    has_nontrivial_mask = check_mask_nontrivial(mask)
 
     def iterate_attn(_q, _k, _v, _causal, _mask_chunk):
         if has_nontrivial_mask and _mask_chunk is not None:
@@ -390,18 +383,9 @@ def xdit_ring_flash_attn_forward_patched(
         k = k.contiguous()
         v = v.contiguous()
 
-    # OPT 1: Avoid GPU-CPU sync — check mask triviality without .all()
-    # Use numel-based fast check: singleton zero or small tensor sampled check
-    has_nontrivial_mask = False
-    if mask is not None:
-        if mask.numel() <= 1:
-            has_nontrivial_mask = not (mask.item() == 0)
-        else:
-            # Sample a few elements instead of full synchronous .all()
-            flat = mask.reshape(-1)
-            sample_indices = [0, flat.numel() // 2, flat.numel() - 1]
-            sampled = flat[sample_indices]
-            has_nontrivial_mask = not (sampled.eq(0).all().item())
+    # OPT 1: Avoid GPU-CPU sync — use cached triviality check
+    from raylight.distributed_modules.attention import check_mask_nontrivial
+    has_nontrivial_mask = check_mask_nontrivial(mask)
 
     next_k = None
     next_v = None

@@ -9,6 +9,7 @@ except ImportError:
     import tqdm as tqdm_auto
 import ctypes
 import gc
+import time
 
 class Noise_EmptyNoise:
     def __init__(self):
@@ -72,8 +73,25 @@ def force_malloc_trim():
     except Exception as e:
         print(f"[Raylight] Warning: malloc_trim failed: {e}")
 
-def cleanup_memory():
-    """Performs comprehensive memory cleanup."""
+def cleanup_memory(force: bool = False):
+    """Performs comprehensive memory cleanup.
+
+    When *force* is False (the default), calls within ``_CLEANUP_DEBOUNCE_SEC``
+    of the previous cleanup are silently skipped.  This avoids stacking
+    multiple expensive gc.collect() + cuda.empty_cache() calls during rapid
+    sequential operations (e.g. model-swap → LoRA apply → VAE load) that
+    each individually request cleanup.
+
+    Pass ``force=True`` to bypass the debounce (e.g. final teardown).
+    """
+    _CLEANUP_DEBOUNCE_SEC = 0.5  # 500 ms
+
+    now = time.monotonic()
+    last = getattr(cleanup_memory, "_last_ts", 0.0)
+    if not force and (now - last) < _CLEANUP_DEBOUNCE_SEC:
+        return
+    cleanup_memory._last_ts = now
+
     gc.collect()
     comfy.model_management.soft_empty_cache()
     if torch.cuda.is_available():

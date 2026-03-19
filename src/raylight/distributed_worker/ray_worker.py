@@ -687,6 +687,10 @@ class RayWorker:
             self.vae_manager.get_spatial_compression(),
         )
 
+    def ray_vae_offload(self):
+        """Offload VAE from VRAM after all work-stealing chunks complete."""
+        self.vae_manager.offload_vae_from_device(self.config, self.lora_manager)
+
     def ray_vae_release(self):
         result = self.vae_manager.release_vae(self.local_rank)
         self.vae_model = None
@@ -717,6 +721,7 @@ class RayWorker:
         latent_ref=None,
         latent_slice_start=None,
         latent_slice_end=None,
+        skip_offload=False,
     ):
         return self.vae_manager.decode(
             shard_index,
@@ -736,6 +741,7 @@ class RayWorker:
             latent_ref=latent_ref,
             latent_slice_start=latent_slice_start,
             latent_slice_end=latent_slice_end,
+            skip_offload=skip_offload,
         )
 
 

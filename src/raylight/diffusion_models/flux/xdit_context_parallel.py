@@ -11,10 +11,12 @@ from xfuser.core.distributed import (
 from ..utils import pad_to_world_size
 import raylight.distributed_modules.attention as xfuser_attn
 from raylight.distributed_modules.sequence_parallel import extract_local_tensor
-attn_type = xfuser_attn.get_attn_type()
-sync_ulysses = xfuser_attn.get_sync_ulysses()
-ring_impl_type = getattr(xfuser_attn, "get_ring_impl_type", lambda: "basic")()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
+xfuser_optimized_attention = xfuser_attn.make_lazy_attention()
+
+
+def _get_ring_impl_type():
+    """Read ring_impl_type lazily so config changes take effect between runs."""
+    return getattr(xfuser_attn, "get_ring_impl_type", lambda: "basic")()
 
 
 def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
@@ -136,8 +138,8 @@ def usp_dit_forward(
         pe_combine = None
         pe_image = None
 
-    img = extract_local_tensor(img, ring_impl_type=ring_impl_type)
-    txt = extract_local_tensor(txt, ring_impl_type=ring_impl_type)
+    img = extract_local_tensor(img, ring_impl_type=_get_ring_impl_type())
+    txt = extract_local_tensor(txt, ring_impl_type=_get_ring_impl_type())
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     if "post_input" in patches:
@@ -185,7 +187,8 @@ def usp_dit_forward(
                 if add is not None:
                     img += add
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    torch.cuda.current_stream().synchronize()
+    # NOTE: synchronize() removed — all_gather is stream-ordered via NCCL and
+    # already sees all preceding CUDA work on the current stream.
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
     txt = get_sp_group().all_gather(txt.contiguous(), dim=1)
     img = img[:, :img_orig_size, :]
@@ -201,8 +204,28 @@ def usp_dit_forward(
 
     if self.params.global_modulation:
         vec, _ = self.single_stream_modulation(vec_orig)
-    img = extract_local_tensor(img, ring_impl_type=ring_impl_type)
+    img = extract_local_tensor(img, ring_impl_type=_get_ring_impl_type())
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+
+    # Pre-compute the number of text tokens that fall within this rank's
+    # local chunk.  After extract_local_tensor the combined (txt+img)
+    # sequence is split across SP ranks, so the global txt↔img boundary
+    # maps to a different local offset per rank.
+    _sp_world = get_sequence_parallel_world_size()
+    if _sp_world > 1:
+        _sp_rank = get_sequence_parallel_rank()
+        _local_seq = img.shape[1]  # local chunk length
+        _txt_len = txt.shape[1]    # full (gathered) text length
+        _rim = _get_ring_impl_type()
+        if _rim == "zigzag":
+            _half = _local_seq // 2
+            _front_start = _sp_rank * _half
+            _local_txt_tokens = max(0, min(_txt_len - _front_start, _half))
+        else:  # basic
+            _global_start = _sp_rank * _local_seq
+            _local_txt_tokens = max(0, min(_txt_len - _global_start, _local_seq))
+    else:
+        _local_txt_tokens = txt.shape[1]
 
     transformer_options["total_blocks"] = len(self.single_blocks)
     transformer_options["block_type"] = "single"
@@ -232,10 +255,10 @@ def usp_dit_forward(
             if i < len(control_o):
                 add = control_o[i]
                 if add is not None:
-                    img[:, txt.shape[1]:, ...] += add
+                    img[:, _local_txt_tokens:, ...] += add
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
-    torch.cuda.current_stream().synchronize()
+    # NOTE: synchronize() removed — all_gather is stream-ordered via NCCL.
     img = get_sp_group().all_gather(img.contiguous(), dim=1)
     img = img[:, :img_orig_size, :]
     # ======================== ADD SEQUENCE PARALLEL ========================= #
