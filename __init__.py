@@ -35,6 +35,14 @@ from raylight.comfy_extra_dist.nodes_ltx_ffn_chunker import NODE_DISPLAY_NAME_MA
 from raylight.comfy_extra_dist.nodes_dit_fast_attn import NODE_CLASS_MAPPINGS as DIT_FAST_ATTN_CLASS_MAPPINGS
 from raylight.comfy_extra_dist.nodes_dit_fast_attn import NODE_DISPLAY_NAME_MAPPINGS as DIT_FAST_ATTN_DISPLAY_MAPPINGS
 
+try:
+    from raylight.comfy_extra_dist.int8 import NODE_CLASS_MAPPINGS as INT8_NODE_CLASS_MAPPINGS
+    from raylight.comfy_extra_dist.int8 import NODE_DISPLAY_NAME_MAPPINGS as INT8_NODE_DISPLAY_NAME_MAPPINGS
+except Exception as e:
+    print(f"[Raylight] INT8 nodes unavailable (triton / comfy-kitchen required): {e}")
+    INT8_NODE_CLASS_MAPPINGS = {}
+    INT8_NODE_DISPLAY_NAME_MAPPINGS = {}
+
 if os.getenv("debug_raylight") == "1":
     print("RAYLIGHT DEBUG MODE")
     from raylight.nodes_debug import NODE_CLASS_MAPPINGS as DEBUG_NODE_CLASS_NAME_MAPPINGS
@@ -64,6 +72,7 @@ NODE_CLASS_MAPPINGS.update(EASY_CACHE_NODE_CLASS_MAPPINGS)
 NODE_CLASS_MAPPINGS.update(SAMPLER_CLASS_MAPPINGS)
 NODE_CLASS_MAPPINGS.update(LTX_FFN_NODE_CLASS_MAPPINGS)
 NODE_CLASS_MAPPINGS.update(DIT_FAST_ATTN_CLASS_MAPPINGS)
+NODE_CLASS_MAPPINGS.update(INT8_NODE_CLASS_MAPPINGS)
 
 
 # DISPLAY
@@ -72,6 +81,7 @@ NODE_DISPLAY_NAME_MAPPINGS.update(EASY_CACHE_DISPLAY_NAME_MAPPINGS)
 NODE_DISPLAY_NAME_MAPPINGS.update(SAMPLER_DISPLAY_MAPPINGS)
 NODE_DISPLAY_NAME_MAPPINGS.update(LTX_FFN_NODE_DISPLAY_NAME_MAPPINGS)
 NODE_DISPLAY_NAME_MAPPINGS.update(DIT_FAST_ATTN_DISPLAY_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(INT8_NODE_DISPLAY_NAME_MAPPINGS)
 
 __all__ = [
     "NODE_CLASS_MAPPINGS",

@@ -81,6 +81,33 @@ def _compute_vram_budget(
     return budget
 
 
+# ---------------------------------------------------------------------------
+# Custom ops selection (SafetensorOps vs Int8SafetensorOps)
+# ---------------------------------------------------------------------------
+
+def _ops_for_model_options(model_options: Dict[str, Any]):
+    """Return the correct custom_operations class for *model_options*.
+
+    When ``model_options`` contains the ``int8_quantize`` flag the INT8-aware
+    hybrid ops (``Int8SafetensorOps``) are used.  Otherwise, the default
+    zero-copy ``SafetensorOps`` are returned.
+    """
+    from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
+
+    if model_options.get("int8_quantize"):
+        try:
+            from raylight.comfy_extra_dist.int8.int8_distributed_ops import Int8SafetensorOps
+            if Int8SafetensorOps is not None:
+                # Propagate per-load configuration
+                Int8SafetensorOps.dynamic_quantize = model_options.get("int8_dynamic", False)
+                Int8SafetensorOps.excluded_names = model_options.get("int8_excluded_names", [])
+                Int8SafetensorOps._is_prequantized = False
+                return Int8SafetensorOps
+        except ImportError:
+            pass
+    return SafetensorOps
+
+
 @dataclass
 class ModelState:
     """Immutable snapshot of model loading parameters."""
@@ -915,7 +942,6 @@ class LazyTensorContext(ModelContext):
         """Instantiate model with lazy state dict (zero-copy until load)."""
         import comfy.sd
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
-        from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
         from raylight.comfy_dist.model_patcher import RaylightModelPatcher
         
         print("[LazyTensorContext] Wrapping state dict with LazySafetensors...")
@@ -923,7 +949,7 @@ class LazyTensorContext(ModelContext):
         
         load_options = state.model_options.copy()
         cast_dtype = load_options.pop("dtype", None)
-        load_options["custom_operations"] = SafetensorOps
+        load_options["custom_operations"] = _ops_for_model_options(load_options)
         
         model = comfy.sd.load_diffusion_model_state_dict(
             lazy_sd, model_options=load_options, metadata=metadata,
@@ -970,6 +996,7 @@ class LazyTensorContext(ModelContext):
         
         load_options = state.model_options.copy()
         cast_dtype = load_options.pop("dtype", None)
+        load_options["custom_operations"] = _ops_for_model_options(load_options)
         
         model = comfy.sd.load_diffusion_model_state_dict(isolated, model_options=load_options)
         
@@ -1365,7 +1392,6 @@ class FSDPContext(ModelContext):
     def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfig", metadata: Any = None, load_weights: bool = True, **kwargs):
         from raylight.comfy_dist.sd import fsdp_load_diffusion_model_stat_dict
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
-        from raylight.expansion.comfyui_lazytensors.ops import SafetensorOps
         
         # Apply One-Time FSDP Patches (like legacy _apply_fsdp_patches)
         import comfy.model_patcher as model_patcher
@@ -1380,10 +1406,9 @@ class FSDPContext(ModelContext):
            print("[FSDPContext] Wrapping state dict with LazySafetensors for JIT loading...")
            sd = wrap_state_dict_lazy(sd)
         
-        # Inject SafetensorOps to handle zero-copy assignment
-        # Unconditionally overwrite to ensure we use SafetensorLayer (like LazyTensorContext)
+        # Inject appropriate ops: either INT8-aware hybrid or default SafetensorOps
         model_options = state.model_options.copy()
-        model_options["custom_operations"] = SafetensorOps
+        model_options["custom_operations"] = _ops_for_model_options(model_options)
 
         model, state_dict = fsdp_load_diffusion_model_stat_dict(
             sd,

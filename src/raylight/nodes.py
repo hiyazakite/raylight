@@ -663,6 +663,20 @@ class RayInitializerAdvanced(RayInitializer):
     CATEGORY = "Raylight"
 
 
+# ---------------------------------------------------------------------------
+# INT8 architecture exclusion lists (shared with standalone INT8 loader)
+# ---------------------------------------------------------------------------
+def _guess_int8_exclusions(unet_name: str) -> list:
+    """Best-effort architecture detection from filename for INT8 layer exclusions."""
+    try:
+        from raylight.comfy_extra_dist.int8.nodes_int8_loader import (
+            _MODEL_EXCLUSIONS, _guess_exclusions,
+        )
+        return _guess_exclusions(unet_name)
+    except ImportError:
+        return []
+
+
 class RayUNETLoader:
     @classmethod
     def INPUT_TYPES(cls):
@@ -678,6 +692,8 @@ class RayUNETLoader:
                         "fp8_e5m2",
                         "bf16",
                         "fp16",
+                        "int8",
+                        "int8_dynamic",
                     ],
                 ),
                 "ray_actors_init": (
@@ -709,6 +725,11 @@ class RayUNETLoader:
             model_options["fp8_optimizations"] = True
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
+        elif weight_dtype in ("int8", "int8_dynamic"):
+            model_options["int8_quantize"] = True
+            model_options["int8_dynamic"] = (weight_dtype == "int8_dynamic")
+            # Auto-detect architecture exclusions from filename
+            model_options["int8_excluded_names"] = _guess_int8_exclusions(unet_name)
 
         try:
             unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
