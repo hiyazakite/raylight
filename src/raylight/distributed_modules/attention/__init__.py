@@ -59,3 +59,79 @@ def make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=None):
 
     backend = AttentionRegistry.get(backend_name)
     return backend.create_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
+
+
+def make_lazy_attention(ring_impl_type_override=None):
+    """Return a callable that resolves the attention backend lazily at call time.
+
+    Unlike ``make_xfuser_attention`` (which captures the backend config at
+    creation time), the returned function re-reads ``get_attn_type()``,
+    ``get_sync_ulysses()``, ``get_ring_impl_type()`` and the
+    ``RAYLIGHT_ATTN_BACKEND`` env-var on **every invocation**.  This means
+    that changing the backend between ComfyUI queue items takes effect
+    immediately without restarting Ray worker processes.
+
+    ``ring_impl_type_override`` – if not None, pins the ring implementation
+    (e.g. ``"basic"`` for non-causal models like LTX / Lumina) instead of
+    reading the global setting.
+    """
+    def _lazy_attention(*args, **kwargs):
+        attn_type = get_attn_type()
+        sync_ulysses = get_sync_ulysses()
+        rim = ring_impl_type_override if ring_impl_type_override is not None else get_ring_impl_type()
+        fn = make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=rim)
+        return fn(*args, **kwargs)
+    return _lazy_attention
+
+
+# Bounded module-level cache for mask triviality results.  Keyed by
+# ``id(mask)`` so the same mask tensor object (passed through many ring
+# steps / layers in one forward pass) is only checked once.  The cache is
+# very small (typically 1-2 distinct masks per forward) and is cleared when
+# it reaches the cap to avoid accumulating stale entries.
+_mask_nontrivial_cache: dict[int, bool] = {}
+_MASK_CACHE_MAX = 8
+
+
+def invalidate_mask_cache():
+    """Clear the mask triviality cache.
+
+    Call at step boundaries or when mask content is modified in-place to
+    prevent stale cached results from silently disabling masking.
+    """
+    _mask_nontrivial_cache.clear()
+
+
+def check_mask_nontrivial(mask):
+    """Check if an attention mask has any non-zero entries.
+
+    Uses ``torch.any`` for a complete check (no sampling heuristic) with a
+    single GPU→CPU scalar transfer, and caches the result per mask object
+    in a bounded module-level dict so repeat calls within the same forward
+    pass are free.
+
+    Returns ``False`` when *mask* is ``None``.
+    """
+    if mask is None:
+        return False
+
+    key = id(mask)
+    result = _mask_nontrivial_cache.get(key)
+    if result is not None:
+        return result
+
+    if mask.numel() == 0:
+        result = False
+    elif mask.numel() <= 1:
+        result = bool(mask.item() != 0)
+    else:
+        # torch.any → single-element bool tensor → one .item() GPU→CPU sync.
+        # This is a complete, correct check (no sampling false-negatives).
+        result = bool(mask.any().item())
+
+    # Bounded cache: evict all entries when full to keep memory and lookup
+    # cost trivial.  In practice there are only 1-2 distinct masks.
+    if len(_mask_nontrivial_cache) >= _MASK_CACHE_MAX:
+        _mask_nontrivial_cache.clear()
+    _mask_nontrivial_cache[key] = result
+    return result

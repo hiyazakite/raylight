@@ -290,16 +290,9 @@ def _compact_ring_fwd(
     out = None
     lse = None
 
-    # OPT 1: Avoid GPU-CPU sync — use sampled check instead of full .all()
-    has_nontrivial_mask = False
-    if mask is not None:
-        if mask.numel() <= 1:
-            has_nontrivial_mask = (mask.item() != 0)
-        else:
-            flat = mask.reshape(-1)
-            sample_indices = [0, flat.numel() // 2, flat.numel() - 1]
-            sampled = flat[sample_indices]
-            has_nontrivial_mask = not (sampled.eq(0).all().item())
+    # OPT 1: Avoid GPU-CPU sync — use cached triviality check
+    from raylight.distributed_modules.attention import check_mask_nontrivial
+    has_nontrivial_mask = check_mask_nontrivial(mask)
 
     config = compact_config()
     if config:

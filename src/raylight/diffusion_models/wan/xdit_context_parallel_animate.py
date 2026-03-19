@@ -10,9 +10,7 @@ import raylight.distributed_modules.attention as xfuser_attn
 from .xdit_context_parallel import sinusoidal_embedding_1d
 from ..utils import pad_to_world_size
 
-attn_type = xfuser_attn.get_attn_type()
-sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+xfuser_optimized_attention = xfuser_attn.make_lazy_attention()
 
 
 def usp_face_block_forward(

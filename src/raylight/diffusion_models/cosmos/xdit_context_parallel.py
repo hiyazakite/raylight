@@ -25,9 +25,7 @@ from xfuser.core.distributed import (
     get_sp_group,
 )
 import raylight.distributed_modules.attention as xfuser_attn
-attn_type = xfuser_attn.get_attn_type()
-sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+xfuser_optimized_attention = xfuser_attn.make_lazy_attention()
 
 
 def pad_if_odd(t: torch.Tensor, dim: int = 1):

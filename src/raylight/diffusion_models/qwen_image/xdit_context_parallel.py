@@ -8,9 +8,7 @@ from xfuser.core.distributed import (
 )
 from ..utils import pad_to_world_size
 import raylight.distributed_modules.attention as xfuser_attn
-attn_type = xfuser_attn.get_attn_type()
-sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+xfuser_optimized_attention = xfuser_attn.make_lazy_attention()
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):

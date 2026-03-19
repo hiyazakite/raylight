@@ -47,7 +47,15 @@ def _wrap_fp8_tensor(qtensor, qdata):
 def _handle_all_gather(qt, args, kwargs):
     # args: (tensor, ...) or (output_tensor, input_tensor, ...) depending on call
     # torch.ops._c10d_functional.all_gather_into_tensor.default(output, input, group_name, ...)
-    
+    #
+    # NOTE (correctness): The gathered output reuses the *input shard's* scale
+    # and orig_dtype.  This is correct when all shards originate from the same
+    # QuantizedTensor (the FSDP pattern: quantize → split → all_gather) because
+    # every shard shares the identical per-tensor scale.  If shards were
+    # independently re-quantized with differing scales, the result would be
+    # numerically wrong.  We add a comment rather than an assertion because
+    # the peer shards' scales are not available locally before the gather.
+    #
     # We need to find the input tensor which is QuantizedTensor
     input_tensor = None
     input_idx = None
@@ -236,6 +244,27 @@ def _handle_fp8_cat(qt, args, kwargs):
             first_qtensor = item
 
     assert first_qtensor is not None
+
+    # Verify all tensors share the same quantization scale.  The output uses
+    # only the first tensor's scale/orig_dtype, so differing scales would
+    # silently produce incorrect dequantization.
+    _ref_scale = first_qtensor._params.scale
+    for idx, item in enumerate(tensors[1:], start=1):
+        _item_scale = item._params.scale
+        try:
+            _scales_equal = torch.equal(
+                torch.as_tensor(_ref_scale), torch.as_tensor(_item_scale)
+            )
+        except Exception:
+            _scales_equal = (_ref_scale == _item_scale)
+        if not _scales_equal:
+            logger.warning(
+                "[Raylight] FP8 cat: tensor %d has a different scale "
+                "(%s vs %s). Using first tensor's scale — result may be "
+                "numerically incorrect.", idx, _ref_scale, _item_scale,
+            )
+            break
+
     concatenated_qdata = torch.ops.aten.cat.default(qdata_list, *args[1:], **kwargs)
     return _wrap_fp8_tensor(first_qtensor, concatenated_qdata)
 

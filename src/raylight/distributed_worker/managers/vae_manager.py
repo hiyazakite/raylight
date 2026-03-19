@@ -1,3 +1,4 @@
+import os
 import torch
 from raylight.utils.memory import monitor_memory
 from raylight.utils.common import cleanup_memory, force_malloc_trim
@@ -5,9 +6,14 @@ from raylight.utils.common import cleanup_memory, force_malloc_trim
 from typing import Optional, Any
 from raylight.distributed_worker.worker_config import WorkerConfig
 
+# Gate expensive per-chunk diagnostics behind env var (each .item() forces GPU→CPU sync)
+DEBUG_VAE_STATS = os.environ.get("RAYLIGHT_DEBUG_VAE", "0") == "1"
+
 class VaeManager:
     def __init__(self):
         self.vae_model = None
+        self._cached_dtype = None    # (preference, dtype) — avoids redundant logging per chunk
+        self._mmap_cache = None      # (path, shape_tuple, buffer) — reuse across work-stealing chunks
 
     def load_vae(
         self, 
@@ -51,15 +57,30 @@ class VaeManager:
         return vae_model
 
 
+    def offload_vae_from_device(self, config: WorkerConfig, lora_manager: Optional[Any] = None):
+        """Explicitly offload VAE from VRAM back to CPU/mmap after work-stealing completes."""
+        # Release per-job caches (mmap buffer, dtype decision)
+        self._mmap_cache = None
+        self._cached_dtype = None
+        if self.vae_model is None:
+            return
+        from raylight.distributed_worker.model_context import VAEContext
+        vae_ctx = VAEContext(use_mmap=config.parallel_dict.get("use_mmap", True))
+        vae_ctx.offload(self.vae_model, lora_manager, {}, config)
+        print(f"[RayWorker {config.local_rank}] VAE offloaded from VRAM.")
+        force_malloc_trim()
+
     def release_vae(self, local_rank: int):
         """Explicitly release VAE model from memory to free RAM for other operations."""
+        self._mmap_cache = None
+        self._cached_dtype = None
         if self.vae_model is not None:
             print(f"[RayWorker {local_rank}] Releasing VAE model from RAM...")
             del self.vae_model
             self.vae_model = None
             
-            # Aggressive cleanup
-            cleanup_memory()
+            # Aggressive cleanup (force=True bypasses debounce for teardown)
+            cleanup_memory(force=True)
             
             # Force OS to reclaim freed memory
             force_malloc_trim()
@@ -118,6 +139,7 @@ class VaeManager:
         latent_ref=None,
         latent_slice_start=None,
         latent_slice_end=None,
+        skip_offload=False,
     ):
         if config is None:
              raise ValueError("WorkerConfig must be passed to decode")
@@ -148,8 +170,10 @@ class VaeManager:
     
             # 1. Select and Configure Dtype
             dtype = self._select_dtype(vae_dtype, config.local_rank)
-            self.vae_model.first_stage_model.to(dtype)
-            self.vae_model.vae_dtype = dtype
+            # Only cast when dtype actually changes (skips iterating all params on repeat chunks)
+            if getattr(self.vae_model, 'vae_dtype', None) != dtype:
+                self.vae_model.first_stage_model.to(dtype)
+                self.vae_model.vae_dtype = dtype
             
             # 2. Transfer Latents (Optimized)
             # If latent_ref is provided, it's already resolved by Ray's actor call
@@ -194,53 +218,52 @@ class VaeManager:
             return result
         
         finally:
-            # Release VAE from GPU VRAM using context's offload method
-            # (Consistent with diffusion model pattern)
-            # Release VAE from GPU VRAM using context's offload method
-            # (Consistent with diffusion model pattern)
-            
-            # Use factory to get correct context type (VAE defaults to standard VAEContext)
-            # We don't have the original path easily here if not stored, 
-            # BUT VAEs are almost always standard unless we support GGUF VAEs (rare).
-            # For now, we reconstruct standard VAEContext or rely on what load_vae used.
-            # Strategy: Default to VAEContext since we don't persist 'ctx' in manager.
-            
-            from raylight.distributed_worker.model_context import VAEContext
-            vae_ctx = VAEContext(use_mmap=config.parallel_dict.get("use_mmap", True))
-            vae_ctx.offload(self.vae_model, lora_manager, {}, config)
-            
-            print(f"[RayWorker {config.local_rank}] VAE Offload in finally block complete.")
-            
-            # Force OS to reclaim freed memory (fixes RSS creep on Worker 0)
-            force_malloc_trim()
+            # Offload VAE from GPU back to CPU/mmap unless skip_offload is set.
+            # With dynamic work-stealing, the same worker may receive more chunks,
+            # so we keep the VAE on GPU to avoid the costly re-stream.
+            # The master calls release_vae (or explicit offload) after all chunks complete.
+            if not skip_offload:
+                from raylight.distributed_worker.model_context import VAEContext
+                vae_ctx = VAEContext(use_mmap=config.parallel_dict.get("use_mmap", True))
+                vae_ctx.offload(self.vae_model, lora_manager, {}, config)
+                print(f"[RayWorker {config.local_rank}] VAE Offload in finally block complete.")
+                force_malloc_trim()
 
     def _select_dtype(self, preference, local_rank):
         """Selects appropriate VAE dtype based on hardware and preference."""
+        # Fast path: return cached dtype for repeat work-stealing chunks
+        if self._cached_dtype is not None and self._cached_dtype[0] == preference:
+            return self._cached_dtype[1]
+
         if preference == "auto":
             if torch.cuda.is_bf16_supported():
                 print(f"[RayWorker {local_rank}] Using bfloat16 VAE (auto: bf16 supported)")
-                return torch.bfloat16
+                dtype = torch.bfloat16
             else:
                 print(f"[RayWorker {local_rank}] Using float32 VAE (auto: bf16 not supported)")
-                return torch.float32
+                dtype = torch.float32
         elif preference == "bf16":
             print(f"[RayWorker {local_rank}] Using bfloat16 VAE (user selected)")
-            return torch.bfloat16
+            dtype = torch.bfloat16
         elif preference == "fp16":
             print(f"[RayWorker {local_rank}] Using float16 VAE (user selected - may cause NaN on some models)")
-            return torch.float16
+            dtype = torch.float16
         else:  # fp32
             print(f"[RayWorker {local_rank}] Using float32 VAE (user selected - stable but 2x memory)")
-            return torch.float32
+            dtype = torch.float32
+
+        self._cached_dtype = (preference, dtype)
+        return dtype
 
     def _post_process_images(self, images, discard_latent_frames, local_rank, shard_index=None):
         """Normalizes image shape and handles warmup frame discarding."""
-        # Check raw output stats
-        raw_min, raw_max, raw_mean = images.min().item(), images.max().item(), images.mean().item()
-        print(f"[RayWorker {local_rank}] RAW decode stats: min={raw_min:.4f}, max={raw_max:.4f}, mean={raw_mean:.4f}")
-        
-        if torch.isnan(images).any():
-            print(f"[RayWorker {local_rank}] CRITICAL: VAE output STILL contains NaNs even in float32!")
+        # Debug stats (disabled by default — each .item() forces a GPU→CPU sync stall)
+        # Enable with RAYLIGHT_DEBUG_VAE=1 environment variable
+        if DEBUG_VAE_STATS:
+            raw_min, raw_max, raw_mean = images.min().item(), images.max().item(), images.mean().item()
+            print(f"[RayWorker {local_rank}] RAW decode stats: min={raw_min:.4f}, max={raw_max:.4f}, mean={raw_mean:.4f}")
+            if torch.isnan(images).any():
+                print(f"[RayWorker {local_rank}] CRITICAL: VAE output STILL contains NaNs even in float32!")
         
         # Shape normalization: ensure [Batch, Time, Height, Width, Channels]
         # input is typically [B, H, W, C] or [B, T, H, W, C] (after movedim)
@@ -267,21 +290,26 @@ class VaeManager:
     def _handle_output(self, images, shard_index, mmap_path, mmap_shape, output_offset, local_rank):
         """Handles output transport: direct mmap write or CPU serialization."""
         
-        # Stats for troubleshooting "Black Video" issues
-        stats_min, stats_max, stats_mean = images.min().item(), images.max().item(), images.mean().item()
-        print(f"[RayWorker {local_rank}] Shard {shard_index} statistics: min={stats_min:.4f}, max={stats_max:.4f}, mean={stats_mean:.4f}")
+        # Debug stats (disabled by default — each .item() forces a GPU→CPU sync stall)
+        if DEBUG_VAE_STATS:
+            stats_min, stats_max, stats_mean = images.min().item(), images.max().item(), images.mean().item()
+            print(f"[RayWorker {local_rank}] Shard {shard_index} statistics: min={stats_min:.4f}, max={stats_max:.4f}, mean={stats_mean:.4f}")
         
         if mmap_path and mmap_shape:
             # Fast Path: Direct write to shared memory
             print(f"[RayWorker {local_rank}] Writing directly to shared mmap: {mmap_path} (offset={output_offset}, shape={images.shape})...")
             
-            # Calculate total elements
-            num_elements = 1
-            for dim in mmap_shape: num_elements *= dim
-            
-            # Map the shared file (assumed float32 output)
-            # mmap_shape is typically [TotalFrames, H, W, 3] or [Batch, TotalFrames, H, W, 3]
-            out_buffer = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(mmap_shape)
+            # Reuse mmap buffer across work-stealing chunks (avoids re-mapping syscall per chunk)
+            mmap_shape_t = tuple(mmap_shape) if not isinstance(mmap_shape, tuple) else mmap_shape
+            if (self._mmap_cache is not None
+                    and self._mmap_cache[0] == mmap_path
+                    and self._mmap_cache[1] == mmap_shape_t):
+                out_buffer = self._mmap_cache[2]
+            else:
+                num_elements = 1
+                for dim in mmap_shape: num_elements *= dim
+                out_buffer = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(mmap_shape)
+                self._mmap_cache = (mmap_path, mmap_shape_t, out_buffer)
             
             # Calculate write length with safety clipping
             shard_frames = images.shape[1]
@@ -311,11 +339,9 @@ class VaeManager:
             # Return metadata only
             result_payload = {
                 "mmap": True,
-                "shape": images.shape,
-                "stats": (stats_min, stats_max, stats_mean)
+                "shape": list(images.shape),
             }
-            # Clean up mmap handle
-            del out_buffer
+            # Note: out_buffer kept alive in _mmap_cache for chunk reuse
             
         else:
             # Fast Path 2: Ray Object Store Transfer

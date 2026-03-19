@@ -10,11 +10,9 @@ from comfy.ldm.lightricks.model import apply_rotary_emb
 from ..utils import pad_to_world_size
 from .optimizations import prepare_pe_cached, RAYLIGHT_DEBUG, logger
 
-attn_type = xfuser_attn.get_attn_type()
-sync_ulysses = xfuser_attn.get_sync_ulysses()
 # LTX is non-causal, so we force "basic" ring implementation to avoid zigzag overhead
 ring_impl_type = "basic"
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
+xfuser_optimized_attention = xfuser_attn.make_lazy_attention(ring_impl_type_override="basic")
 
 
 # A better solution is just to type.MethodType the x, context, and pe construction,

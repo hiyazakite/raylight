@@ -1136,115 +1136,132 @@ class RayVAEDecodeDistributed:
             # Create the tensor wrapper immediately
             full_image = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(master_shape)
             
-            # 4. Dispatch Workers
-            # NOTE: Do NOT pre-divide temporal parameters by compression factor.
-            # Original ComfyUI's decode_tiled passes tile_t and overlap_t directly to decode_tiled_3d.
+            # === DYNAMIC WORK-STEALING VAE DISPATCH ===
+            # Instead of 1 big static shard per worker, split into many small
+            # micro-batches. Workers pull the next chunk when they finish,
+            # so faster GPUs naturally process more chunks and no one idles.
             
-            frames_per_shard = (total_frames + num_workers - 1) // num_workers
+            # Chunk size heuristic: aim for ~2-3x more chunks than workers
+            # to allow load balancing, but not so small that overhead dominates.
+            # Minimum 2 latent frames per chunk to keep context overhead low.
+            target_chunks = num_workers * 3
+            frames_per_chunk = max(2, total_frames // target_chunks)
+            # For very short videos, fall back to 1 chunk per worker
+            if total_frames <= num_workers:
+                frames_per_chunk = 1
             
-            futures = []
-            for i, actor in enumerate(gpu_actors):
-                start = i * frames_per_shard
-                end = min((i + 1) * frames_per_shard, total_frames)
+            # Build ordered chunk descriptors
+            chunks = []  # list of (chunk_id, context_start, actual_end, discard_latent_frames, start_video_frame)
+            chunk_id = 0
+            pos = 0
+            while pos < total_frames:
+                end = min(pos + frames_per_chunk, total_frames)
+                context_start = max(0, pos - 1)
+                # Extend by 1 for continuity into next chunk (unless last chunk)
+                actual_end = min(end + (1 if end < total_frames else 0), total_frames)
+                discard_latent_frames = pos - context_start
                 
-                if start >= total_frames:
-                    continue # No work for this worker
-                    
-                # context_start: Provide 1 frame of context to ensure continuity
-                context_start = max(0, start - 1)
-                # actual_end: Each shard must produce frames up to the START of the next shard.
-                actual_end = min(end + (1 if i < num_workers - 1 else 0), total_frames)
-                
-                # Pass how many latent frames to discard from the beginning of the result
-                discard_latent_frames = start - context_start
-                
-                # Calculate Output Offset due to temporal compression
                 if isinstance(temporal_compression, (int, float)) and temporal_compression > 1:
-                    start_video_frame = start * temporal_compression
+                    start_video_frame = pos * temporal_compression
                 else:
-                    start_video_frame = start
+                    start_video_frame = pos
                 
-                print(f"[RayVAEDecode] Shard {i}: Latents {context_start}:{actual_end} (discard {discard_latent_frames}) -> Video Frame {start_video_frame}")
-                
-                # Zero-copy dispatch: pass latent_ref + slice indices
-                # Workers resolve from Ray object store (shared memory) and slice locally
-                futures.append(actor.ray_vae_decode.remote(
-                    i, # shard_index
-                    {},  # empty samples dict (latent_ref used instead)
+                chunks.append((chunk_id, context_start, actual_end, discard_latent_frames, start_video_frame))
+                chunk_id += 1
+                pos = end
+            
+            print(f"[RayVAEDecode] Dynamic dispatch: {len(chunks)} chunks of ~{frames_per_chunk} latent frames across {num_workers} workers")
+            
+            # Helper to dispatch a chunk to an actor
+            def _dispatch_chunk(actor, chunk):
+                cid, ctx_start, ctx_end, discard, vid_offset = chunk
+                print(f"[RayVAEDecode] Chunk {cid}: Latents {ctx_start}:{ctx_end} (discard {discard}) -> Video Frame {vid_offset}")
+                return actor.ray_vae_decode.remote(
+                    cid,
+                    {},
                     tile_size,
                     overlap=overlap,
                     temporal_size=temporal_size,
                     temporal_overlap=temporal_overlap,
-                    discard_latent_frames=discard_latent_frames,
+                    discard_latent_frames=discard,
                     vae_dtype=vae_dtype,
                     mmap_path=mmap_path,
                     mmap_shape=master_shape,
-                    output_offset=start_video_frame,
+                    output_offset=vid_offset,
                     latent_ref=latent_ref,
-                    latent_slice_start=context_start,
-                    latent_slice_end=actual_end,
-                ))
-    
-            print(f"[RayVAEDecode] Dispatched {len(futures)} shards. Direct-to-disk mode enabled.")
+                    latent_slice_start=ctx_start,
+                    latent_slice_end=ctx_end,
+                    skip_offload=True,  # Keep VAE on GPU for work-stealing
+                )
             
-            # 5. Gather Results (Stats Only)
-            remaining = list(futures)
+            # Seed the queue: dispatch first batch (1 chunk per worker)
+            chunk_queue = list(chunks)  # remaining chunks to dispatch
+            inflight = {}  # ray_ref -> (actor, chunk_descriptor)
+            
+            initial_batch = min(num_workers, len(chunk_queue))
+            for i in range(initial_batch):
+                chunk = chunk_queue.pop(0)
+                ref = _dispatch_chunk(gpu_actors[i], chunk)
+                inflight[ref] = (gpu_actors[i], chunk)
+            
+            print(f"[RayVAEDecode] Seeded {initial_batch} workers, {len(chunk_queue)} chunks queued. Work-stealing enabled.")
+            
+            # Dynamic gather + re-dispatch loop
             received_count = 0
             
-            while remaining:
+            while inflight:
                 # Check ComfyUI cancel status
                 if comfy.model_management.processing_interrupted():
                     print("[Raylight] Cancellation detected during VAE decoding! Force-canceling Ray tasks...")
-                    for ref in remaining:
+                    for ref in inflight:
                         try:
                             ray.cancel(ref, force=True, recursive=True)
                         except:
                             pass
                     raise Exception("Raylight: VAE Decode canceled by user.")
 
-                ready, remaining = ray.wait(remaining, num_returns=1, timeout=1.0)
+                ready, _ = ray.wait(list(inflight.keys()), num_returns=1, timeout=1.0)
                 if not ready:
                     continue
                     
                 for ray_ref in ready:
+                    actor, completed_chunk = inflight.pop(ray_ref)
                     res_data: Any = cancellable_get(ray_ref)
-                    if res_data is None:
-                        continue
-                    shard_index, result = res_data
-                    received_count += 1
                     
-                    if isinstance(result, dict) and result.get("mmap", False):
-                        # Direct write success
-                        shape = result["shape"]
-                        stats = result["stats"]
-                        print(f"[RayVAEDecode] Shard {shard_index} wrote {shape} to mmap. Stats: {stats}")
-                    else:
-                        # Fallback (Legacy / Failure fallback)
-                        shard_data: Any = result
-                        print(f"[RayVAEDecode] Shard {shard_index} returned tensor {shard_data.shape} (Fallback path)")
+                    if res_data is not None:
+                        shard_index, result = res_data
+                        received_count += 1
                         
-                        # Write to mmap manually
-                        start = shard_index * frames_per_shard
-                        start_video_frame = start * temporal_compression if (isinstance(temporal_compression, (int, float)) and temporal_compression > 1) else start
-                        
-                        # shard_data is [Batch, T, H, W, 3] from worker
-                        s_len = shard_data.shape[1]
-                        
-                        # Handle truncation if needed
-                        if start_video_frame + s_len > total_output_frames:
-                            s_len = max(0, total_output_frames - start_video_frame)
-                            shard_data = shard_data[:, :s_len]
-                        
-                        if s_len > 0:
-                            # Use Any cast for results that linter misinterprets
-                            shard_data_any: Any = shard_data
-                            full_image_any: Any = full_image
-                            full_image_any[:, start_video_frame : start_video_frame + s_len] = shard_data_any.to(torch.float32)
-
-                        del shard_data
-
-            del remaining
-            del futures
+                        if isinstance(result, dict) and result.get("mmap", False):
+                            shape = result["shape"]
+                            print(f"[RayVAEDecode] Chunk {shard_index} wrote {shape} to mmap.")
+                        else:
+                            # Fallback: tensor returned directly
+                            shard_data: Any = result
+                            print(f"[RayVAEDecode] Chunk {shard_index} returned tensor {shard_data.shape} (Fallback path)")
+                            _, _, _, _, vid_offset = completed_chunk
+                            s_len = shard_data.shape[1]
+                            if vid_offset + s_len > total_output_frames:
+                                s_len = max(0, total_output_frames - vid_offset)
+                                shard_data = shard_data[:, :s_len]
+                            if s_len > 0:
+                                shard_data_any: Any = shard_data
+                                full_image_any: Any = full_image
+                                full_image_any[:, vid_offset : vid_offset + s_len] = shard_data_any.to(torch.float32)
+                            del shard_data
+                    
+                    # WORK STEALING: if chunks remain, immediately send next to this now-idle worker
+                    if chunk_queue:
+                        next_chunk = chunk_queue.pop(0)
+                        ref = _dispatch_chunk(actor, next_chunk)
+                        inflight[ref] = (actor, next_chunk)
+            
+            print(f"[RayVAEDecode] All {received_count} chunks complete.")
+            
+            # Offload VAE from VRAM on all workers (skip_offload=True kept it on GPU)
+            print("[RayVAEDecode] Offloading VAE from VRAM on all workers...")
+            offload_futures = [actor.ray_vae_offload.remote() for actor in gpu_actors]
+            cancellable_get(offload_futures)
             
             # Release the shared latent tensor from Ray object store
             del latent_ref

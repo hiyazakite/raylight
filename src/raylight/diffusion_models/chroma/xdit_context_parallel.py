@@ -10,9 +10,7 @@ from xfuser.core.distributed import (
 )
 import raylight.distributed_modules.attention as xfuser_attn
 from ..utils import pad_to_world_size
-attn_type = xfuser_attn.get_attn_type()
-sync_ulysses = xfuser_attn.get_sync_ulysses()
-xfuser_optimized_attention = xfuser_attn.make_xfuser_attention(attn_type, sync_ulysses)
+xfuser_optimized_attention = xfuser_attn.make_lazy_attention()
 
 
 def apply_mod(tensor, m_mult, m_add=None, modulation_dims=None):
