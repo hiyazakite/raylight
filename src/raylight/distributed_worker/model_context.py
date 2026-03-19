@@ -676,11 +676,19 @@ class GGUFContext(ModelContext):
         ``GGUFModelPatcher.unpatch_model()`` replaces CUDA params with the
         pinned-backed ``mmap_cache`` entries.  Old CUDA tensors are GC'd,
         VRAM is freed, and no extra host-RAM copy is needed.
+
+        Partial-load aware: when model was partially loaded (some modules on
+        CUDA, rest in lowvram hooks), the pointer swap still works because
+        ``unpatch_model`` iterates the full mmap_cache and restores every
+        matched parameter — including those that were moved to CUDA.
         """
         if model is None:
             return False
 
-        print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload: pointer swap to pinned mmap_cache...")
+        inner = getattr(model, "model", None)
+        is_partial = inner is not None and getattr(inner, "model_lowvram", False)
+        tag = "partial" if is_partial else "full"
+        print(f"[GGUFContext {config.local_rank}] GGUF Soft-Offload ({tag}): pointer swap to pinned mmap_cache...")
 
         if lora_manager:
             lora_manager.clear_gpu_refs(model, config)
@@ -694,23 +702,27 @@ class GGUFContext(ModelContext):
         return False
     
     def hot_load(self, model: Any, device: torch.device, reload_params: Dict[str, Any], state_cache: Any):
-        """GGUF Hot-Reload: fast path bypassing ``model.load()``.
+        """GGUF Hot-Reload: budget-aware fast path.
 
-        GGUF weights never live on CUDA — they dequantize on-the-fly during
-        forward via ``comfy_cast_weights`` hooks.  The standard ``model.load()``
-        is expensive because it runs ``_load_list()`` (iterates every module,
-        computes memory, sorts) then calls ``patch_weight_to_device`` per key —
-        all pure Python overhead with zero data movement.
+        Full VRAM (no budget)
+        ~~~~~~~~~~~~~~~~~~~~~
+        Bypasses ``model.load()`` entirely — re-enables the lowvram
+        ``comfy_cast_weights`` hooks in a single tight loop over modules
+        then re-attaches LoRA ``.patches`` directly.  No data movement;
+        quantised weights stay on CPU and dequant on-the-fly.
 
-        This fast path re-enables the lowvram hooks in a single tight loop
-        over modules, then re-attaches LoRA ``.patches`` directly.
+        Partial VRAM (budget > 0)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~
+        Delegates to ``model.load(device, lowvram_model_memory=budget)``
+        which lets ComfyUI decide which modules' quantised weights fit on
+        CUDA (faster dequant — no CPU→GPU copy per forward) and which
+        stay CPU-streamed via hooks.
         """
         if model is None:
             return
 
         import time
         t0 = time.perf_counter()
-        print(f"[GGUFContext] Hot-loading to {device} (fast path)...")
 
         # Restore GGUF ops configuration (class attrs may have been reset)
         if hasattr(model, "model_options"):
@@ -740,7 +752,38 @@ class GGUFContext(ModelContext):
             print(f"[GGUFContext] Hot-load complete (fallback).")
             return
 
-        # === FAST RELOAD: bypass model.load() ===
+        # ── Budget calculation ────────────────────────────────────
+        vram_limit = getattr(model, "vram_limit_bytes", 0)
+        model_bytes = model.model_size() if hasattr(model, "model_size") else 0
+        budget = (
+            _compute_vram_budget(device, model_bytes, vram_limit_bytes=vram_limit)
+            if vram_limit > 0 and model_bytes > 0
+            else 0
+        )
+
+        if budget > 0:
+            # ── PARTIAL CUDA: budget-aware load ──────────────────
+            # Let ComfyUI split: budget-worth of modules get their
+            # quantised weights on CUDA (fast on-device dequant),
+            # the rest stay on CPU with lowvram streaming hooks.
+            budget_mb = budget / (1024 ** 2)
+            model_mb = model_bytes / (1024 ** 2)
+            print(
+                f"[GGUFContext] Hot-Reload (partial): "
+                f"model {model_mb:.0f} MB, VRAM budget {budget_mb:.0f} MB..."
+            )
+            try:
+                model.load(device, force_patch_weights=True,
+                           lowvram_model_memory=budget)
+                model.current_device = device
+                dt = (time.perf_counter() - t0) * 1000
+                print(f"[GGUFContext] Hot-Reload (partial) complete ({dt:.0f} ms).")
+                return
+            except Exception as e:
+                print(f"[GGUFContext] Partial hot-reload failed: {e}, falling back to full lowvram...")
+
+        # ── FULL LOWVRAM: fast path (no budget) ──────────────────
+        print(f"[GGUFContext] Hot-loading to {device} (fast path)...")
         try:
             self._fast_reload(model, inner, device)
         except Exception as e:

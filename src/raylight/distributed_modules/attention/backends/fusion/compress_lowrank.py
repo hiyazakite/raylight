@@ -2,6 +2,17 @@ import torch
 from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
 import torch.nn.functional as F # For normalization
 
+# P2: Cache Q-matrix across denoising steps for faster subspace_iter convergence.
+# The right-subspace basis Q changes slowly between steps, so reusing it as
+# init_q gives a warm start that typically halves the required iterations.
+_q_cache: dict[str, torch.Tensor] = {}
+
+
+def invalidate_q_cache():
+    """Drop all cached Q-matrices (call at generation reset)."""
+    _q_cache.clear()
+
+
 def _ensure_standard_tensor(x):
     if x is None:
         return None
@@ -69,11 +80,30 @@ def _subspace_iter_compiled(
     return U.to(dtype), V.to(dtype), Q.to(dtype)
 
 def subspace_iter(
-    A: torch.Tensor, rank: int, num_iters: int = 10, init_q: torch.Tensor | None = None
+    A: torch.Tensor, rank: int, num_iters: int = 10,
+    init_q: torch.Tensor | None = None,
+    cache_key: str | None = None,
 ):
-    return _subspace_iter_compiled(
+    # P2: warm-start from cached Q when caller supplies a cache_key.
+    if init_q is None and cache_key is not None:
+        cached_q = _q_cache.get(cache_key)
+        if cached_q is not None:
+            # Validate shape: Q is (n_features=A.shape[1], rank)
+            if cached_q.shape == (A.shape[1], rank):
+                init_q = cached_q
+            else:
+                # Dimension mismatch (e.g. resolution change) — discard.
+                _q_cache.pop(cache_key, None)
+
+    u, v, q = _subspace_iter_compiled(
         _ensure_standard_tensor(A),
         rank,
         num_iters,
-        _ensure_standard_tensor(init_q)
+        _ensure_standard_tensor(init_q),
     )
+
+    # Store Q for the next step.
+    if cache_key is not None:
+        _q_cache[cache_key] = q
+
+    return u, v, q

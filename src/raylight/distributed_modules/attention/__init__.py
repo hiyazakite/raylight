@@ -1,3 +1,4 @@
+import os
 from .registry import AttentionRegistry
 from .backends.standard import StandardAttentionBackend
 from .backends.compact import CompactAttentionBackend
@@ -50,8 +51,6 @@ def make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=None):
     Create xFuser attention using the registered backend.
     Currently defaults to 'STANDARD' backend.
     """
-    # In Phase 2, we can switch on a config flag here or let the caller decide
-    import os
     backend_name = os.environ.get("RAYLIGHT_ATTN_BACKEND", "STANDARD")
     
     if ring_impl_type is None:
@@ -59,6 +58,22 @@ def make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=None):
 
     backend = AttentionRegistry.get(backend_name)
     return backend.create_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
+
+
+# Cache for attention callables keyed by (backend_name, attn_type, sync_ulysses, ring_impl_type).
+# Avoids recreating RaylightAttention (and for COMPACT, re-running compact_init)
+# on every single attention forward call.
+_attn_callable_cache: dict[tuple, callable] = {}
+
+
+def invalidate_attn_cache():
+    """Clear the attention callable cache.
+
+    Call when switching attention backends, changing COMPACT env-var config
+    between runs, or after ``compact_reset()`` to ensure the next attention
+    call creates a fresh backend instance.
+    """
+    _attn_callable_cache.clear()
 
 
 def make_lazy_attention(ring_impl_type_override=None):
@@ -71,6 +86,11 @@ def make_lazy_attention(ring_impl_type_override=None):
     that changing the backend between ComfyUI queue items takes effect
     immediately without restarting Ray worker processes.
 
+    The resolved callable is cached by ``(backend_name, attn_type,
+    sync_ulysses, ring_impl_type)`` so that repeated calls with the same
+    config reuse the same ``RaylightAttention`` instance instead of
+    allocating a new one every forward pass.
+
     ``ring_impl_type_override`` – if not None, pins the ring implementation
     (e.g. ``"basic"`` for non-causal models like LTX / Lumina) instead of
     reading the global setting.
@@ -79,7 +99,12 @@ def make_lazy_attention(ring_impl_type_override=None):
         attn_type = get_attn_type()
         sync_ulysses = get_sync_ulysses()
         rim = ring_impl_type_override if ring_impl_type_override is not None else get_ring_impl_type()
-        fn = make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=rim)
+        backend_name = os.environ.get("RAYLIGHT_ATTN_BACKEND", "STANDARD")
+        cache_key = (backend_name, attn_type, sync_ulysses, rim)
+        fn = _attn_callable_cache.get(cache_key)
+        if fn is None:
+            fn = make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=rim)
+            _attn_callable_cache[cache_key] = fn
         return fn(*args, **kwargs)
     return _lazy_attention
 

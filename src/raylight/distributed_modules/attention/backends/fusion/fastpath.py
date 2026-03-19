@@ -154,31 +154,33 @@ def binary_quant_fastpath(
     assert C_COLS % 8 == 0, "C_COLS must be divisible by 8 for packing output alignment"
     C_COLS_8 = C_COLS // 8
 
-    # Calculate tensor to quantize (Always delta)
-    tensor_to_quantize_nc = x_tensor_nc - base_tensor_nc
-
     # --- Scale Calculation (U(N, K), V(C, K)) --- 
-    tensor_to_quantize_abs_nc = torch.abs(tensor_to_quantize_nc)
+    # Fuse delta + abs into a single (N,C) tensor to halve peak memory.
+    # The Triton kernel computes x-base internally, so we only need |x-base|
+    # for scale estimation.
+    delta_abs_nc = (x_tensor_nc - base_tensor_nc).abs_()  # in-place abs on temporary
 
     if rank == -1:
         # Calculate channel-wise mean scale
         with Profiler.scope("compact.quant.calc_scale_mean"):
             # Scale is the mean of absolute values per channel -> (C,)
-            mean_scale_c = torch.mean(tensor_to_quantize_abs_nc, dim=0)
-            # Prepare rank-1 structure for the kernel: U(N, 1) = ones, V(C, 1) = mean_scale.T
-            # scale_u_output_nk = torch.ones((N_ROWS, 1), device=x_tensor_nc.device, dtype=torch.half) # Shape (N, 1)
+            mean_scale_c = torch.mean(delta_abs_nc, dim=0)
             
-            scale_u_output_nk = torch.mean(tensor_to_quantize_abs_nc, dim=1, keepdim=True) # Shape (N, 1)
+            scale_u_output_nk = torch.mean(delta_abs_nc, dim=1, keepdim=True) # Shape (N, 1)
             scale_u_output_nk = (scale_u_output_nk / (scale_u_output_nk.mean(dim=0, keepdim=True) + 1e-6)).to(torch.half)
             scale_v_output_ck = mean_scale_c.unsqueeze(1).contiguous().to(torch.half) # Shape (C, 1)
         effective_rank = 1 # Kernel needs rank >= 1 for its loop
     else: # rank >= 1
-        # Calculate rank-K approximation for scale based on abs(tensor_to_quantize)
+        # Calculate rank-K approximation for scale based on abs(delta)
         # subspace_iter(N, C) returns U(N, K), V_t(K, C)
         assert rank > 0, "Rank must be > 1 for rank-K approximation"
         with Profiler.scope(f"compact.quant.scale_rank{rank}_approx"):
+            # P2: pass cache_key for Q-matrix warm-start
+            import raylight.distributed_modules.attention.backends.fusion.context as _ctx
+            _qk = _ctx._current_cache_key
             scale_U_nk, scale_V_t_kc, _ = subspace_iter(
-                tensor_to_quantize_abs_nc, rank=rank, num_iters=2
+                delta_abs_nc, rank=rank, num_iters=2,
+                cache_key=f"{_qk}-fp" if _qk else None,
             )
         # Kernel expects U(N, K) and V(C, K)
         scale_u_output_nk = scale_U_nk.contiguous().to(torch.half)       # Shape (N, K)
@@ -186,6 +188,8 @@ def binary_quant_fastpath(
         effective_rank = rank
         assert scale_u_output_nk.shape == (N_ROWS, rank)
         assert scale_v_output_ck.shape == (C_COLS, rank)
+
+    del delta_abs_nc  # free (N,C) before kernel allocations
 
 
     # Allocate outputs

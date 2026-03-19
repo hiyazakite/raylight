@@ -264,7 +264,10 @@ class XFuserSamplerCustom:
     ):
         try:
             gc.collect()
-            comfy.model_management.unload_all_models()
+            # Use the ORIGINAL unload (not the monkey-patched one) to free
+            # main-process VRAM without destroying worker pinned caches.
+            from raylight.nodes import _orig_unload_all_models
+            _orig_unload_all_models()
             comfy.model_management.soft_empty_cache()
             comfy.model_management.soft_empty_cache()
             gpu_actors = ray_actors["workers"]
@@ -355,7 +358,10 @@ class DPSamplerCustom:
             latent_image = latent_image[0]
 
             gc.collect()
-            comfy.model_management.unload_all_models()
+            # Use the ORIGINAL unload (not the monkey-patched one) to free
+            # main-process VRAM without destroying worker pinned caches.
+            from raylight.nodes import _orig_unload_all_models
+            _orig_unload_all_models()
             comfy.model_management.soft_empty_cache()
             gpu_actors = ray_actors["workers"]
 

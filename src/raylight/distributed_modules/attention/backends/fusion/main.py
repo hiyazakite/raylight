@@ -96,6 +96,22 @@ def compact_reset():
     except (ImportError, AttributeError):
         pass
 
+    # Clear the attention callable cache so that any env-var config changes
+    # (e.g. switching COMPACT compression type) take effect on the next run.
+    try:
+        from raylight.distributed_modules.attention import invalidate_attn_cache
+        invalidate_attn_cache()
+    except (ImportError, AttributeError):
+        pass
+
+    # P2: Clear the subspace_iter Q-matrix cache so stale warm-starts from
+    # a prior generation don't pollute the new run.
+    try:
+        from raylight.distributed_modules.attention.backends.fusion.compress_lowrank import invalidate_q_cache
+        invalidate_q_cache()
+    except (ImportError, AttributeError):
+        pass
+
     if context._config is None:
         return
 

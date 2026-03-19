@@ -59,11 +59,15 @@ def quantize_1bit(
         # Calculate rank-k approximation of abs(input)
         # subspace_iter expects (Features=N, Samples=C), returns U_nk(N, K), V_t_kc(K, C)
         with Profiler.scope(f"compact.quant.scale_rank{rank}_approx"):
+            # P2: pass cache_key so Q-matrix is warm-started from previous step
+            import raylight.distributed_modules.attention.backends.fusion.context as _ctx
+            _qk = _ctx._current_cache_key
             # Pass (N, C) directly
             scale_U_nk, scale_V_t_kc, _ = subspace_iter(
                 input_abs_nc,
                 rank=rank,
-                num_iters=2
+                num_iters=2,
+                cache_key=f"{_qk}-q1b" if _qk else None,
             )
         # Get scale_u (N, K) and scale_v (K, C)
         scale_u_nk = scale_U_nk.contiguous().to(torch.half)       # Shape (N, K)
@@ -166,8 +170,8 @@ def dequantize_1bit(
 ) -> torch.Tensor:
     """
     Dequantize packed 1-bit sign values (packed along C dim) back to FP16 using rank-k scale factors.
-    Computes the full scale matrix S = U @ V internally and passes it to the kernel.
-    Uses Triton kernel for unpacking and scaling.
+    Passes U(N, K) and V(K, C) directly to the Triton kernel which computes the
+    per-element scale ``dot(U[n,:], V[:,c])`` on the fly, avoiding the (N, C) matmul.
     Input packed layout: (N, C//8)
     Output layout: (N, C)
     
@@ -189,7 +193,6 @@ def dequantize_1bit(
 
     packed_tensor = packed_tensor.contiguous() # (N, C//8)
     scale_u = scale_u.contiguous() # (N, K)
-    scale_v = scale_v.contiguous() # (K, C)
 
     N, C_8 = packed_tensor.shape # N = tokens, C_8 = packed channels
     C = C_8 * 8 # Unpacked channels
@@ -198,15 +201,8 @@ def dequantize_1bit(
     assert scale_u.shape[0] == N, f"Scale U N dim {scale_u.shape[0]} must match packed N dim {N}"
     assert scale_v.shape[1] == C, f"Scale V C dim {scale_v.shape[1]} must match unpacked C dim {C}"
 
-    # --- Compute Full Scale Matrix (PyTorch) --- 
-    # S = U @ V -> (N, K) @ (K, C) -> (N, C)
-    with Profiler.scope(f"compact.dequant.scale_rank{rank}_matmul"):
-        scale_matrix_nc = (scale_u @ scale_v).to(torch.half)
-    assert scale_matrix_nc.shape == (N, C)
-
-    # --- Prepare Scale for Kernel ---
-    # Kernel expects scale matrix in (N, C) layout
-    scale_matrix_nc = scale_matrix_nc.contiguous()
+    # Transpose V from (K, C) to (C, K) for kernel efficiency (contiguous row per C element)
+    scale_v_ck = scale_v.transpose(0, 1).contiguous()  # (C, K) — K*C elements, much smaller than N*C
 
     # Allocate output in (N, C) layout for kernel
     output_nc = torch.empty((N, C), dtype=torch.half, device=packed_tensor.device)
@@ -218,15 +214,19 @@ def dequantize_1bit(
 
     with Profiler.scope("compact.dequantize_1bit_kernel"):
         _dequantize_1bit_kernel[grid](
-            input_ptr=packed_tensor, # (N, C//8)
-            output_ptr=output_nc,    # (N, C)
-            scale_matrix_ptr=scale_matrix_nc, # Pass pre-computed scale (N, C)
-            N_ROWS=N,                 # Num Tokens
-            C_COLS=C_8,               # Num Packed Channels per token
-            C_COLS_8=C,               # Num Unpacked Channels per token
-            stride_scale_n=scale_matrix_nc.stride(0), # Stride for scale N dim
-            stride_scale_c=scale_matrix_nc.stride(1), # Stride for scale C dim
-            BLOCK_SIZE_C=BLOCK_SIZE_C_PACKED, # Block size for packed dimension C//8
+            input_ptr=packed_tensor,    # (N, C//8)
+            output_ptr=output_nc,       # (N, C)
+            scale_u_ptr=scale_u,        # (N, K)
+            scale_v_ptr=scale_v_ck,     # (C, K)
+            N_ROWS=N,
+            C_COLS=C_8,                 # C//8
+            C_COLS_8=C,                 # C
+            RANK=rank,
+            stride_scale_un=scale_u.stride(0),
+            stride_scale_uk=scale_u.stride(1),
+            stride_scale_vc=scale_v_ck.stride(0),
+            stride_scale_vk=scale_v_ck.stride(1),
+            BLOCK_SIZE_C=BLOCK_SIZE_C_PACKED,
         )
         
     # Output is already (N, C)
@@ -234,19 +234,25 @@ def dequantize_1bit(
 
 @triton.jit
 def _dequantize_1bit_kernel(
-    input_ptr,      # Packed bits (N, C//8) UINT8
-    output_ptr,     # Output (N, C) FP16
-    scale_matrix_ptr, # <<< Pre-computed scale (N, C) FP16
-    N_ROWS,  # = N (Number of tokens)
-    C_COLS,  # = C//8 (Number of packed elements per token)
-    C_COLS_8,# = C (Number of unpacked elements per token)
-    stride_scale_n, # <<< Stride for scale N dim
-    stride_scale_c, # <<< Stride for scale C dim
+    input_ptr,       # Packed bits (N, C//8) UINT8
+    output_ptr,      # Output (N, C) FP16
+    scale_u_ptr,     # Scale U (N, K) FP16
+    scale_v_ptr,     # Scale V (C, K) FP16
+    N_ROWS,          # = N (Number of tokens)
+    C_COLS,          # = C//8 (Number of packed elements per token)
+    C_COLS_8,        # = C (Number of unpacked elements per token)
+    RANK: tl.constexpr,     # Rank K for scale factors
+    stride_scale_un,        # Stride for U N dim
+    stride_scale_uk,        # Stride for U K dim
+    stride_scale_vc,        # Stride for V C dim
+    stride_scale_vk,        # Stride for V K dim
     BLOCK_SIZE_C: tl.constexpr = 256, # Block size for the packed dimension C//8
 ):
     """
-    Dequantizes packed 1-bit signs (packed along C) to FP16 using pre-computed scale matrix S.
-    Input layout: packed (N, C//8), scale (N, C)
+    Dequantizes packed 1-bit signs (packed along C) to FP16 using factored scale U(N,K), V(C,K).
+    Computes scale = dot(U[n,:], V[c,:]) per element inside the kernel to avoid
+    materializing the full (N, C) scale matrix on the host.
+    Input layout: packed (N, C//8), U (N, K), V (C, K)
     Output layout: (N, C)
     Grid: (N, cdiv(C//8, BLOCK_SIZE_C))
     """
@@ -259,50 +265,44 @@ def _dequantize_1bit_kernel(
     offs_c_packed = c_packed_offset + tl.arange(0, BLOCK_SIZE_C)
     mask_c_packed = offs_c_packed < C_COLS  # Mask for packed dimension elements
 
-    # Calculate pointer offsets for loading packed data for the current token (row pid_n)
-    # Base ptr = input_ptr + pid_n * C_COLS (stride for packed dim)
+    # Load packed data for the current token row
     packed_row_start_ptr = input_ptr + pid_n * C_COLS
-    packed_ptrs = packed_row_start_ptr + offs_c_packed
-    # Load packed data for the current block
-    packed_data = tl.load(packed_ptrs, mask=mask_c_packed, other=0) # Shape: [BLOCK_SIZE_C]
+    packed_data = tl.load(packed_row_start_ptr + offs_c_packed, mask=mask_c_packed, other=0)
 
-    # Calculate base offset for output pointer (start of the row in N, C layout)
-    output_row_start_ptr = output_ptr + pid_n * C_COLS_8 # Offset to the start of token pid_n
-    # Calculate base offset for scale matrix pointer (start of the row in N, C layout)
-    scale_row_start_ptr = scale_matrix_ptr + pid_n * stride_scale_n
+    # Load U vector for this row once (shared across all 8 bits): (RANK,)
+    offs_k = tl.arange(0, RANK)
+    scale_u_row_ptr = scale_u_ptr + pid_n * stride_scale_un
+    scale_u_vec = tl.load(scale_u_row_ptr + offs_k * stride_scale_uk)  # (RANK,)
+
+    # Calculate base offset for output pointer
+    output_row_start_ptr = output_ptr + pid_n * C_COLS_8
 
     # Base offset for the unpacked C dimension
     c_8_offset = c_packed_offset * 8
 
     # Unpack 8 bits and dequantize
     for i in range(8):
-        # --- Unpack Bit --- 
-        # Extract the i-th bit from each packed byte
-        bits = ((packed_data >> i) & 1).to(tl.int8) # Shape: [BLOCK_SIZE_C]
-        # Convert bits to +1/-1 signs
+        # --- Unpack Bit ---
+        bits = ((packed_data >> i) & 1).to(tl.int8)
         signs = tl.where(bits == 1, 1.0, -1.0).to(tl.float16)
 
-        # --- Load Scale from Matrix --- 
-        # Calculate corresponding unpacked C offsets for this bit position
-        offs_c_8 = c_8_offset + tl.arange(0, BLOCK_SIZE_C) * 8 + i # Offset within the unpacked row (C dimension)
-        
-        # Create mask for the unpacked dimension (relative to the block start)
-        # Ensure we are within N, C bounds (mask_c_packed takes care of block bounds)
-        mask_c_8 = mask_c_packed & (offs_c_8 < C_COLS_8) 
-        
-        # Load scale values from the pre-computed matrix (N, C)
-        # Ptrs = base_row_ptr + c_offset * stride_c
-        scale_ptrs = scale_row_start_ptr + offs_c_8 * stride_scale_c
-        scale_block = tl.load(scale_ptrs, mask=mask_c_8, other=0.0).to(tl.float16)
+        # --- Compute Scale from U and V ---
+        offs_c_8 = c_8_offset + tl.arange(0, BLOCK_SIZE_C) * 8 + i
+        mask_c_8 = mask_c_packed & (offs_c_8 < C_COLS_8)
 
-        # --- Dequantize --- 
+        # Load V block for these C positions: V[offs_c_8, :] → (BLOCK_SIZE_C, RANK)
+        v_ptrs = scale_v_ptr + offs_c_8[:, None] * stride_scale_vc + offs_k[None, :] * stride_scale_vk
+        mask_v = mask_c_8[:, None] & (offs_k[None, :] < RANK)
+        v_block = tl.load(v_ptrs, mask=mask_v, other=0.0)  # (BLOCK_SIZE_C, RANK)
+
+        # scale[c] = dot(U[n,:], V[c,:]) = sum_k(U[n,k] * V[c,k])
+        scale_block = tl.sum(scale_u_vec[None, :] * v_block, axis=1).to(tl.float16)  # (BLOCK_SIZE_C,)
+
+        # --- Dequantize ---
         scaled = signs * scale_block
 
-        # --- Store Output --- 
-        # Calculate output pointers for the current bit position within the unpacked row
-        # Ptrs = base_row_ptr + c_offset
+        # --- Store Output ---
         output_ptrs = output_row_start_ptr + offs_c_8
-        # Store the dequantized values, masking invalid elements using unpacked mask
         tl.store(output_ptrs, scaled, mask=mask_c_8)
 
 def sim_binary(input_tensor: torch.Tensor, rank: int|None = None) -> torch.Tensor:
@@ -329,8 +329,14 @@ def sim_binary(input_tensor: torch.Tensor, rank: int|None = None) -> torch.Tenso
     else: # rank >= 1
         from raylight.distributed_modules.attention.backends.fusion.compress_lowrank import svd, subspace_iter
         RANK=rank
+        # P2: pass cache_key for Q-matrix warm-start
+        import raylight.distributed_modules.attention.backends.fusion.context as _ctx
+        _qk = _ctx._current_cache_key
         # subspace_iter input (N, C), output u_nk(N, K), v_kc(K, C)
-        u_nk, v_kc, _ = subspace_iter(torch.abs(input_tensor), RANK, 2)
+        u_nk, v_kc, _ = subspace_iter(
+            torch.abs(input_tensor), RANK, 2,
+            cache_key=f"{_qk}-sim1b" if _qk else None,
+        )
         scale = u_nk @ v_kc # (N, C)
     assert scale.dtype == torch.half, "Scale must be FP16"
     # Quantize to -1 or 1 based on the sign

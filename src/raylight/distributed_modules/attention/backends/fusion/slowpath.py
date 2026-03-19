@@ -53,8 +53,11 @@ def slowpath_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, ran
         comp_list = [q.view(torch.half).contiguous(), scale_u.view(-1).contiguous(), scale_v.view(-1).contiguous()]
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK:
         assert rank is not None and rank >= 1, "Rank must be provided for LOW_RANK compression"
+        # P2: pass cache_key for Q-matrix warm-start
+        import raylight.distributed_modules.attention.backends.fusion.context as _ctx
+        _qk = _ctx._current_cache_key
         # assert shape
-        u, v, _ = subspace_iter(x, rank, 2)
+        u, v, _ = subspace_iter(x, rank, 2, cache_key=f"{_qk}-lr" if _qk else None)
         u = u.half()
         v = v.half()
         assert u.size(1) == v.size(0) and u.dtype == torch.half and v.dtype == torch.half
@@ -67,7 +70,10 @@ def slowpath_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, ran
         comp_list = [q.view(torch.half).contiguous(), scale.contiguous(), min_v.contiguous()]
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_Q:
         assert rank is not None and rank >= 1, "Rank must be provided for LOW_RANK_Q compression"
-        u, v, _ = subspace_iter(x, rank, 2)
+        # P2: pass cache_key for Q-matrix warm-start
+        import raylight.distributed_modules.attention.backends.fusion.context as _ctx
+        _qk = _ctx._current_cache_key
+        u, v, _ = subspace_iter(x, rank, 2, cache_key=f"{_qk}-lrq" if _qk else None)
         assert u.size(1) == v.size(0)
         u = u.half()
         v = v.half()
@@ -223,11 +229,15 @@ def sim_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, sparse_r
         return sim_int4(x, dim=0)
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK:
         assert rank is not None
-        u, v, _ = subspace_iter(x, rank, 2)
+        import raylight.distributed_modules.attention.backends.fusion.context as _ctx
+        _qk = _ctx._current_cache_key
+        u, v, _ = subspace_iter(x, rank, 2, cache_key=f"{_qk}-sim-lr" if _qk else None)
         return torch.matmul(u, v)
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_Q:
         assert rank is not None
-        u, v, _ = subspace_iter(x, rank, 2)
+        import raylight.distributed_modules.attention.backends.fusion.context as _ctx
+        _qk = _ctx._current_cache_key
+        u, v, _ = subspace_iter(x, rank, 2, cache_key=f"{_qk}-sim-lrq" if _qk else None)
         u = sim_int4(u, dim=0)
         v = sim_int4(v, dim=1)
         return torch.matmul(u, v)
@@ -245,7 +255,7 @@ def sim_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, sparse_r
                 x = x.float() * current_lowrank_scale.view(1, C)
             elif current_lowrank_scale.shape == (N,):
                 x = x.float() * current_lowrank_scale.view(N, 1)
-        u, v, _ = subspace_iter(x, rank, 2)
+        u, v, _ = subspace_iter(x, rank, 2, cache_key=f"{cache_key}-sim-awl" if cache_key else None)
         if current_lowrank_scale is not None:
             if current_lowrank_scale.shape == (C,):
                 v = v / current_lowrank_scale.view(1, C)
