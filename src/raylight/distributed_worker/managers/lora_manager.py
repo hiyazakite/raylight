@@ -178,7 +178,9 @@ class LoraManager:
             model: Optional model instance. If None, this is a no-op (or should caller pass it?)
             config: Optional config for logging.
         """
-        # 1. Clear weight_function/bias_function closures on ALL modules
+        # Fused single-pass: clear weight/bias functions AND per-param
+        # .patches in one traversal of the module tree (avoids 3 separate
+        # iterations over the same model).
         if model is None: return
         
         # Logging helper
@@ -188,31 +190,30 @@ class LoraManager:
         diffusion_model = getattr(model, "model", None)
         if diffusion_model is not None:
             cleared_funcs = 0
+            cleared_param_patches = 0
             for m in diffusion_model.modules():
-                if hasattr(m, "weight_function") and len(m.weight_function) > 0:
+                # Clear weight/bias function closures
+                if hasattr(m, "weight_function") and m.weight_function:
                     m.weight_function = []
                     cleared_funcs += 1
-                if hasattr(m, "bias_function") and len(m.bias_function) > 0:
+                if hasattr(m, "bias_function") and m.bias_function:
                     m.bias_function = []
                     cleared_funcs += 1
+                # Clear per-parameter .patches (GGMLTensor) in same visit
+                for p in m.parameters(recurse=False):
+                    if hasattr(p, "patches") and p.patches:
+                        p.patches = []
+                        cleared_param_patches += 1
             if cleared_funcs > 0:
                 log(f"[RayWorker] Cleared {cleared_funcs} weight/bias functions.")
+            if cleared_param_patches > 0:
+                log(f"[RayWorker] Cleared .patches on {cleared_param_patches} parameters.")
         
-        # 2. Clear patches dict on model patcher
+        # Clear patches dict on model patcher
         if hasattr(model, "patches") and model.patches:
             patch_count = len(model.patches)
             model.patches.clear()
             log(f"[RayWorker] Cleared {patch_count} patches from patcher.")
-        
-        # 3. Clear .patches attribute on individual parameters (GGMLTensor carries these)
-        if diffusion_model is not None:
-            cleared_param_patches = 0
-            for name, param in diffusion_model.named_parameters():
-                if hasattr(param, "patches") and param.patches:
-                    param.patches = []
-                    cleared_param_patches += 1
-            if cleared_param_patches > 0:
-                log(f"[RayWorker] Cleared .patches on {cleared_param_patches} parameters.")
 
     def clear_tracking(self):
         """Clears tracking state."""

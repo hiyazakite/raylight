@@ -430,29 +430,65 @@ class GGUFContext(ModelContext):
 
     @staticmethod
     def _pin_mmap_private(mmap_cache: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Single-GPU: pre-allocate pinned destination + copy once (no double-copy)."""
-        from raylight.expansion.comfyui_gguf.ops import GGMLTensor
+        """Single-GPU: pre-allocate pinned destination + parallel copy.
 
-        pinned: Dict[str, torch.Tensor] = {}
+        Phase 1 — allocate all pinned destinations (fast, no data movement).
+        Phase 2 — memcpy mmap→pinned using a thread-pool so multiple cores
+                  drive the copies concurrently (2-4x faster for large GGUF).
+        """
+        from raylight.expansion.comfyui_gguf.ops import GGMLTensor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os
+
+        # ── Phase 1: allocate pinned buffers (no data movement) ───────
+        allocs: list = []  # (key, pinned, raw, is_ggml, tensor)
         total_bytes = 0
         for key, tensor in mmap_cache.items():
             is_ggml = isinstance(tensor, GGMLTensor)
             raw = tensor.as_subclass(torch.Tensor) if is_ggml else tensor
-            # Pre-allocate pinned destination and copy directly — avoids
-            # clone() (pageable alloc) + pin_memory() (second alloc + copy).
             p = torch.empty_like(raw).pin_memory()
-            p.copy_(raw)
             total_bytes += p.nbytes
-            if is_ggml:
-                pinned[key] = GGMLTensor(
-                    p,
-                    tensor_type=tensor.tensor_type,
-                    tensor_shape=tensor.tensor_shape,
-                )
-            else:
-                pinned[key] = p
+            allocs.append((key, p, raw, is_ggml, tensor))
+
+        # ── Phase 2: parallel memcpy (CPU-only, safe to thread) ───────
+        def _copy(item):
+            _key, _p, _raw, _is_ggml, _tensor = item
+            _p.copy_(_raw)
+            return item
+
+        # Use up to 4 workers (diminishing returns beyond that for memcpy)
+        num_workers = min(4, max(1, os.cpu_count() or 1))
+        pinned: Dict[str, torch.Tensor] = {}
+
+        if len(allocs) > 32 and num_workers > 1:
+            # Thread-pool path for large models
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                for item in pool.map(_copy, allocs):
+                    key, p, raw, is_ggml, tensor = item
+                    if is_ggml:
+                        pinned[key] = GGMLTensor(
+                            p,
+                            tensor_type=tensor.tensor_type,
+                            tensor_shape=tensor.tensor_shape,
+                        )
+                    else:
+                        pinned[key] = p
+        else:
+            # Sequential fast-path for small models (< 32 tensors)
+            for item in allocs:
+                _copy(item)
+                key, p, raw, is_ggml, tensor = item
+                if is_ggml:
+                    pinned[key] = GGMLTensor(
+                        p,
+                        tensor_type=tensor.tensor_type,
+                        tensor_shape=tensor.tensor_shape,
+                    )
+                else:
+                    pinned[key] = p
+
         print(
-            f"[GGUFContext] Pinned mmap→RAM (private): "
+            f"[GGUFContext] Pinned mmap→RAM (private, {num_workers} threads): "
             f"{len(pinned)} tensors, {total_bytes / 1e9:.2f} GB"
         )
         return pinned
@@ -467,10 +503,13 @@ class GGUFContext(ModelContext):
 
         Returns ``(pinned_dict, shm_handle)``.
 
-        Rank 0 (writer) creates the segment and copies mmap data in.
-        Other ranks wait at a barrier, then attach and create views.
-        All ranks get a dict of pinned GGMLTensor views into the same
-        physical pages — N workers share 1× model-size of host RAM.
+        All ranks cooperate:
+
+        1. Rank 0 creates the ``/dev/shm`` segment (allocation only).
+        2. Barrier — all ranks attach and ``cudaHostRegister``.
+        3. Each rank copies its round-robin slice of tensors.
+        4. Barrier — all data in place.
+        5. All ranks create ``GGMLTensor`` views.
         """
         import ctypes
         import hashlib
@@ -483,6 +522,8 @@ class GGUFContext(ModelContext):
         )
 
         is_writer = config.local_rank == 0
+        local_rank = config.local_rank
+        world_size = config.global_world_size
         cache_id = hashlib.md5(model_path.encode()).hexdigest()[:16]
         shm_name = f"raylight_gguf_{cache_id}"
 
@@ -507,82 +548,77 @@ class GGUFContext(ModelContext):
         if total_bytes == 0:
             return mmap_cache, None  # nothing to pin
 
-        # --- writer: create + copy + register + barrier ------------------
+        # --- Step 1: Rank 0 creates /dev/shm segment ---
         if is_writer:
-            # Clean up stale segment
             try:
                 old = SharedMemory(name=shm_name, create=False)
                 old.close(); old.unlink()
             except FileNotFoundError:
                 pass
-
             shm = SharedMemory(name=shm_name, create=True, size=total_bytes)
-            ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
-            ok = _cuda_host_register(ptr, total_bytes)
-            if not ok:
-                print("[GGUFContext] WARNING: cudaHostRegister failed (DMA will use staging buffer).")
 
-            for key, off, nb, s_shape, dtype, tt, ts in layout:
-                src = mmap_cache[key]
-                raw = src.as_subclass(torch.Tensor) if isinstance(src, GGMLTensor) else src
-                dst = torch.frombuffer(memoryview(shm.buf)[off:off + nb], dtype=dtype).reshape(s_shape)
-                dst.copy_(raw)
-
-            if dist.is_initialized():
-                dist.barrier()
-
-            pinned: Dict[str, torch.Tensor] = {}
-            for key, off, nb, s_shape, dtype, tt, ts in layout:
-                view = torch.frombuffer(memoryview(shm.buf)[off:off + nb], dtype=dtype).reshape(s_shape)
-                if tt is not None:
-                    pinned[key] = GGMLTensor(view, tensor_type=tt, tensor_shape=ts)
-                else:
-                    pinned[key] = view
-
-            print(
-                f"[GGUFContext] Pinned mmap→shm (Writer): "
-                f"{len(pinned)} tensors, {total_bytes / 1e9:.2f} GB "
-                f"(shm={shm_name})"
-            )
-            return pinned, shm
-
-        # --- reader: barrier + attach + create views ---------------------
+        # --- Step 2: Barrier — all ranks attach + register ---
         if dist.is_initialized():
             dist.barrier()
 
-        retries = 50
-        for i in range(retries):
-            try:
-                shm = SharedMemory(name=shm_name, create=False)
-                break
-            except FileNotFoundError:
-                if i < retries - 1:
-                    time.sleep(0.2)
-        else:
-            raise RuntimeError(
-                f"[GGUFContext] Reader timed out waiting for shm '{shm_name}'"
-            )
+        if not is_writer:
+            retries = 50
+            for i in range(retries):
+                try:
+                    shm = SharedMemory(name=shm_name, create=False)
+                    break
+                except FileNotFoundError:
+                    if i < retries - 1:
+                        time.sleep(0.2)
+            else:
+                raise RuntimeError(
+                    f"[GGUFContext] Rank {local_rank} timed out waiting for "
+                    f"shm '{shm_name}'"
+                )
 
-        if shm.size < total_bytes:
-            raise RuntimeError(
-                f"[GGUFContext] shm size mismatch: need {total_bytes}, got {shm.size}"
-            )
+            if shm.size < total_bytes:
+                raise RuntimeError(
+                    f"[GGUFContext] shm size mismatch: need {total_bytes}, "
+                    f"got {shm.size}"
+                )
 
         ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
-        _cuda_host_register(ptr, total_bytes)
+        ok = _cuda_host_register(ptr, total_bytes)
+        if not ok and is_writer:
+            print("[GGUFContext] WARNING: cudaHostRegister failed "
+                  "(DMA will use staging buffer).")
 
-        pinned = {}
+        # --- Step 3: Each rank copies its slice (round-robin) ---
+        my_count = 0
+        for i, (key, off, nb, s_shape, dtype, tt, ts) in enumerate(layout):
+            if i % world_size == local_rank:
+                src = mmap_cache[key]
+                raw = src.as_subclass(torch.Tensor) if isinstance(src, GGMLTensor) else src
+                dst = torch.frombuffer(
+                    memoryview(shm.buf)[off:off + nb], dtype=dtype,
+                ).reshape(s_shape)
+                dst.copy_(raw)
+                my_count += 1
+
+        # --- Step 4: Barrier — all copies complete ---
+        if dist.is_initialized():
+            dist.barrier()
+
+        # --- Step 5: All ranks create full view dict ---
+        pinned: Dict[str, torch.Tensor] = {}
         for key, off, nb, s_shape, dtype, tt, ts in layout:
-            view = torch.frombuffer(memoryview(shm.buf)[off:off + nb], dtype=dtype).reshape(s_shape)
+            view = torch.frombuffer(
+                memoryview(shm.buf)[off:off + nb], dtype=dtype,
+            ).reshape(s_shape)
             if tt is not None:
                 pinned[key] = GGMLTensor(view, tensor_type=tt, tensor_shape=ts)
             else:
                 pinned[key] = view
 
         print(
-            f"[GGUFContext] Pinned mmap→shm (Reader): "
-            f"{len(pinned)} tensors, {total_bytes / 1e9:.2f} GB "
-            f"(shm={shm_name})"
+            f"[GGUFContext] Pinned mmap→shm (rank {local_rank}): "
+            f"{len(pinned)} tensors, {total_bytes / 1e9:.2f} GB — "
+            f"copied {my_count} (shm={shm_name})"
         )
         return pinned, shm
 
@@ -930,10 +966,14 @@ class LazyTensorContext(ModelContext):
             )
             cache_id = make_cache_id(model_path)
             is_writer = config.local_rank == 0
-            tag = "Writer" if is_writer else "Reader"
-            print(f"[LazyTensorContext] Shared pinned cache ({tag}): "
-                  f"{config.global_world_size} workers share 1 buffer.")
-            return SharedPinnedParamCache(cache_id=cache_id, is_writer=is_writer)
+            print(f"[LazyTensorContext] Shared pinned cache (rank {config.local_rank}): "
+                  f"{config.global_world_size} workers share 1 buffer (parallel build).")
+            return SharedPinnedParamCache(
+                cache_id=cache_id,
+                is_writer=is_writer,
+                local_rank=config.local_rank,
+                world_size=config.global_world_size,
+            )
         else:
             from raylight.distributed_modules.pinned_cache import PinnedParamCache
             return PinnedParamCache()
@@ -1639,45 +1679,49 @@ class VAEContext(LazyTensorContext):
         first_stage = getattr(model, "first_stage_model", None)
         
         if mmap_cache and first_stage:
-            # ZERO-COPY
+            # ZERO-COPY — fused single-pass: restore mmap pointers AND
+            # move any CUDA stragglers to CPU in one traversal.
             print(f"[VAEContext {config.local_rank}] Zero-Copy Offload: Restoring mmap pointers...")
-            
-            # Param map logic...
-            param_map = {name: param for name, param in first_stage.named_parameters()}
-            buffer_map = {name: buf for name, buf in first_stage.named_buffers()}
-            
+
+            # Build lookup dicts once
+            param_map = dict(first_stage.named_parameters())
+            buffer_map = dict(first_stage.named_buffers())
+
+            # Build set of mmap keys (both original and stripped) for
+            # fast straggler detection without a second full sweep.
+            mmap_keys_original = set(mmap_cache.keys())
+            mmap_keys_simple = {k.replace("first_stage_model.", "") for k in mmap_keys_original}
+
+            # Pass 1: restore mmap pointers from cache
             restored = 0
             for name, mmap_tensor in mmap_cache.items():
-                target_param = None
-                if name in param_map:
-                    target_param = param_map[name]
-                elif name in buffer_map:
-                    target_param = buffer_map[name]
-                
+                target_param = param_map.get(name)
+                if target_param is None:
+                    target_param = buffer_map.get(name)
                 if target_param is None:
                     simple_name = name.replace("first_stage_model.", "")
-                    if simple_name in param_map:
-                        target_param = param_map[simple_name]
-                    elif simple_name in buffer_map:
-                         target_param = buffer_map[simple_name]
-
+                    target_param = param_map.get(simple_name)
+                    if target_param is None:
+                        target_param = buffer_map.get(simple_name)
                 if target_param is not None:
                     target_param.data = mmap_tensor
                     restored += 1
-            
-            print(f"[VAEContext {config.local_rank}] Zero-Copy: Restored {restored}/{len(mmap_cache)} tensors to mmap.")
-            
-            # Move stragglers
+
+            # Fused straggler pass: only check params/buffers NOT already
+            # covered by the mmap restore above (avoids full re-iteration).
             stragglers_moved = 0
-            for name, param in first_stage.named_parameters():
-                if param.device.type == 'cuda':
-                    param.data = param.data.to('cpu')
-                    stragglers_moved += 1
-            for name, buf in first_stage.named_buffers():
-                if buf.device.type == 'cuda':
-                    buf.data = buf.data.to('cpu')
-                    stragglers_moved += 1
-            
+            for name, param in param_map.items():
+                if name not in mmap_keys_original and name not in mmap_keys_simple:
+                    if param.device.type == 'cuda':
+                        param.data = param.data.to('cpu')
+                        stragglers_moved += 1
+            for name, buf in buffer_map.items():
+                if name not in mmap_keys_original and name not in mmap_keys_simple:
+                    if buf.device.type == 'cuda':
+                        buf.data = buf.data.to('cpu')
+                        stragglers_moved += 1
+
+            print(f"[VAEContext {config.local_rank}] Zero-Copy: Restored {restored}/{len(mmap_cache)} tensors to mmap.")
             if stragglers_moved > 0:
                 print(f"[VAEContext {config.local_rank}] Moved {stragglers_moved} stragglers to CPU.")
                     
