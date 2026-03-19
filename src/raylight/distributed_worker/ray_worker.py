@@ -97,6 +97,14 @@ class RayWorker:
         # Patch comfy.lora.calculate_weight to support LoRAAdapter objects
         comfy.lora.calculate_weight = calculate_weight
         
+        # Register INT8 tensorwise layout in this worker process so
+        # pre-quantized INT8 checkpoints are handled correctly.
+        try:
+            from raylight.comfy_extra_dist.int8 import _register_layouts
+            _register_layouts()
+        except Exception:
+            pass  # INT8 support optional
+        
         print(f"[RayWorker {self.local_rank}] Applied global monkey-patches.")
 
         self._init_device_and_comms(local_rank)
