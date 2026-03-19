@@ -309,23 +309,46 @@ class BasePinnedCache(ABC):
             print(f"[{self._tag}] Already on CUDA — skipping reload.")
             return 0
 
-        torch.cuda.empty_cache()
+        t_start = time.perf_counter()
+
+        # NOTE: intentionally no empty_cache() here — the caching allocator
+        # may still hold freed blocks from a previous model being unloaded;
+        # those can be reused by resize_() below without hitting cudaMalloc.
+        # The offload path already called empty_cache() when it freed VRAM.
 
         # Re-allocate all freed CUDA storages
         restored = 0
+        alloc_bytes = 0
         for s, nbytes in self._freed_storages:
             s.resize_(nbytes)
+            alloc_bytes += nbytes
             restored += 1
         self._freed_storages = []
-        print(f"[{self._tag}] Restored {restored} CUDA storages.")
+
+        t_alloc = time.perf_counter()
 
         reloaded = self._copy_to_cuda(module, non_blocking)
+
+        t_copy = time.perf_counter()
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
+        t_sync = time.perf_counter()
+
         self._on_cuda = True
-        print(f"[{self._tag}] Reloaded {reloaded} params to CUDA.")
+        alloc_ms = (t_alloc - t_start) * 1000
+        copy_ms = (t_copy - t_alloc) * 1000
+        sync_ms = (t_sync - t_copy) * 1000
+        total_ms = (t_sync - t_start) * 1000
+        total_gb = alloc_bytes / 1e9
+        throughput = total_gb / (t_sync - t_start) if (t_sync - t_start) > 0 else 0
+        print(
+            f"[{self._tag}] Reloaded {reloaded} params to CUDA "
+            f"({total_gb:.2f} GB in {total_ms:.0f} ms — "
+            f"alloc {alloc_ms:.0f} ms, copy+sync {copy_ms + sync_ms:.0f} ms, "
+            f"{throughput:.1f} GB/s)."
+        )
         return reloaded
 
     @abstractmethod
@@ -443,7 +466,7 @@ class PinnedParamCache(BasePinnedCache):
     # -- build --
 
     def _do_build(self, module: torch.nn.Module) -> None:
-        param_count = buf_count = pinned_cpu = 0
+        param_count = buf_count = pinned_cpu = not_pinned = 0
         needs_sync = False
 
         for name, param in module.named_parameters():
@@ -482,10 +505,20 @@ class PinnedParamCache(BasePinnedCache):
         if needs_sync and torch.cuda.is_available():
             torch.cuda.synchronize()
 
+        # Verify pinning — unpinned buffers silently fall back to staged
+        # (pageable) DMA at roughly half the bandwidth.
+        for t in self._cpu_params.values():
+            if not t.is_pinned():
+                not_pinned += 1
+        for t in self._cpu_buffers.values():
+            if not t.is_pinned():
+                not_pinned += 1
+
+        pin_status = "all pinned ✓" if not_pinned == 0 else f"WARNING: {not_pinned} tensors NOT pinned (DMA will use slow staging path)"
         print(
             f"[{self._tag}] Built: {param_count} params + {buf_count} buffers, "
             f"{self.pinned_ram_bytes() / 1e9:.2f} GB pinned. "
-            f"(pinned_in_place={pinned_cpu})"
+            f"(pinned_in_place={pinned_cpu}, {pin_status})"
         )
 
     # -- offload --

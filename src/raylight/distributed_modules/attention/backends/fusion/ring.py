@@ -40,6 +40,22 @@ except ImportError:
 
 _VERBOSE_ATTN = os.getenv("RAYLIGHT_VERBOSE_ATTN", "0") == "1"
 
+# P1: Overlap decompress with NCCL communication on a secondary CUDA stream.
+# After comm.wait() receives compressed K/V, decompress is launched on
+# _decomp_stream so it runs concurrently with the next step's send_recv.
+# Disable with RAYLIGHT_OVERLAP_DECOMP=0 if it causes issues.
+_OVERLAP_DECOMP = os.getenv("RAYLIGHT_OVERLAP_DECOMP", "1") == "1"
+_decomp_stream_cache: dict[int, torch.cuda.Stream] = {}  # keyed by device index
+
+
+def _get_decomp_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return a cached CUDA stream for decompress overlap on *device*."""
+    idx = device.index if device.index is not None else 0
+    if idx not in _decomp_stream_cache:
+        _decomp_stream_cache[idx] = torch.cuda.Stream(device=device)
+    return _decomp_stream_cache[idx]
+
+
 # OPT 7: Cache RingComm instances per process group
 _ring_comm_cache = {}
 
@@ -331,27 +347,51 @@ def _compact_ring_fwd(
     if v.dtype != q.dtype:
         v = v.to(q.dtype)
 
+    # P1: Pre-decompress on a secondary CUDA stream so that decompress
+    # of the NEXT step's received K/V overlaps with the current step's
+    # NCCL send_recv.  For world_size <= 2, overlap provides no benefit
+    # (the decompress cannot run concurrently with useful work).
+    use_overlap = _OVERLAP_DECOMP and world_size > 2
+    decomp_stream = _get_decomp_stream(q.device) if use_overlap else None
+    k_predecomp = None
+    v_predecomp = None
+
     for step in range(world_size):
-        buf_k: torch.Tensor = torch.empty(0)
-        buf_v: torch.Tensor = torch.empty(0)
+        # P6: Batch K+V into a single NCCL transfer to halve kernel launches.
+        # Instead of two send_recv calls (4 P2P ops), concatenate into one
+        # buffer (2 P2P ops) and split after receive.
+        buf_kv: torch.Tensor | None = None
+        k_split: int = 0
         if step + 1 != world_size:
-            buf_k = comm.send_recv(k_to_send)
-            buf_v = comm.send_recv(v_to_send)
+            k_split = k_to_send.numel()
+            kv_to_send = torch.cat([k_to_send.reshape(-1), v_to_send.reshape(-1)])
+            buf_kv = comm.send_recv(kv_to_send)
             comm.commit()
         
         if step != 0:
-            k_recv_cache_key = k_recv_keys[step]
-            v_recv_cache_key = v_recv_keys[step]
-            k = compact_decompress(
-                k_recv_cache_key, k_to_send, compress_type_k, original_k_shape, update_cache=True
-            ).contiguous()
-            if k.dtype != q.dtype:
-                k = k.to(q.dtype)
-            v = compact_decompress(
-                v_recv_cache_key, v_to_send, compress_type_v, original_v_shape, update_cache=True
-            ).contiguous()
-            if v.dtype != q.dtype:
-                v = v.to(q.dtype)
+            if k_predecomp is not None:
+                # Data was pre-decompressed on the secondary stream at the
+                # end of the previous step.  Synchronize so the default
+                # stream sees the completed tensors.
+                torch.cuda.current_stream().wait_stream(decomp_stream)
+                k = k_predecomp
+                v = v_predecomp
+                k_predecomp = v_predecomp = None
+            else:
+                # Fallback: decompress synchronously on the default stream
+                # (first eligible step when overlap is off, or world_size<=2).
+                k_recv_cache_key = k_recv_keys[step]
+                v_recv_cache_key = v_recv_keys[step]
+                k = compact_decompress(
+                    k_recv_cache_key, k_to_send, compress_type_k, original_k_shape, update_cache=True
+                ).contiguous()
+                if k.dtype != q.dtype:
+                    k = k.to(q.dtype)
+                v = compact_decompress(
+                    v_recv_cache_key, v_to_send, compress_type_v, original_v_shape, update_cache=True
+                ).contiguous()
+                if v.dtype != q.dtype:
+                    v = v.to(q.dtype)
 
         if is_joint and joint_strategy == "rear":
             if step + 1 == comm.world_size:
@@ -446,8 +486,34 @@ def _compact_ring_fwd(
         if step + 1 != comm.world_size:
             with Profiler.scope("compact.ring.wait"):
                 comm.wait()
-            k_to_send = buf_k 
-            v_to_send = buf_v
+            # P6: Split the received KV buffer back into K and V parts.
+            assert buf_kv is not None
+            k_to_send = buf_kv[:k_split]
+            v_to_send = buf_kv[k_split:]
+
+            # P1: Pre-decompress next step's received K/V on the secondary
+            # stream.  This runs concurrently with the next step's NCCL
+            # send_recv (posted at the top of the loop) since NCCL and
+            # decomp_stream are independent CUDA streams.  Both only READ
+            # k_to_send/v_to_send so there is no data race.
+            next_step = step + 1
+            if use_overlap and next_step > 0:
+                # Ensure decomp_stream sees all default-stream work
+                # (in particular the buf_k/buf_v contents from comm.wait).
+                decomp_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(decomp_stream):
+                    k_predecomp = compact_decompress(
+                        k_recv_keys[next_step], k_to_send,
+                        compress_type_k, original_k_shape, update_cache=True,
+                    ).contiguous()
+                    if k_predecomp.dtype != q.dtype:
+                        k_predecomp = k_predecomp.to(q.dtype)
+                    v_predecomp = compact_decompress(
+                        v_recv_keys[next_step], v_to_send,
+                        compress_type_v, original_v_shape, update_cache=True,
+                    ).contiguous()
+                    if v_predecomp.dtype != q.dtype:
+                        v_predecomp = v_predecomp.to(q.dtype)
     
     if out is None:
         out = torch.zeros_like(q)

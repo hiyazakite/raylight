@@ -231,6 +231,39 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             sd, _ = gguf_sd_loader(u_path)
             self.mmap_cache = sd
 
+        # ── Enforce user VRAM budget (partial VRAM load) ──────────
+        # When vram_limit_bytes is set, compute how much VRAM is
+        # available and pass lowvram_model_memory so ComfyUI's load()
+        # places budget-worth of modules on CUDA (quantised weights
+        # stay on-device for faster dequant) and streams the rest
+        # per-layer via comfy_cast_weights hooks.
+        import logging
+        vram_limit = getattr(self, "vram_limit_bytes", 0)
+        device_to = args[0] if args else kwargs.get("device_to")
+        if vram_limit > 0 and device_to is not None:
+            try:
+                from raylight.distributed_worker.model_context import _compute_vram_budget
+                model_bytes = self.model_size()
+                budget = _compute_vram_budget(
+                    device_to, model_bytes, vram_limit_bytes=vram_limit,
+                )
+                if budget > 0:
+                    incoming = kwargs.get("lowvram_model_memory", 0)
+                    if incoming == 0 or incoming > budget:
+                        kwargs["lowvram_model_memory"] = budget
+                    kwargs["full_load"] = False
+                    logging.info(
+                        "[GGUFModelPatcher] VRAM limit %.1f GB → "
+                        "weight budget capped to %.0f MB (model %.0f MB)",
+                        vram_limit / 1e9,
+                        budget / (1024 ** 2),
+                        model_bytes / (1024 ** 2),
+                    )
+            except Exception as e:
+                logging.warning(
+                    "[GGUFModelPatcher] Budget cap failed: %s", e,
+                )
+
         super().load(*args, force_patch_weights=True, **kwargs)
 
         # Optimization: Clear backup after load to drop extra references?
@@ -247,6 +280,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         
         n.patch_on_device = getattr(self, "patch_on_device", False)
         n.mmap_cache = getattr(self, "mmap_cache", {})
+        n.vram_limit_bytes = getattr(self, "vram_limit_bytes", 0)
         
         # CRITICAL FIX: Empty backup in clone to prevent mmap reference leaks
         # Clones will repopulate backup when they act.

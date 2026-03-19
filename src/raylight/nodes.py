@@ -36,16 +36,17 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # The pinned RAM cache lives in host memory (/dev/shm or private pinned pages)
 # and is designed to survive VRAM unloads so that models can be hot-reloaded in
-# milliseconds.  We must NOT destroy it when ComfyUI calls unload_all_models()
-# — that function is about reclaiming VRAM, and ComfyUI's execution engine
-# calls it in several normal-operation scenarios (DISABLE_SMART_MEMORY, OOM
-# recovery, etc.).
+# milliseconds.  Internal Raylight callers (samplers) use the original
+# ``_orig_unload_all_models`` to free main-process VRAM without disturbing
+# worker caches.
 #
-# Pinned caches are released only when:
-#   1. Workers are being replaced (model change → _need_restart path in
-#      ray_worker._maybe_restart_actors releases caches before killing actors).
-#   2. The user explicitly requests it via release_all_pinned_caches() (exposed
-#      for future "deep clean" nodes or manual use).
+# The public ``unload_all_models()`` (monkey-patched below) additionally
+# releases worker pinned caches so that ComfyUI's "Unload model" and
+# "Free model and node cache" buttons fully reclaim VRAM and pinned RAM.
+#
+# Pinned caches are also released when:
+#   1. Workers are being replaced (model change → ensure_fresh_actors).
+#   2. Workers crash (dead-actor detection + /dev/shm cleanup).
 # ---------------------------------------------------------------------------
 _active_workers: list = []  # Current Ray actor handles (set by loader nodes)
 
@@ -57,32 +58,45 @@ def _register_workers(gpu_actors: list):
 
 
 def release_all_pinned_caches():
-    """Tell every live Ray worker to free its pinned RAM cache.
+    """Tell every live Ray worker to free its pinned RAM cache + VRAM.
 
-    This is intentionally NOT hooked into ComfyUI's unload_all_models.
-    Call it explicitly when workers are being torn down or a deep memory
-    cleanup is needed.
+    Handles dead/crashed workers gracefully: unreachable actors are pruned
+    and orphaned /dev/shm segments are cleaned up.
     """
+    global _active_workers
     if not _active_workers:
+        # No workers tracked — just clean up any orphaned shm segments.
+        _cleanup_stale_shm()
         return
+
     futures = []
+    live_actors = []
     for actor in _active_workers:
         try:
             futures.append(actor.release_pinned_cache.remote())
+            live_actors.append(actor)
         except Exception:
-            pass  # actor may already be dead
+            pass  # actor already dead — skip
+
     if futures:
         try:
             ray.get(futures, timeout=30)
         except Exception as e:
             print(f"[Raylight] Pinned cache release warning: {e}")
 
+    # Prune dead actors from the tracked list
+    _active_workers = live_actors
+
+    # Always clean up /dev/shm — dead actors may have left orphaned segments.
+    _cleanup_stale_shm()
+    print("[Raylight] release_all_pinned_caches: cleanup complete.")
+
 
 def _cleanup_stale_shm():
     """Remove orphaned /dev/shm segments from previous Raylight sessions.
 
-    Safe to call only at startup before workers are created — it removes ALL
-    raylight shm segments, including any that might belong to a running session.
+    Safe to call at startup or after releasing caches — removes ALL
+    raylight shm segments that are not actively mmap'd.
     """
     import glob
     for pattern in ("/dev/shm/raylight_pc_*", "/dev/shm/raylight_vae_*"):
@@ -95,6 +109,27 @@ def _cleanup_stale_shm():
 
 # Run stale-shm cleanup once at import time (before any workers exist).
 _cleanup_stale_shm()
+
+# ---------------------------------------------------------------------------
+# Monkey-patch unload_all_models so ComfyUI buttons release worker caches
+# ---------------------------------------------------------------------------
+# Save the original for internal use (samplers call this to free main-process
+# VRAM without touching worker caches — preserving hot-reload).
+_orig_unload_all_models = comfy.model_management.unload_all_models
+
+
+def _patched_unload_all_models():
+    """Drop-in replacement that also frees Ray worker pinned caches.
+
+    ComfyUI calls this from the "Unload model" / "Free model and node cache"
+    buttons.  Internal Raylight samplers must use ``_orig_unload_all_models``
+    to avoid destroying the hot-reload cache on every sample.
+    """
+    _orig_unload_all_models()
+    release_all_pinned_caches()
+
+
+comfy.model_management.unload_all_models = _patched_unload_all_models
 
 # Workaround https://github.com/comfyanonymous/ComfyUI/pull/11134
 # since in FSDPModelPatcher mode, ray cannot pickle None type cause by getattr

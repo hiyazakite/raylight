@@ -476,6 +476,13 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
              return
         if hasattr(self.model, "current_patcher"):
             self.model.current_patcher = None
+        # Release FSDP shard cache when the patcher is being cleaned up
+        shard_cache = getattr(self, "fsdp_shard_cache", None)
+        if shard_cache is not None:
+            try:
+                shard_cache.cleanup()
+            except Exception as e:
+                logging.warning(f"[FSDPModelPatcher] Shard cache cleanup error: {e}")
         for callback in self.get_all_callbacks(CallbacksMP.ON_CLEANUP):
             callback(self)
 
@@ -577,10 +584,13 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                     except Exception:
                         pass
         
-        # Additional cleanup for FSDP
-        if isinstance(self.model, FSDPModule):
-            # Try to force FSDP internal cleanup if possible
-            pass
+        # Release FSDP shard cache
+        shard_cache = getattr(self, "fsdp_shard_cache", None)
+        if shard_cache is not None:
+            try:
+                shard_cache.cleanup()
+            except Exception:
+                pass
 
     def __del__(self):
         try:
@@ -588,7 +598,18 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         except:
             pass
             
-        del self.model
+        # Release shard cache if release_memory didn't run
+        shard_cache = getattr(self, "fsdp_shard_cache", None)
+        if shard_cache is not None:
+            try:
+                shard_cache.cleanup()
+            except Exception:
+                pass
+
+        try:
+            del self.model
+        except Exception:
+            pass
         self.model = None
         comfy.model_management.soft_empty_cache()
         gc.collect()

@@ -108,13 +108,26 @@ class RayWorker:
 
         Called on: model switch, kill, error-triggered destruction.
         Safe to call when no model / no cache is attached.
+        Handles both standard (pinned_param_cache) and FSDP (fsdp_shard_cache).
         """
-        cache = getattr(self.model, "pinned_param_cache", None) if self.model else None
+        if self.model is None:
+            return
+
+        # Standard pinned param cache (non-FSDP)
+        cache = getattr(self.model, "pinned_param_cache", None)
         if cache is not None:
             try:
                 cache.cleanup()
             except Exception as e:
                 print(f"[RayWorker {self.local_rank}] Pinned cache cleanup error: {e}")
+
+        # FSDP shard cache
+        shard_cache = getattr(self.model, "fsdp_shard_cache", None)
+        if shard_cache is not None:
+            try:
+                shard_cache.cleanup()
+            except Exception as e:
+                print(f"[RayWorker {self.local_rank}] FSDP shard cache cleanup error: {e}")
 
     def release_pinned_cache(self):
         """Public remote-callable wrapper: free pinned RAM on demand.
@@ -440,7 +453,15 @@ class RayWorker:
         # Format flags and coordinating refs
         self.is_gguf = unet_path.lower().endswith(".gguf") or dequant_dtype is not None
         if self.is_gguf and self.model is not None and hasattr(self.model, "load"):
-            print(f"[RayWorker {self.local_rank}] GGUF: Forcing immediate VRAM load...")
+            # Budget-aware initial load: if vram_limit_bytes is set the
+            # budget enforcement inside GGUFModelPatcher.load() will cap
+            # lowvram_model_memory so ComfyUI places only budget-worth of
+            # modules on CUDA and streams the rest per-layer.
+            vram_limit = self.parallel_dict.get("vram_limit_bytes", 0)
+            if vram_limit > 0:
+                print(f"[RayWorker {self.local_rank}] GGUF: Partial VRAM load (limit {vram_limit / 1e9:.1f} GB)...")
+            else:
+                print(f"[RayWorker {self.local_rank}] GGUF: Forcing immediate VRAM load...")
             self.model.load(self.device, force_patch_weights=True)
             self.model.current_device = self.device
             cleanup_memory()
