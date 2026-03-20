@@ -1,15 +1,16 @@
 import torch
 import logging
-from typing import Dict, Any, Callable, Optional
+from typing import Dict, Any, Callable, Optional, TYPE_CHECKING
+if TYPE_CHECKING:
+    from raylight.config import RaylightConfig
 
 logger = logging.getLogger(__name__)
 
 try:
-    from raylight.distributed_modules.attention.backends.fusion.ring import compact_fwd, _VERBOSE_ATTN
+    from raylight.distributed_modules.attention.backends.fusion.ring import compact_fwd
     from raylight.distributed_modules.attention.backends.fusion.context import compact_get_step
 except ImportError:
     compact_fwd = None
-    _VERBOSE_ATTN = False
     compact_get_step = lambda: 0
 
 try:
@@ -28,11 +29,17 @@ def select_ring_attn_fn(
     use_compact_ring: bool,
     has_mask: bool,
     layer_idx: Optional[int] = None,
-    ring_impl_type: str = "basic"
+    ring_impl_type: str = "basic",
+    raylight_config: Optional['RaylightConfig'] = None
 ) -> Callable:
     """
     Centralized logic to select the appropriate ring attention function.
     """
+    # [SENIOR REFACTOR] Use Unified Config if available
+    if raylight_config:
+        use_compact_ring = (raylight_config.strategy.attention_backend == "COMPACT")
+        ring_impl_type = raylight_config.strategy.ring_impl
+        
     if use_compact_ring:
         if compact_fwd is None:
             raise ImportError("Compact ring backend (compact_fwd) not found but requested.")
@@ -42,7 +49,7 @@ def select_ring_attn_fn(
     if ring_impl_type == "zigzag":
         target_fn = xdit_ring_zigzag_flash_attn_func_patched
         if target_fn is not None:
-             if _VERBOSE_ATTN:
+             if raylight_config and raylight_config.debug.verbose_attn:
                 print(f"[Raylight] ⚡ Using zigzag ring attention (Layer: {layer_idx})")
              # Wrap to swallow extra kwargs like mod_idx
              if target_fn not in _WRAPPED_CACHE:
@@ -54,7 +61,7 @@ def select_ring_attn_fn(
         # Use patched version if available (supports masks)
         target_fn = xdit_ring_flash_attn_func_patched or xdit_ring_flash_attn_func
         if target_fn is not None:
-            if _VERBOSE_ATTN:
+            if raylight_config and raylight_config.debug.verbose_attn:
                 print(f"[Raylight] ⚡ Mask present — using patched xfuser ring for mask support (Layer: {layer_idx})")
             # Wrap to swallow extra kwargs like mod_idx
             if target_fn not in _WRAPPED_CACHE:
@@ -91,13 +98,17 @@ def prepare_ring_attn_kwargs(
     return_attn_probs: bool = False,
     group: Any = None,
     attn_layer: Any = None,
+    raylight_config: Optional['RaylightConfig'] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
     Prepares the keyword arguments for the selected ring attention function.
     Optimized to minimize dictionary overhead.
     """
+    # [SENIOR REFACTOR] Use Unified Config if available
     is_compact = (ring_fn is compact_fwd)
+    if raylight_config:
+        is_compact = (raylight_config.strategy.attention_backend == "COMPACT")
     
     # Common base
     attn_kwargs = {
@@ -122,6 +133,7 @@ def prepare_ring_attn_kwargs(
     
     if is_compact:
         attn_kwargs["mod_idx"] = mod_idx
+        # Default current_iter to compact_get_step() if not provided in kwargs
         attn_kwargs["current_iter"] = kwargs.get("current_iter", compact_get_step())
         attn_kwargs["mask"] = mask
     else:

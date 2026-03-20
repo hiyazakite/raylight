@@ -11,11 +11,12 @@ from .distributed_worker.ray_worker import (
     ensure_fresh_actors,
     ray_nccl_tester
 )
+from .config import RaylightConfig, ExecutionStrategy, DeviceConfig, DebugConfig
 
 
 class RayInitializerDebug:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "ray_cluster_address": ("STRING", {"default": "local"}),
@@ -72,8 +73,6 @@ class RayInitializerDebug:
 
         # HF Tokenizer warning when forking
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        self.parallel_dict = dict()
-
         world_size = GPU
         max_world_size = torch.cuda.device_count()
         if world_size > max_world_size:
@@ -89,30 +88,22 @@ class RayInitializerDebug:
                 "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
             )
 
-        self.parallel_dict["is_xdit"] = False
-        self.parallel_dict["is_fsdp"] = False
-        self.parallel_dict["sync_ulysses"] = False
-        self.parallel_dict["global_world_size"] = world_size
-
-        if (
-            ulysses_degree > 0
-            or ring_degree > 0
-            or cfg_degree > 0
-        ):
-            if ulysses_degree * ring_degree * cfg_degree == 0:
-                raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} mul {ring_degree=} mul {cfg_degree=} is 0.
-                 Please make sure to set any parallel degree to be greater than 0.
-                 Or switch into DPKSampler and set 0 to all parallel degree""")
-            self.parallel_dict["attention"] = XFuser_attention
-            self.parallel_dict["is_xdit"] = True
-            self.parallel_dict["ulysses_degree"] = ulysses_degree
-            self.parallel_dict["ring_degree"] = ring_degree
-            self.parallel_dict["cfg_degree"] = cfg_degree
-            self.parallel_dict["sync_ulysses"] = sync_ulysses
-
-        if FSDP:
-            self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
-            self.parallel_dict["is_fsdp"] = True
+        from .config import RaylightAttnType
+        config = RaylightConfig(
+            strategy=ExecutionStrategy(
+                ulysses_degree=ulysses_degree,
+                ring_degree=ring_degree,
+                cfg_degree=cfg_degree,
+                fsdp_enabled=FSDP,
+                fsdp_cpu_offload=FSDP_CPU_OFFLOAD,
+                sync_ulysses=sync_ulysses,
+                attention_type=RaylightAttnType(XFuser_attention)
+            ),
+            device=DeviceConfig(
+                world_size=world_size,
+            )
+        )
+        self.parallel_dict = config.to_legacy_dict()
 
         try:
             # Shut down so if comfy user try another workflow it will not cause error
@@ -143,7 +134,7 @@ class RayInitializerDebug:
 
 class RayNF4Loader:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("checkpoints"),),
@@ -165,15 +156,14 @@ class RayNF4Loader:
         ray_actors_init,
         unet_name,
     ):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
-        parallel_dict: Any = parallel_dict
+        ray_actors, gpu_actors, config = ensure_fresh_actors(ray_actors_init)
 
         unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
         loaded_futures = []
         patched_futures = []
 
-        if parallel_dict["is_fsdp"] is True:
+        if config.strategy.fsdp_enabled is True:
             worker0 = ray.get_actor("RayWorker:0")
             ray.get(
                 worker0.load_bnb_unet.remote(
@@ -205,7 +195,7 @@ class RayNF4Loader:
             loaded_futures = []
 
         for actor in gpu_actors:
-            if parallel_dict["is_xdit"]:
+            if config.meta.total_sp_degree > 1:
                 patched_futures.append(actor.patch_usp.remote())
 
         ray.get(patched_futures)

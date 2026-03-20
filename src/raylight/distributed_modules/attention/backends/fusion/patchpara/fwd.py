@@ -1,3 +1,4 @@
+from typing import Optional
 from raylight.distributed_modules.attention.backends.fusion.context import compact_config
 from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
 import torch
@@ -53,7 +54,7 @@ def patch_gather_fwd(
     config_obj = compact_config()
     override = config_obj.override_with_patch_gather_fwd if config_obj else False
     assert override, "Patch gather fwd is not enabled"
-    config: PatchConfig = config_obj.patch_gather_fwd_config if config_obj else None
+    config: Optional[PatchConfig] = config_obj.patch_gather_fwd_config if config_obj else None
     assert config is not None, "patch_gather_fwd_config is required"
     assert mod_idx is not None, "mod_idx is required for caching"
     assert current_iter is not None, "current_iter is required for async logic"
@@ -97,8 +98,8 @@ def patch_gather_fwd(
     # --- Communication Step (Sync or Async) ---
     if config.use_compact:
         from raylight.distributed_modules.attention.backends.fusion.ops import compact_all_gather
-        comp_type_k = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
-        comp_type_v = config_obj.compress_func(mod_idx, current_iter) if config_obj else COMPACT_COMPRESS_TYPE.IDENTITY
+        comp_type_k = config_obj.compress_func(mod_idx, current_iter) if (config_obj and config_obj.compress_func) else COMPACT_COMPRESS_TYPE.IDENTITY
+        comp_type_v = config_obj.compress_func(mod_idx, current_iter) if (config_obj and config_obj.compress_func) else COMPACT_COMPRESS_TYPE.IDENTITY
         k_list_for_computation = compact_all_gather(
             f"{mod_idx}-k",
             k,
@@ -195,11 +196,11 @@ def patch_gather_fwd(
     value_to_use = global_v
     if is_joint:
         if joint_strategy == "front":
-            key_to_use = torch.cat([joint_tensor_key, global_k], dim=1)
-            value_to_use = torch.cat([joint_tensor_value, global_v], dim=1)
+            key_to_use = torch.cat([joint_tensor_key, global_k], dim=1) # type: ignore
+            value_to_use = torch.cat([joint_tensor_value, global_v], dim=1) # type: ignore
         elif joint_strategy == "rear":
-            key_to_use = torch.cat([global_k, joint_tensor_key], dim=1)
-            value_to_use = torch.cat([global_v, joint_tensor_value], dim=1)
+            key_to_use = torch.cat([global_k, joint_tensor_key], dim=1) # type: ignore
+            value_to_use = torch.cat([global_v, joint_tensor_value], dim=1) # type: ignore
     # --- End Apply Joint Tensors ---
 
     # PERFORMANCE: Avoid synchronous .all() checks in inner loops.
@@ -254,17 +255,17 @@ def patch_gather_fwd(
 
         if use_legacy:
             fa_kwargs["window_size"] = window_size
-            fa_res = _flash_attn_forward(q, key_to_use, value_to_use, **fa_kwargs)
+            fa_res = _flash_attn_forward(q, key_to_use, value_to_use, **fa_kwargs) # type: ignore
             out = fa_res[0]
             lse = fa_res[5]  # type: ignore
         else:
             fa_kwargs["window_size_left"] = window_size[0]
             fa_kwargs["window_size_right"] = window_size[1]
-            fa_res = _flash_attn_forward(q, key_to_use, value_to_use, **fa_kwargs)
+            fa_res = _flash_attn_forward(q, key_to_use, value_to_use, **fa_kwargs) # type: ignore
             out = fa_res[0]
             lse = fa_res[1]  # type: ignore
 
-    out = out.to(q.dtype)
-    lse = lse.squeeze(dim=-1).transpose(1, 2)
+    out = out.to(q.dtype) # type: ignore
+    lse = lse.squeeze(dim=-1).transpose(1, 2) # type: ignore
 
     return out, lse, None

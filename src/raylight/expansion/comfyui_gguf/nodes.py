@@ -340,8 +340,7 @@ class RayGGUFLoader:
         torch_compile="disabled",
         torch_compile_dynamic="auto",
     ):
-        ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
-        parallel_dict: Any = parallel_dict
+        ray_actors, gpu_actors, config = ensure_fresh_actors(ray_actors_init)
         
         model_options = {
             "dequant_dtype": dequant_dtype,
@@ -354,7 +353,7 @@ class RayGGUFLoader:
         loaded_futures = []
         patched_futures = []
 
-        if parallel_dict.get("is_fsdp"):
+        if config.strategy.fsdp_enabled:
             worker0 = ray.get_actor("RayWorker:0")
             ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
             meta_model = ray.get(worker0.get_meta_model.remote())
@@ -375,7 +374,7 @@ class RayGGUFLoader:
             # Mmap-aware loading strategy:
             # - use_mmap=True: Pure parallel loading (OS page cache handles sharing)
             # - use_mmap=False: Leader-follower sequential (avoid RAM spikes from concurrent copies)
-            use_mmap = parallel_dict.get("use_mmap", True)
+            use_mmap = config.device.use_mmap
             
             if use_mmap:
                 # PARALLEL: All workers load simultaneously via mmap
@@ -426,7 +425,7 @@ class RayGGUFLoader:
                 loaded_futures = []
 
         for actor in gpu_actors:
-            if parallel_dict.get("is_xdit"):
+            if config.meta.total_sp_degree > 1:
                 patched_futures.append(actor.patch_usp.remote())
 
         ray.get(patched_futures)
@@ -434,7 +433,7 @@ class RayGGUFLoader:
         # Optional torch.compile
         if torch_compile != "disabled":
             from raylight.nodes import _check_compile_compatible, _discover_compile_keys
-            compile_ok, compile_reason = _check_compile_compatible(unet_name, parallel_dict, backend=torch_compile)
+            compile_ok, compile_reason = _check_compile_compatible(unet_name, config, backend=torch_compile)
             if not compile_ok:
                 print(f"[Raylight] WARNING: torch.compile skipped — {compile_reason}")
             else:

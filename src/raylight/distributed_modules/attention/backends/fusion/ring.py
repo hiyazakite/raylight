@@ -2,6 +2,7 @@
 NOTE: code from yunchang
 """
 
+from typing import Optional, List, Any
 import torch
 import os
 
@@ -38,13 +39,6 @@ except ImportError:
     memory_efficient_attention_forward = None
     LowerTriangularMask = None
 
-_VERBOSE_ATTN = os.getenv("RAYLIGHT_VERBOSE_ATTN", "0") == "1"
-
-# P1: Overlap decompress with NCCL communication on a secondary CUDA stream.
-# After comm.wait() receives compressed K/V, decompress is launched on
-# _decomp_stream so it runs concurrently with the next step's send_recv.
-# Disable with RAYLIGHT_OVERLAP_DECOMP=0 if it causes issues.
-_OVERLAP_DECOMP = os.getenv("RAYLIGHT_OVERLAP_DECOMP", "1") == "1"
 _decomp_stream_cache: dict[int, torch.cuda.Stream] = {}  # keyed by device index
 
 
@@ -89,16 +83,17 @@ def compact_fwd(
     """
     Compact ring attention forward pass.
     """
-    if _VERBOSE_ATTN:
+    config = compact_config()
+    if config and config.verbose_attn:
         mask_info = f"Shape={mask.shape}" if mask is not None else "None"
         # print(f"📦 [Raylight] compact_fwd called (Layer: {mod_idx}, Iter: {current_iter}, mask={mask_info})")
         pass
+
     # Trust that higher-level logic (usp_dit_forward) has already 
     # stripped trivial masks to avoid GPU-CPU sync here.
     from xfuser.core.distributed import get_sequence_parallel_rank
     get_sequence_parallel_rank() # Just to ensure it's imported
 
-    config = compact_config()
     gather = config.override_with_patch_gather_fwd if config else False
     
     if gather:
@@ -115,8 +110,6 @@ def compact_fwd(
             mask=mask
         )
 
-# env var USE_AWL
-AWL=os.getenv("USE_AWL", "0") == "1"
 AWL_RAND=False
 
 def compact_update_awl_scale(q, k, v):
@@ -128,8 +121,11 @@ def compact_update_awl_scale(q, k, v):
         q: Query tensor (bs, seq_len, head_cnt, head_size)
         k: Key tensor (bs, seq_len, head_cnt, head_size)
     """
+    config = compact_config()
+    use_awl = config.use_awl if config else False
+
     from raylight.distributed_modules.attention.backends.fusion.slowpath import set_current_lowrank_scale
-    if not AWL:
+    if not use_awl:
         return
     with torch.no_grad(): # No need to track gradients for importance calculation
         if not AWL_RAND:
@@ -260,7 +256,8 @@ def _compact_ring_fwd(
     current_iter=None,
     mask=None,
 ):
-    if _VERBOSE_ATTN:
+    config = compact_config()
+    if config and config.verbose_attn:
         mask_info = f"Shape={mask.shape}" if mask is not None else "None"
         # print(f"🐳 [Raylight] _compact_ring_fwd loop (Layer: {mod_idx}, Step: {current_iter}, Q: {q.shape}, mask={mask_info})")
         pass
@@ -310,8 +307,7 @@ def _compact_ring_fwd(
     from raylight.distributed_modules.attention import check_mask_nontrivial
     has_nontrivial_mask = check_mask_nontrivial(mask)
 
-    config = compact_config()
-    if config:
+    if config and config.compress_func:
         compress_type_k = config.compress_func(mod_idx, current_iter)
         compress_type_v = config.compress_func(mod_idx, current_iter)
     else:
@@ -351,10 +347,10 @@ def _compact_ring_fwd(
     # of the NEXT step's received K/V overlaps with the current step's
     # NCCL send_recv.  For world_size <= 2, overlap provides no benefit
     # (the decompress cannot run concurrently with useful work).
-    use_overlap = _OVERLAP_DECOMP and world_size > 2
+    use_overlap = config.overlap_decomp and world_size > 2 if config else (world_size > 2)
     decomp_stream = _get_decomp_stream(q.device) if use_overlap else None
-    k_predecomp = None
-    v_predecomp = None
+    k_predecomp: Optional[torch.Tensor] = None
+    v_predecomp: Optional[torch.Tensor] = None
 
     for step in range(world_size):
         # P6: Batch K+V into a single NCCL transfer to halve kernel launches.
@@ -374,6 +370,7 @@ def _compact_ring_fwd(
                 # end of the previous step.  Synchronize so the default
                 # stream sees the completed tensors.
                 torch.cuda.current_stream().wait_stream(decomp_stream)
+                assert k_predecomp is not None and v_predecomp is not None
                 k = k_predecomp
                 v = v_predecomp
                 k_predecomp = v_predecomp = None
@@ -420,9 +417,9 @@ def _compact_ring_fwd(
                 recv_rank = (comm.rank - step) % comm.world_size
                 q_start = comm.rank * q_len
                 k_start = recv_rank * k_len_block
-                q_idx = slice(q_start, q_start + q_len) if (len(mask.shape) > 2 and mask.shape[2] > 1) else slice(None)
-                k_idx = slice(k_start, k_start + k_len_block) if (len(mask.shape) > 3 and mask.shape[3] > 1) else slice(None)
-                mask_slice = mask[:, :, q_idx, k_idx]
+                q_idx = slice(q_start, q_start + q_len) if (mask is not None and len(mask.shape) > 2 and mask.shape[2] > 1) else slice(None)
+                k_idx = slice(k_start, k_start + k_len_block) if (mask is not None and len(mask.shape) > 3 and mask.shape[3] > 1) else slice(None)
+                mask_slice = mask[:, :, q_idx, k_idx] if mask is not None else None
 
             if mask_slice is not None or flash_attn is None:
                 block_out, block_lse = compact_attn_forward(
@@ -497,7 +494,7 @@ def _compact_ring_fwd(
             # decomp_stream are independent CUDA streams.  Both only READ
             # k_to_send/v_to_send so there is no data race.
             next_step = step + 1
-            if use_overlap and next_step > 0:
+            if use_overlap and next_step > 0 and decomp_stream is not None:
                 # Ensure decomp_stream sees all default-stream work
                 # (in particular the buf_k/buf_v contents from comm.wait).
                 decomp_stream.wait_stream(torch.cuda.current_stream())
@@ -506,12 +503,14 @@ def _compact_ring_fwd(
                         k_recv_keys[next_step], k_to_send,
                         compress_type_k, original_k_shape, update_cache=True,
                     ).contiguous()
+                    assert k_predecomp is not None # satisfy pyright
                     if k_predecomp.dtype != q.dtype:
                         k_predecomp = k_predecomp.to(q.dtype)
                     v_predecomp = compact_decompress(
                         v_recv_keys[next_step], v_to_send,
                         compress_type_v, original_v_shape, update_cache=True,
                     ).contiguous()
+                    assert v_predecomp is not None # satisfy pyright
                     if v_predecomp.dtype != q.dtype:
                         v_predecomp = v_predecomp.to(q.dtype)
     

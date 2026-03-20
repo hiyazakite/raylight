@@ -26,7 +26,7 @@ def local_shard(x: torch.Tensor, dim: int = 2) -> torch.Tensor:
         return x
 
     cp_rank, cp_size = get_cp_rank_size()
-    return x.tensor_split(cp_size, dim=dim)[cp_rank]
+    return x.tensor_split(cp_size, dim=dim)[cp_rank] # type: ignore
 
 
 def set_cp_group(cp_group, ranks, global_rank):
@@ -98,4 +98,4 @@ def cfg_local_shard(x: torch.Tensor, dim: int = 2) -> torch.Tensor:
         return x
 
     cfg_rank, cfg_size = get_cfg_rank_size()
-    return x.tensor_split(cfg_size, dim=dim)[cfg_rank]
+    return x.tensor_split(cfg_size, dim=dim)[cfg_rank] # type: ignore

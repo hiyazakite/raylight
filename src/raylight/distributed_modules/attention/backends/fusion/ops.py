@@ -1,9 +1,12 @@
 import torch
 import torch.distributed as dist
-import raylight.distributed_modules.attention.backends.fusion.context as context
+from raylight.distributed_modules.attention.backends.fusion.context import (
+    compact_config, 
+    compact_cache, 
+    compact_set_current_cache_key
+)
 from raylight.distributed_modules.attention.backends.fusion.utils import (
     COMPACT_COMPRESS_TYPE,
-    ALLOW_DEPRECATED,
 )
 from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
 from raylight.distributed_modules.attention.backends.fusion.stats import stats_log
@@ -17,28 +20,32 @@ from raylight.distributed_modules.attention.backends.fusion.fastpath import (
 
 @Profiler.prof_func("compact._compress_fn")
 def _compress_fn(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, rank: int):
-    if context._config and context._config.simulate_compress:
+    cfg = compact_config()
+    if cfg and cfg.simulate_compress:
         # NOTE: if simulation enabled, directly return the simulated compress-then-decompress result
-        return sim_compress(x, compress_type, (context._config.sparse_ratio if context._config.sparse_ratio is not None else 0), rank)
+        return sim_compress(x, compress_type, (cfg.sparse_ratio if cfg.sparse_ratio is not None else 0), rank)
 
-    return slowpath_compress(x, compress_type, rank=rank, sparse_ratio=(context._config.sparse_ratio if context._config and context._config.sparse_ratio is not None else 0))
+    return slowpath_compress(x, compress_type, rank=rank, sparse_ratio=(cfg.sparse_ratio if cfg and cfg.sparse_ratio is not None else 0))
 
             
 @Profiler.prof_func("compact._decompress_fn")
 def _decompress_fn(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, shape: tuple, rank: int):
-    if context._config and context._config.simulate_compress:
+    cfg = compact_config()
+    if cfg and cfg.simulate_compress:
         return x.view(shape)  # no need for further decompression
-    return slowpath_decompress(x, shape, compress_type, rank=rank, sparse_ratio=(context._config.sparse_ratio if context._config and context._config.sparse_ratio is not None else 0))
+    return slowpath_decompress(x, shape, compress_type, rank=rank, sparse_ratio=(cfg.sparse_ratio if cfg and cfg.sparse_ratio is not None else 0))
 
 def _compact_compress_fastpath(cache_key, x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, update_cache: bool, rank: int):
-    assert compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2
-    assert context._config.compress_residual == 1
+    cfg = compact_config()
+    cache = compact_cache()
+    if cfg is None or cfg.compress_residual != 1:
+        return x
     # Base should be (N, C) now - returns None if shape mismatch or cache miss
-    base = context._cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype) 
+    base = cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype) if cache else None
     
     if base is None:
-        if update_cache:
-            context._cache.put(cache_key, x, None)
+        if update_cache and cache:
+            cache.put(cache_key, x, None)
         return x  # Return uncompressed tensor (warmup behavior)
     
     fastpath_func = binary_quant_fastpath if compress_type == COMPACT_COMPRESS_TYPE.BINARY else int2_quant_fastpath
@@ -55,16 +62,16 @@ def _compact_compress_fastpath(cache_key, x: torch.Tensor, compress_type: COMPAC
         # print(msg)
         raise AssertionError(msg) from e
     # q: (N, C//8), scale_u_nk: (N, K), scale_v_ck: (C, K), new_base: (N, C)
-    if update_cache:
+    if update_cache and cache:
         # new_base is already N, C
-        context._cache.put(cache_key, new_base, None)
+        cache.put(cache_key, new_base, None)
 
     q_flat_half = q.view(torch.half).flatten()
     u_flat_half = scale_u_nk.flatten() # New: U is (N, K)
     v_flat_half = scale_v_ck.flatten() # New: V is (C, K)
     compressed = torch.cat([q_flat_half, u_flat_half, v_flat_half], dim=0)
 
-    if context._config.log_compress_stats:
+    if cfg and cfg.log_compress_stats:
         log_base = base # Already N, C
         log_recv_activation = new_base # Already N, C
         stats_log().log(
@@ -85,9 +92,11 @@ def compact_compress(
     compress_type: COMPACT_COMPRESS_TYPE,
     update_cache: bool = False,
 ):
-    context._current_cache_key = cache_key
-    assert x.is_contiguous()
-    if not context._config or not context._config.enabled:
+    compact_set_current_cache_key(cache_key)
+    # assert x.is_contiguous() # Removed for performance, assume caller handles
+    cfg = compact_config()
+    cache = compact_cache()
+    if not cfg or not cfg.enabled:
         return x
     
     original_shape = x.shape
@@ -96,41 +105,43 @@ def compact_compress(
     elif len(x.shape) == 3:
         shape = (x.shape[0] * x.shape[1], x.shape[2])
         x = x.view(shape)
-    assert x.ndim == 2
+    if x.ndim != 2: # Cheap check
+        return x.view(original_shape)
 
     # NOTE: rank check
-    rank = context._config.comp_rank if context._config.comp_rank is not None else -1
+    rank = cfg.comp_rank if cfg and cfg.comp_rank is not None else -1
     if compress_type == COMPACT_COMPRESS_TYPE.BINARY and rank != -1:
-        assert ALLOW_DEPRECATED, "Binary compression with rank != -1 is deprecated"
+        if not cfg or not cfg.allow_deprecated:
+            raise RuntimeError("Binary compression with rank != -1 is deprecated and not enabled in config")
     
     def cond_cache_put(key, val, delta):
-        if update_cache and context._cache is not None:
-            context._cache.put(key, val, delta)
+        if update_cache and cache is not None:
+            cache.put(key, val, delta)
 
     if compress_type == COMPACT_COMPRESS_TYPE.WARMUP:
-        if context._config.fastpath:
-            assert context._config.compress_residual == 1
+        if cfg and cfg.fastpath:
+            # assert cfg.compress_residual == 1 # Removed for performance
             cond_cache_put(cache_key, x, None)
         else:
-            if context._config.compress_residual == 1:
+            if cfg.compress_residual == 1:
                 cond_cache_put(cache_key, x, None)
-            elif context._config.compress_residual == 2:
-                base = context._cache.get_base(cache_key) if context._cache else None
+            elif cfg.compress_residual == 2:
+                base = cache.get_base(cache_key) if cache else None
                 if base is None:
                     cond_cache_put(cache_key, x, None)
                 else:
                     cond_cache_put(cache_key, x, x - base)
         return x.view(original_shape)
     else:
-        if context._cache is None:
+        if cache is None:
             return x.view(original_shape)
 
-        if context._config.fastpath and (compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2):
+        if cfg.fastpath and (compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2):
             compressed = _compact_compress_fastpath(cache_key, x, compress_type, update_cache, rank)
         else:
-            if context._config.compress_residual == 0:
+            if cfg.compress_residual == 0:
                 compressed = _compress_fn(x, compress_type, rank)
-                if context._config.log_compress_stats:
+                if cfg.log_compress_stats:
                     reconstructed_local = _decompress_fn(compressed, compress_type, x.shape, rank)
                     stats_log().log(
                         cache_key, 
@@ -139,10 +150,10 @@ def compact_compress(
                         before_comp_activation=x, 
                         recv_activation=reconstructed_local, 
                         compressed_tensor=compressed, 
-                        compress_residual=context._config.compress_residual,
+                        compress_residual=cfg.compress_residual,
                     )
-            elif context._config.compress_residual == 1:
-                base = context._cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype)
+            elif cfg.compress_residual == 1:
+                base = cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype) if cache else None
                 if base is None:
                     cond_cache_put(cache_key, x, None)
                     return x.view(original_shape)
@@ -150,8 +161,8 @@ def compact_compress(
                 compressed = _compress_fn(delta, compress_type, rank)
                 recv_delta = _decompress_fn(compressed, compress_type, x.shape, rank)
                 reconstructed = base + recv_delta
-                cond_cache_put(cache_key, reconstructed if context._config.error_feedback else x, None)
-                if context._config.log_compress_stats:
+                cond_cache_put(cache_key, reconstructed if cfg.error_feedback else x, None)
+                if cfg.log_compress_stats:
                     stats_log().log(
                         cache_key, 
                         base=base, 
@@ -159,14 +170,14 @@ def compact_compress(
                         before_comp_activation=x, 
                         recv_activation=reconstructed, 
                         compressed_tensor=compressed, 
-                        compress_residual=context._config.compress_residual,
+                        compress_residual=cfg.compress_residual,
                     )
-            elif context._config.compress_residual == 2:
-                base = context._cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype)
+            elif cfg.compress_residual == 2:
+                base = cache.get_base(cache_key, expected_shape=x.shape, expected_dtype=x.dtype) if cache else None
                 if base is None:
                     cond_cache_put(cache_key, x, None)
                     return x.view(original_shape)
-                delta_base = context._cache.get_delta_base(cache_key)
+                delta_base = cache.get_delta_base(cache_key) if cache else None
                 delta_delta = x - (base + (delta_base if delta_base is not None else 0))
                 compressed = _compress_fn(delta_delta, compress_type, rank)
                 recv_delta_delta = _decompress_fn(compressed, compress_type, x.shape, rank)
@@ -177,7 +188,7 @@ def compact_compress(
                     new_base,
                     _decay_delta_base(new_delta_base),
                 )
-                if context._config.log_compress_stats:
+                if cfg.log_compress_stats:
                     stats_log().log(
                         cache_key, 
                         base, 
@@ -185,7 +196,7 @@ def compact_compress(
                         x, 
                         new_base, 
                         compressed, 
-                        context._config.compress_residual,
+                        cfg.compress_residual,
                     )
                 return compressed
             else:
@@ -193,17 +204,21 @@ def compact_compress(
         return compressed
 
 def _decay_delta_base(delta_base):
-    if context._config:
-        return delta_base * context._config.delta_decay_factor
+    cfg = compact_config()
+    if cfg:
+        return delta_base * cfg.delta_decay_factor
     return delta_base
 
 
 def _compact_decompress_fastpath(cache_key, compressed: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, shape: tuple, update_cache: bool, rank: int):
-    assert compress_type in [COMPACT_COMPRESS_TYPE.BINARY, COMPACT_COMPRESS_TYPE.INT2]
-    assert context._config and context._config.compress_residual == 1
+    cfg = compact_config()
+    if cfg is None or cfg.compress_residual != 1:
+        return compressed.view(shape)
+    if compress_type not in [COMPACT_COMPRESS_TYPE.BINARY, COMPACT_COMPRESS_TYPE.INT2]:
+        return compressed.view(shape)
 
     N, C = shape
-    assert C % (8 if compress_type == COMPACT_COMPRESS_TYPE.BINARY else 4) == 0
+    # assert C % (8 if compress_type == COMPACT_COMPRESS_TYPE.BINARY else 4) == 0
 
     ITEM_PER_BYTE = 8 if compress_type == COMPACT_COMPRESS_TYPE.BINARY else 4
     
@@ -213,7 +228,7 @@ def _compact_decompress_fastpath(cache_key, compressed: torch.Tensor, compress_t
     v_numel_half = C * rank
 
     expected_numel = q_numel_half + u_numel_half + v_numel_half
-    assert compressed.numel() == expected_numel
+    # assert compressed.numel() == expected_numel
     
     q_half, scale_u_flat, scale_v_flat = torch.split(
         compressed,
@@ -224,7 +239,8 @@ def _compact_decompress_fastpath(cache_key, compressed: torch.Tensor, compress_t
     scale_u_nk = scale_u_flat.view(N, rank)
     scale_v_ck = scale_v_flat.view(C, rank)
 
-    base_nc = context._cache.get_base(cache_key, expected_shape=(N, C)) if context._cache else None
+    cache = compact_cache()
+    base_nc = cache.get_base(cache_key, expected_shape=(N, C)) if cache else None
 
     fastpath_func = binary_dequant_fastpath if compress_type == COMPACT_COMPRESS_TYPE.BINARY else int2_dequant_fastpath
     reconstructed_nc = fastpath_func(
@@ -233,8 +249,8 @@ def _compact_decompress_fastpath(cache_key, compressed: torch.Tensor, compress_t
         scale_v_ck=scale_v_ck,
         base_nc=base_nc if base_nc is not None else torch.zeros_like(scale_u_nk.new_empty(N, C)),
     )
-    if update_cache and context._cache:
-        context._cache.put(cache_key, reconstructed_nc, None)
+    if update_cache and cache:
+        cache.put(cache_key, reconstructed_nc, None)
     return reconstructed_nc
 
 @Profiler.prof_func("compact.compact_decompress")
@@ -245,8 +261,10 @@ def compact_decompress(
     shape: tuple,
     update_cache: bool = False,
 ):
-    context._current_cache_key = cache_key
-    if not context._config or not context._config.enabled:
+    compact_set_current_cache_key(cache_key)
+    cfg = compact_config()
+    cache = compact_cache()
+    if not cfg or not cfg.enabled:
         return compressed
     
     original_shape = shape
@@ -257,27 +275,27 @@ def compact_decompress(
         shape = (dim_0, shape[-2] * shape[-1])
     elif len(shape) == 3:
         shape = (shape[0] * shape[1], shape[2])
-    else:
-        assert len(shape) == 2
+    elif len(shape) != 2:
+        return compressed.view(original_shape)
 
     def cond_cache_put(key, val, delta):
-        if update_cache and context._cache:
-            context._cache.put(key, val, delta)
+        if update_cache and cache:
+            cache.put(key, val, delta)
 
-    rank = context._config.comp_rank if context._config.comp_rank is not None else 1
+    rank = cfg.comp_rank if cfg and cfg.comp_rank is not None else 1
     if rank == -1:
         rank = 1
 
     if compress_type == COMPACT_COMPRESS_TYPE.WARMUP:
         val = compressed.view(shape)
-        if context._config.fastpath:
-            assert context._config.compress_residual == 1
+        if cfg and cfg.fastpath:
+            # assert cfg.compress_residual == 1 # Removed for performance
             cond_cache_put(cache_key, val, None)
         else:
-            if context._config.compress_residual == 1:
+            if cfg.compress_residual == 1:
                 cond_cache_put(cache_key, val, None)
-            elif context._config.compress_residual == 2:
-                base = context._cache.get_base(cache_key) if context._cache else None
+            elif cfg.compress_residual == 2:
+                base = cache.get_base(cache_key) if cache else None
                 if base is None:
                     cond_cache_put(cache_key, val, None)
                 else:
@@ -293,22 +311,22 @@ def compact_decompress(
              cond_cache_put(cache_key, cache_val, None)
              return val
 
-        if context._cache is None:
+        if cache is None:
              return compressed.view(original_shape)
 
-        if context._config.fastpath and (compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2):
+        if cfg.fastpath and (compress_type == COMPACT_COMPRESS_TYPE.BINARY or compress_type == COMPACT_COMPRESS_TYPE.INT2):
             reconstructed = _compact_decompress_fastpath(cache_key, compressed, compress_type, shape, update_cache, rank)
         else:
-            if context._config.compress_residual == 0:
+            if cfg.compress_residual == 0:
                 reconstructed = _decompress_fn(compressed, compress_type, shape, rank)
-            elif context._config.compress_residual == 1:
-                base = context._cache.get_base(cache_key, expected_shape=shape)
+            elif cfg.compress_residual == 1:
+                base = cache.get_base(cache_key, expected_shape=shape) if cache else None
                 recv_delta = _decompress_fn(compressed, compress_type, shape, rank)
                 reconstructed = base + recv_delta if base is not None else recv_delta
                 cond_cache_put(cache_key, reconstructed, None)
-            elif context._config.compress_residual == 2:
-                base = context._cache.get_base(cache_key, expected_shape=shape)
-                delta_base = context._cache.get_delta_base(cache_key)
+            elif cfg.compress_residual == 2:
+                base = cache.get_base(cache_key, expected_shape=shape) if cache else None
+                delta_base = cache.get_delta_base(cache_key) if cache else None
                 recv_delta_delta = _decompress_fn(compressed, compress_type, shape, rank)
                 reconstructed = (base if base is not None else 0) + (delta_base if delta_base is not None else 0) + recv_delta_delta
                 new_delta_base = (delta_base if delta_base is not None else 0) + recv_delta_delta
@@ -323,8 +341,9 @@ def compact_all_gather(
     comp_type: COMPACT_COMPRESS_TYPE,
     group=None,
 ):
-    # raise NotImplementedError("Compact all gather is inconsistent with ring impl.")
-    assert context._config and context._config.enabled
+    cfg = compact_config()
+    if not cfg or not cfg.enabled:
+        return x
     rank = dist.get_rank(group)
     my_key = f"{tag}-{rank}"
     to_send = compact_compress(

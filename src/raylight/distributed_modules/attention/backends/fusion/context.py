@@ -1,11 +1,12 @@
+from typing import Optional
 from raylight.distributed_modules.attention.backends.fusion.utils import CompactConfig, CompactCache
 from raylight.distributed_modules.attention.backends.fusion.patchpara.df_cache import AllGatherCache
 
-_config: CompactConfig = None
-_cache: CompactCache = None
-_step: int = None
-_allgather_cache: AllGatherCache = None
-_current_cache_key: str = None
+_config: Optional[CompactConfig] = None
+_cache: Optional[CompactCache] = None
+_step: Optional[int] = None
+_allgather_cache: Optional[AllGatherCache] = None
+_current_cache_key: Optional[str] = None
 
 def compact_config():
     global _config
@@ -30,3 +31,7 @@ def allgather_cache():
 def compact_get_current_cache_key():
     global _current_cache_key
     return _current_cache_key
+
+def compact_set_current_cache_key(key):
+    global _current_cache_key
+    _current_cache_key = key

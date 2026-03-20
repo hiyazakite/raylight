@@ -1,46 +1,60 @@
 import torch
 import logging
-from dataclasses import replace
+from dataclasses import replace, dataclass
+from typing import Any, Tuple, List, Dict, Optional, Union, cast, Callable, TypeVar, Iterable
+
+T = TypeVar("T")
 
 try:
-    from comfy_kitchen.tensor.base import (
-        QuantizedTensor,
+    from comfy_kitchen.tensor.base import ( # type: ignore
+        QuantizedTensor, # type: ignore
         register_layout_op,
         _LAYOUT_DISPATCH_TABLE
     )
-    from comfy_kitchen.tensor.fp8 import TensorCoreFP8Layout
+    from comfy_kitchen.tensor.fp8 import TensorCoreFP8Layout # type: ignore
 except ImportError:
     # Dummy classes for static analysis and runtime safety when library is missing
+    @dataclass
+    class _ParamsDummy:
+        scale: Any = None
+        orig_dtype: Any = None
+        orig_shape: Optional[Tuple[int, ...]] = None
+
     class QuantizedTensor: 
-        class _params:
-            scale = None
-            orig_dtype = None
-        _qdata = None
-        _layout_cls = None
+        def __init__(self, qdata: Any, layout_cls: Any, params: Any):
+            self._qdata = qdata
+            self._layout_cls = layout_cls
+            self._params = params
+        _qdata: Any = None
+        _params: _ParamsDummy = _ParamsDummy()
+        _layout_cls: Any = None
 
     class TensorCoreFP8Layout:
+        @dataclass
         class Params:
-            def __init__(self, scale, orig_dtype, orig_shape):
-                self.scale = scale
-                self.orig_dtype = orig_dtype
-                self.orig_shape = orig_shape
+            scale: Any
+            orig_dtype: Any
+            orig_shape: Tuple[int, ...]
     
-    def register_layout_op(*args):
-        def decorator(f): return f
+    def register_layout_op(*args: Any, **kwargs: Any) -> Callable[[T], T]:
+        def decorator(f: T) -> T: return f
         return decorator
         
-    _LAYOUT_DISPATCH_TABLE = {}
+    _LAYOUT_DISPATCH_TABLE: Dict[Any, Any] = {}
 
 logger = logging.getLogger(__name__)
 
-def _wrap_fp8_tensor(qtensor, qdata):
+def _wrap_fp8_tensor(qtensor: Any, qdata: torch.Tensor) -> Any:
     # Helper to wrap a new qdata with same params as original qtensor
+    if not hasattr(qtensor, "_params") or qtensor._params is None:
+        raise ValueError("qtensor must have _params")
+        
     new_params = TensorCoreFP8Layout.Params(
         scale=qtensor._params.scale,
         orig_dtype=qtensor._params.orig_dtype,
         orig_shape=tuple(qdata.shape),
     )
-    return QuantizedTensor(qdata, qtensor._layout_cls, new_params)
+    return QuantizedTensor(qdata, getattr(qtensor, "_layout_cls", None), new_params)
 
 # ==================== Distributed Operations ====================
 
@@ -66,15 +80,18 @@ def _handle_all_gather(qt, args, kwargs):
 
     assert input_tensor is not None, "all_gather handler called without QuantizedTensor input"
 
-    qdata = input_tensor._qdata
-    layout_cls = input_tensor._layout_cls
-    params = input_tensor._params
+    qdata = cast(torch.Tensor, input_tensor._qdata)
+    layout_cls = getattr(input_tensor, "_layout_cls", None)
+    params = getattr(input_tensor, "_params", None)
+
+    if qdata is None or params is None:
+        raise ValueError("QuantizedTensor must have _qdata and _params")
 
     # View as uint8 (bytes) for transport
     qdata_bytes = qdata.contiguous().view(torch.uint8)
 
     new_args = list(args)
-    new_args[input_idx] = qdata_bytes
+    new_args[input_idx] = qdata_bytes # type: ignore
 
     # Call underlying c10d op with bytes
     gathered_bytes = torch.ops._c10d_functional.all_gather_into_tensor.default(
@@ -87,38 +104,50 @@ def _handle_all_gather(qt, args, kwargs):
     return QuantizedTensor(gathered_qdata, layout_cls, gathered_params)
 
 
-def _handle_wait_tensor(qt, args, kwargs):
+def _handle_wait_tensor(qt: Any, args: Any, kwargs: Any) -> Any:
     qtensor = args[0]
+    if not isinstance(qtensor, QuantizedTensor):
+        return torch.ops._c10d_functional.wait_tensor.default(*args, **kwargs)
     
+    qdata = cast(torch.Tensor, qtensor._qdata)
+    params = getattr(qtensor, "_params", None)
+    if qdata is None or params is None:
+        raise ValueError("QuantizedTensor must have _qdata and _params")
+
     # Wait on the underlying bytes
     waited_bytes = torch.ops._c10d_functional.wait_tensor.default(
-        qtensor._qdata.view(torch.uint8),
+        qdata.view(torch.uint8),
         *args[1:],
         **kwargs,
     )
 
-    waited_qdata = waited_bytes.view(qtensor._qdata.dtype)
-    waited_params = replace(qtensor._params, orig_shape=tuple(waited_qdata.shape))
-    return QuantizedTensor(waited_qdata, qtensor._layout_cls, waited_params)
+    waited_qdata = waited_bytes.view(qdata.dtype)
+    waited_params = replace(params, orig_shape=tuple(waited_qdata.shape))
+    return QuantizedTensor(waited_qdata, getattr(qtensor, "_layout_cls", None), waited_params)
 
 
-def _handle_broadcast(qt, args, kwargs):
+def _handle_broadcast(qt: Any, args: Any, kwargs: Any) -> Any:
     # args[0] is typically a list of tensors for broadcast
     tensor_list = args[0]
+    if not isinstance(tensor_list, (list, tuple)):
+        return torch.ops.c10d.broadcast_.default(*args, **kwargs)
 
-    input_tensor = None
-    input_idx = None
+    input_tensor: Optional[Any] = None
+    input_idx: Optional[int] = None
     for idx, t in enumerate(tensor_list):
         if isinstance(t, QuantizedTensor):
             input_tensor = t
             input_idx = idx
             break
 
-    if input_tensor is None:
+    if input_tensor is None or input_idx is None:
         return torch.ops.c10d.broadcast_.default(*args, **kwargs)
 
-    qdata = input_tensor._qdata.contiguous()
-    qdata_bytes = qdata.view(torch.uint8)
+    qdata = cast(torch.Tensor, input_tensor._qdata)
+    if qdata is None:
+        return torch.ops.c10d.broadcast_.default(*args, **kwargs)
+        
+    qdata_bytes = qdata.contiguous().view(torch.uint8)
 
     new_tensor_list = list(tensor_list)
     new_tensor_list[input_idx] = qdata_bytes
@@ -137,6 +166,10 @@ def _handle_broadcast(qt, args, kwargs):
         tensor_list_out = broadcasted
         work = None
 
+    if not isinstance(tensor_list_out, (list, tuple)):
+         # Handle case where broadcast_ might return something else unexpectedly
+         return broadcasted
+
     broadcasted_qdata = tensor_list_out[input_idx].view(qdata.dtype)
 
     new_out_list = list(tensor_list_out)
@@ -151,27 +184,33 @@ def _handle_broadcast(qt, args, kwargs):
         return new_out_list
 
 
-def _handle_scatter(qt, args, kwargs):
+def _handle_scatter(qt: Any, args: Any, kwargs: Any) -> Any:
     output_tensors = args[0]
     input_tensors = args[1]
 
-    quantized_outputs = []
+    quantized_outputs: List[Tuple[int, Any]] = []
     new_output_tensors = list(output_tensors)
     for idx, tensor in enumerate(output_tensors):
         if isinstance(tensor, QuantizedTensor):
             quantized_outputs.append((idx, tensor))
-            new_output_tensors[idx] = tensor._qdata.contiguous().view(torch.uint8)
+            qdata = cast(torch.Tensor, tensor._qdata)
+            if qdata is not None:
+                new_output_tensors[idx] = qdata.contiguous().view(torch.uint8)
 
     has_quantized_input = False
     new_input_tensors = []
 
-    def process_input_list(entry):
+    def process_input_list(entry: Iterable[Any]) -> List[Any]:
         nonlocal has_quantized_input
         processed = []
         for t in entry:
             if isinstance(t, QuantizedTensor):
                 has_quantized_input = True
-                processed.append(t._qdata.contiguous().view(torch.uint8))
+                qdata = cast(torch.Tensor, t._qdata)
+                if qdata is not None:
+                    processed.append(qdata.contiguous().view(torch.uint8))
+                else:
+                    processed.append(t)
             else:
                 processed.append(t)
         return processed
@@ -194,14 +233,19 @@ def _handle_scatter(qt, args, kwargs):
         output_list = result
         work = None
 
-    output_list = list(output_list)
+    if not isinstance(output_list, (list, tuple)):
+        return result
+
+    output_list_mutable = list(output_list)
     for idx, original in quantized_outputs:
-        qdata = output_list[idx].view(original._qdata.dtype)
-        output_list[idx] = _wrap_fp8_tensor(original, qdata)
+        original_qdata = cast(torch.Tensor, original._qdata)
+        if original_qdata is not None:
+            qdata = output_list_mutable[idx].view(original_qdata.dtype)
+            output_list_mutable[idx] = _wrap_fp8_tensor(original, qdata)
 
     if work is not None:
-        return output_list, work
-    return output_list
+        return output_list_mutable, work
+    return output_list_mutable
 
 
 # ==================== Aten Operations for Sharding ====================
@@ -270,21 +314,25 @@ def _handle_fp8_cat(qt, args, kwargs):
 
 
 def _make_fp8_shape_handler(aten_op):
-    def handler(qt, args, kwargs):
+    def handler(qt: Any, args: Any, kwargs: Any) -> Any:
         input_tensor = args[0]
         if not isinstance(input_tensor, QuantizedTensor):
             return aten_op(*args, **kwargs)
 
         # Apply aten op to quantized data
         # Note: args[1:] contains the shape args
-        new_qdata = aten_op(input_tensor._qdata, *args[1:], **kwargs)
+        qdata = cast(torch.Tensor, input_tensor._qdata)
+        if qdata is None:
+            return aten_op(*args, **kwargs)
+
+        new_qdata = aten_op(qdata, *args[1:], **kwargs)
 
         new_params = TensorCoreFP8Layout.Params(
             scale=input_tensor._params.scale,
             orig_dtype=input_tensor._params.orig_dtype,
             orig_shape=tuple(new_qdata.shape),
         )
-        return QuantizedTensor(new_qdata, "TensorCoreFP8Layout", new_params)
+        return QuantizedTensor(new_qdata, getattr(input_tensor, "_layout_cls", None), new_params)
     return handler
 
 

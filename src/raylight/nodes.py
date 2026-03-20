@@ -2,7 +2,7 @@ import raylight
 import os
 import gc
 import math
-from typing import Any
+from typing import Any, cast
 from pathlib import Path
 from copy import deepcopy
 
@@ -24,6 +24,17 @@ from .distributed_worker.ray_worker import (
 )
 from .comfy_dist.utils import cancellable_get, clear_ray_cluster, get_ray_cluster_epoch
 from raylight.utils.memory import monitor_memory
+from .config import (
+    RaylightConfig, 
+    ExecutionStrategy, 
+    CompactConfig, 
+    ClusterConfig, 
+    DeviceConfig, 
+    DebugConfig, 
+    SystemConfig, 
+    RaylightAttnType, 
+    CompactCompressType
+)
 
 
 try:
@@ -396,94 +407,94 @@ class RayInitializer:
             # THIS IS PYTORCH DIST ADDRESS
             # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
             # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
-            if torch_dist_address != "None":
-                torch_host, torch_port = torch_dist_address.rsplit(":", 1)
-                os.environ.setdefault("MASTER_ADDR", torch_host)
-                os.environ.setdefault("MASTER_PORT", torch_port)
-            else:
-                torch_host, torch_port = "127.0.0.1", "29500"
-                os.environ.setdefault("MASTER_ADDR", torch_host)
-                os.environ.setdefault("MASTER_PORT", torch_port)
+            # Map string inputs to Enums
+            # [SENIOR REFACTOR] Parse distributed sync addresses
+            master_addr, master_port = "127.0.0.1", "29500"
+            if torch_dist_address and ":" in torch_dist_address:
+                master_addr, master_port = torch_dist_address.split(":", 1)
+            
+            dashboard_host, dashboard_port = "127.0.0.1", None
+            if ray_dashboard_address != "None" and ":" in ray_dashboard_address:
+                try:
+                    _host, _port = ray_dashboard_address.rsplit(":", 1)
+                    dashboard_host = _host
+                    dashboard_port = int(_port)
+                except ValueError:
+                    pass
 
-            # HF Tokenizer warning when forking
-            os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            self.parallel_dict: dict[str, Any] = dict()
-            _monkey()
+            # Map string inputs to Enums
+            try:
+                attn_type_enum = RaylightAttnType[XFuser_attention]
+            except KeyError:
+                attn_type_enum = RaylightAttnType.TORCH
+                
+            try:
+                comp_type_enum = CompactCompressType(delta_compression)
+            except ValueError:
+                comp_type_enum = CompactCompressType.BINARY
 
-            world_size = GPU
-            max_world_size = torch.cuda.device_count()
-            if world_size > max_world_size:
-                raise ValueError("Too many gpus")
-            if world_size == 0:
-                raise ValueError("Num of cuda/cudalike device is 0")
-            if world_size < ulysses_degree * ring_degree * cfg_degree:
-                raise ValueError(
-                    f"ERROR, num_gpus: {world_size}, is lower than {ulysses_degree=} x {ring_degree=} x {cfg_degree=}"
+            # [SENIOR REFACTOR] Initialize the Unified Configuration Engine
+            config = RaylightConfig(
+                strategy=ExecutionStrategy(
+                    ulysses_degree=ulysses_degree,
+                    ring_degree=ring_degree,
+                    cfg_degree=cfg_degree,
+                    sync_ulysses=sync_ulysses,
+                    fsdp_enabled=FSDP,
+                    fsdp_cpu_offload=FSDP_CPU_OFFLOAD,
+                    attention_backend=attention_backend,
+                    attention_type=attn_type_enum,
+                    ring_impl=ring_impl_type,
+                ),
+                compact=CompactConfig(
+                    enabled=delta_compression != "IDENTITY",
+                    warmup_steps=compact_warmup_steps,
+                    delta_compression=comp_type_enum,
+                    kv_cache_quant_enable=kv_cache_quant_enable,
+                    kv_cache_quant_bits=kv_cache_quant_bits,
+                ),
+                cluster=ClusterConfig(
+                    address=ray_cluster_address,
+                    namespace=ray_cluster_namespace,
+                    object_store_gb=ray_object_store_gb,
+                    dashboard_host=dashboard_host,
+                    dashboard_port=dashboard_port,
+                ),
+                device=DeviceConfig(
+                    world_size=GPU,
+                    gpu_indices=[int(x.strip()) for x in gpu_indices.split(",") if x.strip()],
+                    vram_limit_gb=vram_limit_gb,
+                    use_mmap=use_mmap,
+                    mmap_cache_size=mmap_cache_size,
+                ),
+                debug=DebugConfig(
+                    skip_comm_test=skip_comm_test,
+                    enable_kitchen=use_kitchen,
+                ),
+                system=SystemConfig(
+                    master_addr=master_addr,
+                    master_port=master_port,
                 )
+            )
+
+            world_size = config.device.world_size
+
+            # Use legacy dict for backward compatibility with downstream Samplers/Loaders
+            self.parallel_dict = config.to_legacy_dict()
+            
+            # The config.__post_init__ handles validation for ulysses * ring * cfg vs world_size
             if cfg_degree > 2:
-                raise ValueError(
-                    "CFG batch only can be divided into 2 degree of parallelism, since its dimension is only 2"
-                )
+                raise ValueError("CFG batch only can be divided into 2 degree of parallelism")
 
-            self.parallel_dict["is_xdit"] = False
-            self.parallel_dict["is_fsdp"] = False
-            self.parallel_dict["sync_ulysses"] = False
-            self.parallel_dict["global_world_size"] = world_size
+            _monkey()
             
-            # Mmap settings for zero-copy loading
-            self.parallel_dict["use_mmap"] = use_mmap
-            self.parallel_dict["mmap_cache_size"] = mmap_cache_size
+            # [SENIOR REFACTOR] Apply system-level environment settings via Unified Config
+            config.apply_to_env()
 
-            if (
-                ulysses_degree > 0
-                or ring_degree > 0
-                or cfg_degree > 0
-            ):
-                if ulysses_degree * ring_degree * cfg_degree == 0:
-                    raise ValueError(f"""ERROR, parallel product of {ulysses_degree=} x {ring_degree=} x {cfg_degree=} is 0.
-                     Please make sure to set any parallel degree to be greater than 0,
-                     or switch into DPKSampler and set 0 to all parallel degree""")
-                self.parallel_dict["attention"] = XFuser_attention
-                self.parallel_dict["is_xdit"] = True
-                self.parallel_dict["ulysses_degree"] = ulysses_degree
-                self.parallel_dict["ring_degree"] = ring_degree
-                self.parallel_dict["cfg_degree"] = cfg_degree
-                self.parallel_dict["cfg_degree"] = cfg_degree
-                self.parallel_dict["sync_ulysses"] = sync_ulysses
-                self.parallel_dict["attention_backend"] = attention_backend
-                self.parallel_dict["ring_impl_type"] = ring_impl_type
-
-            self.parallel_dict["use_kitchen"] = use_kitchen
-            
-            # KV Cache Quantization
-            self.parallel_dict["kv_cache_quant_enable"] = kv_cache_quant_enable
-            self.parallel_dict["kv_cache_quant_bits"] = kv_cache_quant_bits
-            self.parallel_dict["delta_compression"] = delta_compression
-            self.parallel_dict["compact_warmup_steps"] = compact_warmup_steps
-
-            # VRAM budget limit (0 = auto)
-            if vram_limit_gb > 0:
-                self.parallel_dict["vram_limit_bytes"] = int(vram_limit_gb * (1024 ** 3))
-                print(f"[Raylight] VRAM limit set to {vram_limit_gb:.1f} GB per GPU.")
-
-            if FSDP:
-                self.parallel_dict["fsdp_cpu_offload"] = FSDP_CPU_OFFLOAD
-                self.parallel_dict["is_fsdp"] = True
-
-            if ray_dashboard_address != "None":
-                dashboard_host, dashboard_port = ray_dashboard_address.rsplit(":", 1)
-                dashboard_port = int(dashboard_port)
-                enable_dashboard = True
-            else:
-                dashboard_host, dashboard_port = "127.0.0.1", None
-                enable_dashboard = False
-
-            if ray_object_store_gb <= 0:
-                ray_object_store_memory = None
+            if config.cluster.object_store_gb <= 0:
                 print("[Raylight] object_store_memory set to Auto (Ray default).")
             else:
-                ray_object_store_memory = int(ray_object_store_gb * 1024**3)
-                print(f"[Raylight] object_store_memory set to {ray_object_store_gb} GB.")
+                print(f"[Raylight] object_store_memory set to {config.cluster.object_store_gb} GB.")
 
             runtime_env_base = _RAY_RUNTIME_ENV_LOCAL
             if ray_cluster_address not in _LOCAL_CLUSTER_ADDRESSES:
@@ -523,21 +534,21 @@ class RayInitializer:
                     
                     # Build init kwargs - disable metrics agent for faster startup
                     init_kwargs = {
-                        'namespace': ray_cluster_namespace,
+                        'namespace': config.cluster.namespace,
                         'runtime_env': deepcopy(runtime_env_base),
-                        'include_dashboard': enable_dashboard,
-                        'dashboard_host': dashboard_host,
-                        'dashboard_port': dashboard_port,
+                        'include_dashboard': config.cluster.dashboard_port is not None,
+                        'dashboard_host': config.cluster.dashboard_host,
+                        'dashboard_port': config.cluster.dashboard_port,
                         '_metrics_export_port': None,  # Disable metrics agent to avoid connection retries
                         'configure_logging': False,     # Skip Ray's logging setup
                         'logging_level': 'warning',     # Reduce log processing overhead
                     }
                     
                     # Only set object_store_memory if explicitly configured (not for reused clusters)
-                    if ray_object_store_memory is not None:
-                        init_kwargs['object_store_memory'] = ray_object_store_memory
+                    if config.cluster.object_store_gb > 0:
+                        init_kwargs['object_store_memory'] = int(config.cluster.object_store_gb * 1024**3)
                     
-                    ray.init(ray_cluster_address, **init_kwargs)
+                    ray.init(config.cluster.address, **init_kwargs)
                     print(f"[Raylight] Ray cluster initialized (new instance)")
                 
             except Exception as e:
@@ -561,7 +572,7 @@ class RayInitializer:
             else:
                 print("[Raylight] Skipping NCCL test (skip_comm_test=True)")
             
-            ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
+            ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict, raylight_config=config)
             ray_actors = ray_actor_fn()
             
             # Store GPU indices for later use in samplers (for partial offload matching)
@@ -708,11 +719,13 @@ def _discover_compile_keys(diffusion_model) -> list[str]:
     return keys if keys else ["diffusion_model"]
 
 
-def _check_compile_compatible(unet_name: str, parallel_dict: dict, backend: str = "inductor") -> tuple[bool, str]:
-    """Check if torch.compile is safe for this model + config. Returns (ok, reason)."""
-    # VRAM limit check applies to ALL backends — device transitions break everything
-    if parallel_dict.get("vram_limit_bytes", 0) > 0:
-        return False, "partial VRAM load (vram_limit_gb is set) — streams layers CPU↔GPU dynamically, causing continuous recompilation"
+def _check_compile_compatible(unet_name: str, config: RaylightConfig, backend: str = "inductor") -> tuple[bool, str]:
+    if backend == "disabled":
+        return True, ""
+        
+    if config.device.vram_limit_gb > 0:
+        return False, "torch.compile is incompatible with VRAM limits (LowVram mode)"
+    
     return True, ""
 
 
@@ -773,7 +786,7 @@ class RayUNETLoader:
 
     def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, torch_compile="disabled", torch_compile_dynamic="auto"):
         with monitor_memory("RayUNETLoader.load_ray_unet"):
-            ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
+            ray_actors, gpu_actors, config = ensure_fresh_actors(ray_actors_init)
 
         model_options = {}
         if weight_dtype == "fp8_e4m3fn":
@@ -798,11 +811,8 @@ class RayUNETLoader:
         loaded_futures = []
         patched_futures = []
 
-        # Unified Parallel Loading: All workers load simultaneously (Standard)
-        # OR Sequentially (Kitchen / Low RAM mode)
-        
         # Check for Kitchen FP8 Quantization which is memory intensive (RAM spike during conversion)
-        use_kitchen = parallel_dict.get("use_kitchen", False)
+        use_kitchen = config.debug.enable_kitchen
         
         if use_kitchen:
             # Reverting sequential loading.
@@ -813,7 +823,7 @@ class RayUNETLoader:
 
         # PARALLEL LOADING (Fast)
         # Uses ModelContext with zero-copy mmap for optimal speed
-        print(f"[Raylight] Parallel Load ({'FSDP' if parallel_dict['is_fsdp'] else 'Standard'}): Creating lazy wrappers...")
+        print(f"[Raylight] Parallel Load ({'FSDP' if config.strategy.fsdp_enabled else 'Standard'}): Creating lazy wrappers...")
         for actor in gpu_actors:
             loaded_futures.append(
                 actor.load_unet.remote(unet_path, model_options=model_options)
@@ -827,13 +837,16 @@ class RayUNETLoader:
         # all at once can spike the Ray object store.  Batches of 2 keep
         # wall-clock time ~halved vs fully sequential for 4+ GPUs.
         _PATCH_BATCH = 2
-        if parallel_dict["is_xdit"]:
-            if (parallel_dict["ulysses_degree"]) > 1 or (parallel_dict["ring_degree"] > 1):
+        
+        # Access USP/CFG degrees safely from Strategy
+        strategy = config.strategy
+        if config.meta.total_sp_degree > 1:
+            if strategy.ulysses_degree > 1 or strategy.ring_degree > 1:
                 print(f"[Raylight] Batched USP Patching ({_PATCH_BATCH} workers at a time)...")
                 for i in range(0, len(gpu_actors), _PATCH_BATCH):
                     batch = gpu_actors[i:i + _PATCH_BATCH]
                     cancellable_get([a.patch_usp.remote() for a in batch])
-            if parallel_dict["cfg_degree"] > 1:
+            if strategy.cfg_degree > 1:
                 print(f"[Raylight] Batched CFG Patching ({_PATCH_BATCH} workers at a time)...")
                 for i in range(0, len(gpu_actors), _PATCH_BATCH):
                     batch = gpu_actors[i:i + _PATCH_BATCH]
@@ -841,7 +854,7 @@ class RayUNETLoader:
 
         # Optional torch.compile
         if torch_compile != "disabled":
-            compile_ok, compile_reason = _check_compile_compatible(unet_name, parallel_dict, backend=torch_compile)
+            compile_ok, compile_reason = _check_compile_compatible(unet_name, config, backend=torch_compile)
             if not compile_ok:
                 print(f"[Raylight] WARNING: torch.compile skipped — {compile_reason}")
             else:
@@ -1065,8 +1078,8 @@ class DPKSamplerAdvanced:
 
             gpu_actors = ray_actors["workers"]
 
-            parallel_dict: Any = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
-            if parallel_dict is not None and parallel_dict.get("is_xdit") is True:
+            config = cast(RaylightConfig, cancellable_get(gpu_actors[0].get_raylight_config.remote()))
+            if config is not None and config.meta.total_sp_degree > 1:
                 raise ValueError(
                     """
                 Data Parallel KSampler only supports FSDP or standard Data Parallel (DP).
@@ -1115,7 +1128,7 @@ class DPKSamplerAdvanced:
             if results is None:
                  raise RuntimeError("Raylight: Sampling failed or was cancelled.")
             
-            if parallel_dict is not None and parallel_dict.get("is_xdit"):
+            if config is not None and config.meta.total_sp_degree > 1:
                  return (results[0][0],)
 
             # Standard mode: concat shards

@@ -31,20 +31,13 @@ def get_torch_compiler_disable_decorator():
         return noop
 
     from packaging import version
-
     if not chained_hasattr(torch, "compiler.disable"):
         logging.info("ComfyUI-GGUF: Torch too old for torch.compile - bypassing")
         return dummy_decorator  # torch too old
-    elif version.parse(torch.__version__) >= version.parse("2.8"):
-        logging.info("ComfyUI-GGUF: Allowing full torch compile")
-        return dummy_decorator  # torch compile works
-    if chained_hasattr(torch, "_dynamo.config.nontraceable_tensor_subclasses"):
-        logging.info("ComfyUI-GGUF: Allowing full torch compile (nightly)")
-        return dummy_decorator  # torch compile works, nightly before 2.8 release
     else:
-        logging.info(
-            "ComfyUI-GGUF: Partial torch compile only, consider updating pytorch"
-        )
+        # CRITICAL: Always use torch.compiler.disable for GGUF paths.
+        # Even on newer versions of Torch (2.8+), Dynamo tracing into dequantize/patching
+        # logic can trigger warnings about builtins on custom subclasses (e.g. Tensor.add_).
         return torch.compiler.disable
 
 

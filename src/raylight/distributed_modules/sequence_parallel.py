@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+from typing import Optional
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -8,8 +9,8 @@ from xfuser.core.distributed import (
 
 def extract_local_tensor(
     value: torch.Tensor, 
-    rank: int = None, 
-    world_size: int = None, 
+    rank: Optional[int] = None, 
+    world_size: Optional[int] = None, 
     ring_impl_type: str = "basic",
     dim: int = 1
 ) -> torch.Tensor:
@@ -21,6 +22,10 @@ def extract_local_tensor(
         rank = get_sequence_parallel_rank()
     if world_size is None:
         world_size = get_sequence_parallel_world_size()
+    
+    # Type ignores for Pyright (zero runtime overhead)
+    rank = rank # type: ignore
+    world_size = world_size # type: ignore
 
     if world_size == 1:
         return value

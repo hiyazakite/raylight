@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from raylight.config import RaylightConfig
 
 class AttentionBackend(ABC):
     """
@@ -7,13 +10,12 @@ class AttentionBackend(ABC):
     """
 
     @abstractmethod
-    def create_attention(self, attn_type: str, sync_ulysses: bool, **kwargs) -> Callable:
+    def create_attention(self, raylight_config: 'RaylightConfig', **kwargs) -> Callable:
         """
         Creates and returns the attention function.
         
         Args:
-            attn_type: The type of attention optimization (e.g., 'FLASH_ATTN', 'SAGE_FP8').
-            sync_ulysses: Whether to use synchronous Ulysses parallelism.
+            raylight_config: The unified configuration object.
             **kwargs: Additional backend-specific configuration.
         """
         pass

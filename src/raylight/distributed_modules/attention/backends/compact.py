@@ -1,95 +1,81 @@
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 from yunchang.kernels import AttnType
 from ..interface import AttentionBackend
 from ..layer import RaylightAttention
 from ...sageattention_hf_patch import ensure_hf_fp8_cuda_kernel, ensure_hf_sm90_kernel
 
+if TYPE_CHECKING:
+    from raylight.config import RaylightConfig
+
 # Vendored Compact Modules
-from raylight.distributed_modules.attention.backends.fusion.main import compact_init, CompactConfig, compact_hello
-from raylight.distributed_modules.attention.backends.fusion.utils import COMPACT_COMPRESS_TYPE
+from raylight.distributed_modules.attention.backends.fusion.main import compact_init, compact_hello
+from raylight.distributed_modules.attention.backends.fusion.utils import CompactConfig as FusionCompactConfig, COMPACT_COMPRESS_TYPE
 
 class CompactAttentionBackend(AttentionBackend):
     """
     Attention backend enabling CompactFusion optimization for activation compression.
     """
 
-    def create_attention(self, attn_type: str, sync_ulysses: bool, ring_impl_type: str = "basic", **kwargs) -> Callable:
-        """
-        Creates CompactFusion attention.
+    def create_attention(self, raylight_config: 'RaylightConfig', **kwargs) -> Callable:
+        # [SENIOR REFACTOR] Leverage Unified Config for CompactFusion
+        strat = raylight_config.strategy
+        compact_strat = raylight_config.compact
         
-        Expected kwargs:
-            compact_enabled (bool): Default True
-            compact_fastpath (bool): Default True
-            compact_residual (int): Default 1 (1st order)
-            compact_rank (int): Default -1
-            compact_quantized_cache (bool): Default True
-            compact_cache_quant_bits (int): Default 8
-        """
-        print(f"Using CompactFusion XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}, Impl: {ring_impl_type}")
+        print(f"Using CompactFusion XFuser {strat.attention_type.name} attention, Sync Ulysses: {strat.sync_ulysses}, Impl: {strat.ring_impl}")
         
         # 1. Configuration Lifecycle
-        # Default policy: Warmup for first 5 steps, then configured compression (default BINARY)
-        import os
-        
-        # Priority: env var > kwargs > default (True)
-        env_val = os.environ.get("RAYLIGHT_COMPACT_QUANTIZED_CACHE")
-        if env_val is not None:
-            quantized_cache = (env_val == "1")
-        else:
-            quantized_cache = kwargs.get("compact_quantized_cache", True)
-        
-        # Parse delta compression type
-        delta_compression_str = os.environ.get("RAYLIGHT_DELTA_COMPRESSION", "BINARY").upper()
-        try:
-            delta_compression_type = COMPACT_COMPRESS_TYPE(delta_compression_str.lower())
-        except ValueError:
-            print(f"[Raylight] Warning: Unknown delta compression '{delta_compression_str}', falling back to BINARY")
-            delta_compression_type = COMPACT_COMPRESS_TYPE.BINARY
-            
-        warmup_steps = int(os.environ.get("RAYLIGHT_COMPACT_WARMUP_STEPS", "5"))
-
         def default_compress_func(layer_idx, step):
              if step is None:
                  step = 0
-             if step < warmup_steps:
+             if step < compact_strat.warmup_steps:
                   return COMPACT_COMPRESS_TYPE.WARMUP
-             return delta_compression_type
-        
-        cache_quant_bits = kwargs.get("compact_cache_quant_bits")
-        if cache_quant_bits is None:
-            env_bits = os.environ.get("RAYLIGHT_COMPACT_CACHE_QUANT_BITS")
-            if env_bits is not None:
-                cache_quant_bits = int(env_bits)
+             # Map Raylight enum to backend enum (using name matching)
+             try:
+                 return COMPACT_COMPRESS_TYPE(compact_strat.delta_compression.name.lower())
+             except ValueError:
+                 return COMPACT_COMPRESS_TYPE.BINARY
 
-        config = CompactConfig(
-             enabled=kwargs.get("compact_enabled", True),
+        # Instantiate the vendored CompactConfig from the fusion backend
+        
+        backend_config = FusionCompactConfig(
+             enabled=compact_strat.enabled,
              fastpath=kwargs.get("compact_fastpath", True),
              residual=kwargs.get("compact_residual", 1),
              comp_rank=kwargs.get("compact_rank", -1),
-             quantized_cache=quantized_cache,
-             cache_quant_bits=cache_quant_bits,
+             quantized_cache=compact_strat.kv_cache_quant_enable,
+             cache_quant_bits=compact_strat.kv_cache_quant_bits,
              ef=True, # Error Feedback required for fastpath/residual
-             compress_func=default_compress_func
+             compress_func=default_compress_func,
+             # [NEW] Propriety flags from Unified Config
+             verbose_attn=raylight_config.debug.verbose_attn,
+             overlap_decomp=raylight_config.debug.overlap_decomp,
+             use_awl=raylight_config.debug.use_awl,
+             allow_deprecated=raylight_config.debug.allow_deprecated,
         )
         
-        compact_init(config)
+        compact_init(backend_config)
         compact_hello()
         
         # 2. Kernel Setup
-        attn_enum = AttnType[attn_type]
-        if attn_type == "SAGE_FP8_CUDA":
+        # Map our internal RaylightAttnType to yunchang's AttnType
+        try:
+            attn_enum = AttnType[strat.attention_type.name]
+        except KeyError:
+            attn_enum = AttnType.FA
+            
+        if strat.attention_type.name == "SAGE_FP8_CUDA":
             ensure_hf_fp8_cuda_kernel()
-        elif attn_type == "SAGE_FP8_SM90":
+        elif strat.attention_type.name == "SAGE_FP8_SM90":
             ensure_hf_sm90_kernel()
 
         # 3. Instantiate Centralized Attention Class
-        # This class automatically hooks into the dispatcher
         xfuser_attn = RaylightAttention(
-            use_sync=sync_ulysses,
+            use_sync=strat.sync_ulysses,
             attn_type=attn_enum, 
-            ring_impl_type=ring_impl_type,
+            ring_impl_type=strat.ring_impl,
             use_pack_qkv=False,
-            use_compact_ring=True # Compact backend uses compact ring by default
+            use_compact_ring=True,
+            raylight_config=raylight_config
         )
 
         # 4. Wrapper Function (same signature as Standard)
