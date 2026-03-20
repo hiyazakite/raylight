@@ -1,4 +1,7 @@
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from raylight.config import RaylightConfig
 import torch
 from yunchang.kernels import AttnType
 from ..layer import RaylightAttention
@@ -10,23 +13,33 @@ class StandardAttentionBackend(AttentionBackend):
     The standard xFuser attention implementation.
     """
 
-    def create_attention(self, attn_type: str, sync_ulysses: bool, ring_impl_type: str = "basic", **kwargs) -> Callable:
-        print(f"Using XFuser {attn_type} attention, Sync Ulysses: {sync_ulysses}, Impl: {ring_impl_type}")
+    def create_attention(self, raylight_config: 'RaylightConfig', **kwargs) -> Callable:
+        # [SENIOR REFACTOR] Extract strategies from the Unified Config
+        strat = raylight_config.strategy
+        attn_type_name = strat.attention_type.name
         
-        attn_enum = AttnType[attn_type]
+        print(f"Using XFuser {attn_type_name} attention, Sync Ulysses: {strat.sync_ulysses}, Impl: {strat.ring_impl}")
         
-        if attn_type == "SAGE_FP8_CUDA":
+        # Map our internal RaylightAttnType to yunchang's AttnType
+        # Note: We assume the names match or we have a mapping logic
+        try:
+            attn_enum = AttnType[attn_type_name]
+        except KeyError:
+            attn_enum = AttnType.FA # Default fallback
+        
+        if attn_type_name == "SAGE_FP8_CUDA":
             ensure_hf_fp8_cuda_kernel()
-        elif attn_type == "SAGE_FP8_SM90":
+        elif attn_type_name == "SAGE_FP8_SM90":
             ensure_hf_sm90_kernel()
 
-        # Initialize the underlying Raylight attention class
+        # Initialize the underlying Raylight attention class with the full config
         xfuser_attn = RaylightAttention(
-            use_sync=sync_ulysses, 
+            use_sync=strat.sync_ulysses, 
             attn_type=attn_enum, 
-            ring_impl_type=ring_impl_type,
+            ring_impl_type=strat.ring_impl,
             use_pack_qkv=False, 
-            use_compact_ring=False  # Standard uses xfuser ring or patched flash
+            use_compact_ring=False,
+            raylight_config=raylight_config
         )
 
         def _attention_xfuser_unmask(

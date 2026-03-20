@@ -15,15 +15,12 @@ EIGENVALUES_PLOT_LAYERS = []
 UV_PLOT_STEPS = []
 UV_PLOT_LAYERS = []
 
-# ENV VARS
-CALC_SIMILARITY = os.environ.get("CALC_SIMILARITY", "0") == "1"
-CALC_MORE_SIMILARITY = os.environ.get("CALC_MORE_SIMILARITY", "0") == "1"
-PRINT_ALL_ERROR = os.environ.get("PRINT_ALL_ERROR", "0") == "1"
-
-REF_ACTIVATION_PATH = os.environ.get("REF_ACTIVATION_PATH", "ref_activations")
-DUMP_ACTIVATIONS = os.environ.get("DUMP_ACTIVATIONS", "0") == "1"
-CALC_TOTAL_ERROR = os.environ.get("CALC_TOTAL_ERROR", "0") == "1"
-CALC_ERROR = os.environ.get("CALC_ERROR", "0") == "1"
+def get_stats_config():
+    try:
+        from raylight.distributed_modules.attention.backends.fusion.context import compact_config
+        return compact_config()
+    except (ImportError, AttributeError):
+        return None
 
 def stats_hello():
     pass
@@ -124,9 +121,14 @@ class StatsLogger:
             compress_residual: Residual compression level (0, 1, or 2)
         """
 
-        ref_activation_path = REF_ACTIVATION_PATH
-        dump_activations = DUMP_ACTIVATIONS
-        calc_total_error = CALC_TOTAL_ERROR
+        cfg = get_stats_config()
+        ref_activation_path = cfg.ref_activation_path if cfg else "ref_activations"
+        dump_activations = cfg.dump_activations if cfg else False
+        calc_total_error = cfg.calc_total_error if cfg else False
+        calc_error = cfg.calc_error if cfg else False
+        calc_similarity = cfg.calc_similarity if cfg else False
+        calc_more_similarity = cfg.calc_more_similarity if cfg else False
+        print_all_error = cfg.print_all_error if cfg else False
         
         # Increment step count for this key
         step_count = self.step_counts.get(key, 0)
@@ -148,7 +150,7 @@ class StatsLogger:
 
         # Calculate on-the-fly compression error (Synchronous!)
         error = None
-        if CALC_ERROR:
+        if calc_error:
             error_tensor = torch.norm(before_comp_activation - recv_activation)
             error = error_tensor.item()
 
@@ -220,7 +222,7 @@ class StatsLogger:
         act_sim = None
         delta_sim = None
 
-        if CALC_SIMILARITY:
+        if calc_similarity:
             # Previous step similarities
             if key in self.prev_activations:
                 # Ensure tensors are flat and on the same device for similarity
@@ -243,7 +245,7 @@ class StatsLogger:
                     eps=1e-8 # Add epsilon for numerical stability
                 ).item()
             
-            if CALC_MORE_SIMILARITY:
+            if calc_more_similarity:
                 # Calculate transmitted delta similarity
                 if transmitted_delta is not None and key in self.prev_transmitted_deltas:
                     current_transmitted_delta_flat = transmitted_delta.flatten()
@@ -448,7 +450,9 @@ class StatsLogger:
             for res, stats in by_residual.items():
                 # print(f"🔵 [{k}] res={res} (over {len(stats)} steps):")
                 # print ALL error
-                if PRINT_ALL_ERROR:
+                cfg = get_stats_config()
+                print_all_error = cfg.print_all_error if cfg else False
+                if print_all_error:
                     all_error = [s['error'] for s in stats]
                     # print(f"all error: {all_error}")
                 
@@ -476,11 +480,11 @@ class StatsLogger:
                         dbf_ratio = avg_dbf_norm/avg_act_norm if avg_act_norm > 1e-8 else float('inf')
                         # print(f", dbf={avg_dbf_norm:.3f}, dbf/a={dbf_ratio:.2f}", end="")
 
-                if res >= 2:
-                    avg_delta_delta_norm = np.mean([s['delta_delta_norm'] for s in stats if s['delta_delta_norm'] is not None])
-                    if avg_delta_norm > 0:
-                        dd_ratio = avg_delta_delta_norm/avg_delta_norm
-                        # print(f", dd={avg_delta_delta_norm:.3f}, dd/d={dd_ratio:.2f}", end="")
+                    if res >= 2:
+                        avg_delta_delta_norm = np.mean([s['delta_delta_norm'] for s in stats if s['delta_delta_norm'] is not None])
+                        if avg_delta_norm > 0:
+                            dd_ratio = avg_delta_delta_norm/avg_delta_norm
+                            # print(f", dd={avg_delta_delta_norm:.3f}, dd/d={dd_ratio:.2f}", end="")
 
                 # print() # Newline after norms
 

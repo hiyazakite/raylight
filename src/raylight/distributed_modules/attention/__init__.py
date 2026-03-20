@@ -1,69 +1,85 @@
 import os
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Callable
 from .registry import AttentionRegistry
 from .backends.standard import StandardAttentionBackend
 from .backends.compact import CompactAttentionBackend
+
+if TYPE_CHECKING:
+    from raylight.config import RaylightConfig
 
 # Register backends
 AttentionRegistry.register("STANDARD", StandardAttentionBackend)
 AttentionRegistry.register("COMPACT", CompactAttentionBackend)
 
-# Global variables for backward compatibility (used by get_attn_type/get_sync_ulysses)
-_ATTN_TYPE = None
-_SYNC_ULYSSES = None
-_RING_IMPL_TYPE = "basic"
+# [SENIOR REFACTOR] Global Config Synchronization
+_CONFIG: Optional['RaylightConfig'] = None
 
+def set_config(config: 'RaylightConfig'):
+    """Central point to set the attention configuration."""
+    global _CONFIG
+    _CONFIG = config
+    # Invalidate cache when config changes
+    invalidate_attn_cache()
 
+def get_config() -> 'RaylightConfig':
+    """Retrieve the current attention configuration."""
+    global _CONFIG
+    if _CONFIG is None:
+        from raylight.config import RaylightConfig
+        _CONFIG = RaylightConfig.from_env()
+    return _CONFIG
+
+# --- Legacy Backward Compatibility Layer ---
 def set_attn_type(attn):
-    global _ATTN_TYPE
-    _ATTN_TYPE = attn
-
+    from raylight.config import RaylightAttnType
+    # In a real senior refactor, we would update the config object via replace()
+    # For now, we maintain the old globals or update a dummy config
+    print(f"[Raylight] Deprecated: set_attn_type({attn}) called. Prefer set_config().")
+    cfg = get_config()
+    from dataclasses import replace
+    try:
+        if isinstance(attn, str):
+            attn = RaylightAttnType[attn]
+        new_cfg = replace(cfg, strategy=replace(cfg.strategy, attention_type=attn))
+        set_config(new_cfg)
+    except Exception:
+        pass
 
 def get_attn_type():
-    if _ATTN_TYPE is None:
-        raise RuntimeError("_ATTN_TYPE is not initialized")
-    else:
-        return _ATTN_TYPE
-
+    return get_config().strategy.attention_type
 
 def set_sync_ulysses(is_sync):
-    global _SYNC_ULYSSES
-    _SYNC_ULYSSES = is_sync
-
+    cfg = get_config()
+    from dataclasses import replace
+    new_cfg = replace(cfg, strategy=replace(cfg.strategy, sync_ulysses=is_sync))
+    set_config(new_cfg)
 
 def get_sync_ulysses():
-    if _SYNC_ULYSSES is None:
-        raise RuntimeError("_SYNC_ULYSSES variable is not initialized")
-    else:
-        return _SYNC_ULYSSES
-
+    return get_config().strategy.sync_ulysses
 
 def set_ring_impl_type(impl_type):
-    global _RING_IMPL_TYPE
-    _RING_IMPL_TYPE = impl_type
-
+    cfg = get_config()
+    from dataclasses import replace
+    new_cfg = replace(cfg, strategy=replace(cfg.strategy, ring_impl=impl_type))
+    set_config(new_cfg)
 
 def get_ring_impl_type():
-    return _RING_IMPL_TYPE
+    return get_config().strategy.ring_impl
 
-
-def make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=None):
+def make_xfuser_attention(raylight_config=None, **kwargs):
     """
     Create xFuser attention using the registered backend.
-    Currently defaults to 'STANDARD' backend.
     """
-    backend_name = os.environ.get("RAYLIGHT_ATTN_BACKEND", "STANDARD")
-    
-    if ring_impl_type is None:
-        ring_impl_type = get_ring_impl_type()
-
+    cfg = raylight_config or get_config()
+    backend_name = cfg.strategy.attention_backend
     backend = AttentionRegistry.get(backend_name)
-    return backend.create_attention(attn_type, sync_ulysses, ring_impl_type=ring_impl_type)
+    return backend.create_attention(raylight_config=cfg, **kwargs)
 
 
 # Cache for attention callables keyed by (backend_name, attn_type, sync_ulysses, ring_impl_type).
 # Avoids recreating RaylightAttention (and for COMPACT, re-running compact_init)
 # on every single attention forward call.
-_attn_callable_cache: dict[tuple, callable] = {}
+_attn_callable_cache: Dict[Tuple, Callable] = {}
 
 
 def invalidate_attn_cache():
@@ -77,33 +93,26 @@ def invalidate_attn_cache():
 
 
 def make_lazy_attention(ring_impl_type_override=None):
-    """Return a callable that resolves the attention backend lazily at call time.
-
-    Unlike ``make_xfuser_attention`` (which captures the backend config at
-    creation time), the returned function re-reads ``get_attn_type()``,
-    ``get_sync_ulysses()``, ``get_ring_impl_type()`` and the
-    ``RAYLIGHT_ATTN_BACKEND`` env-var on **every invocation**.  This means
-    that changing the backend between ComfyUI queue items takes effect
-    immediately without restarting Ray worker processes.
-
-    The resolved callable is cached by ``(backend_name, attn_type,
-    sync_ulysses, ring_impl_type)`` so that repeated calls with the same
-    config reuse the same ``RaylightAttention`` instance instead of
-    allocating a new one every forward pass.
-
-    ``ring_impl_type_override`` – if not None, pins the ring implementation
-    (e.g. ``"basic"`` for non-causal models like LTX / Lumina) instead of
-    reading the global setting.
-    """
+    """Return a callable that resolves the attention backend lazily at call time."""
     def _lazy_attention(*args, **kwargs):
-        attn_type = get_attn_type()
-        sync_ulysses = get_sync_ulysses()
-        rim = ring_impl_type_override if ring_impl_type_override is not None else get_ring_impl_type()
-        backend_name = os.environ.get("RAYLIGHT_ATTN_BACKEND", "STANDARD")
-        cache_key = (backend_name, attn_type, sync_ulysses, rim)
+        cfg = get_config()
+        
+        # Apply local override if requested
+        if ring_impl_type_override is not None:
+            from dataclasses import replace
+            cfg = replace(cfg, strategy=replace(cfg.strategy, ring_impl=ring_impl_type_override))
+            
+        # Build cache key from relevant strategy fields
+        cache_key = (
+            cfg.strategy.attention_backend,
+            cfg.strategy.attention_type,
+            cfg.strategy.sync_ulysses,
+            cfg.strategy.ring_impl
+        )
+        
         fn = _attn_callable_cache.get(cache_key)
         if fn is None:
-            fn = make_xfuser_attention(attn_type, sync_ulysses, ring_impl_type=rim)
+            fn = make_xfuser_attention(raylight_config=cfg)
             _attn_callable_cache[cache_key] = fn
         return fn(*args, **kwargs)
     return _lazy_attention

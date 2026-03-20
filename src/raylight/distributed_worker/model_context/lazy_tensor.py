@@ -35,7 +35,7 @@ class LazyTensorContext(ModelContext):
         import safetensors
         sd = safetensors.torch.load_file(state.unet_path, device="cpu")
         try:
-            with safetensors.safe_open(state.unet_path, framework="pt") as f:
+            with safetensors.safe_open(state.unet_path, framework="pt") as f: # type: ignore
                 metadata = f.metadata() or {}
         except Exception:
             metadata = {}

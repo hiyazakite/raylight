@@ -35,6 +35,7 @@ def compact_init(config: CompactConfig):
     context._cache = CompactCache(
         quantize=config.quantized_cache,
         quant_bits=config.cache_quant_bits if config.cache_quant_bits is not None else 8,
+        allow_deprecated=config.allow_deprecated,
     )
     context._step = None
     if config.override_with_patch_gather_fwd:
@@ -120,6 +121,7 @@ def compact_reset():
     context._cache = CompactCache(
         quantize=context._config.quantized_cache, 
         quant_bits=(context._config.cache_quant_bits if context._config.cache_quant_bits is not None else 8),
+        allow_deprecated=context._config.allow_deprecated,
     )
     del old_cache
 

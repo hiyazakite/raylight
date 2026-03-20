@@ -1,11 +1,10 @@
 import torch
+from typing import Optional, Callable
 import torch.distributed as dist
 from raylight.distributed_modules.attention.backends.fusion.prof import Profiler
 from enum import Enum
 from raylight.distributed_modules.attention.backends.fusion.patchpara.df_utils import PatchConfig
 import os
-
-ALLOW_DEPRECATED = os.environ.get("COMPACT_ALLOW_DEPRECATED", "0") == "1"
 
 class COMPACT_COMPRESS_TYPE(Enum):
     """
@@ -29,13 +28,12 @@ class COMPACT_COMPRESS_TYPE(Enum):
 
 
 class CompactConfig:
-
     def __init__(
         self,
         enabled: bool = False,
         override_with_patch_gather_fwd: bool = False,
-        patch_gather_fwd_config: PatchConfig = None,
-        compress_func: callable = None,
+        patch_gather_fwd_config: Optional[PatchConfig] = None,
+        compress_func: Optional[Callable] = None,
         sparse_ratio=None,
         comp_rank=None,
         residual: int = 0,
@@ -46,19 +44,23 @@ class CompactConfig:
         fastpath: bool = False,
         quantized_cache: bool = True,
         cache_quant_bits: int = 8,
-        delta_decay_factor: float | None = None
+        delta_decay_factor: float | None = None,
+        # [NEW] Performance and Debug Flags Moved from Env Vars
+        verbose_attn: bool = False,
+        overlap_decomp: bool = True,
+        use_awl: bool = False,
+        allow_deprecated: bool = False,
+        # Stats / Research
+        calc_similarity: bool = False,
+        calc_more_similarity: bool = False,
+        print_all_error: bool = False,
+        ref_activation_path: str = "ref_activations",
+        dump_activations: bool = False,
+        calc_total_error: bool = False,
+        calc_error: bool = False,
     ):
         """
         Initialize compression settings.
-        Args:
-            enabled (bool): Enable/disable compression.
-            compress_func (callable): (layer_idx, step) -> compress_type, step starts from 0.
-            residual (int): 0: no residual, 1: 1st order residual, 2: 2nd order residual.
-            ef (bool): Enable/disable EF compression.
-            simulate (bool): Enable/disable simulation compression.
-            log_stats (bool): Enable/disable logging of compression stats.
-            quantized_cache (bool): Enable quantization for base tensor in CompactCache.
-            delta_decay_factor (float): Decay factor applied to delta_base in 2nd order residual.
         """
         self.enabled = enabled
         self.compress_func = compress_func
@@ -81,6 +83,18 @@ class CompactConfig:
         self.override_with_patch_gather_fwd = override_with_patch_gather_fwd
         self.patch_gather_fwd_config = patch_gather_fwd_config
         
+        # [NEW]
+        self.verbose_attn = verbose_attn
+        self.overlap_decomp = overlap_decomp
+        self.use_awl = use_awl
+        self.allow_deprecated = allow_deprecated
+        self.calc_similarity = calc_similarity
+        self.calc_more_similarity = calc_more_similarity
+        self.print_all_error = print_all_error
+        self.ref_activation_path = ref_activation_path
+        self.dump_activations = dump_activations
+        self.calc_total_error = calc_total_error
+        self.calc_error = calc_error
         
         if residual == 0:
             assert not ef, "No residual does not support error feedback."
@@ -104,7 +118,7 @@ class CompactConfig:
                  self.cache_quant_bits = 8
             else:
                  self.cache_quant_bits = cache_quant_bits
-            assert self.cache_quant_bits in [4, 8], "Only 4-bit and 8-bit cache quantization are supported."
+            assert self.allow_deprecated or self.cache_quant_bits in [4, 8], "Only 4-bit and 8-bit cache quantization are supported."
         else:
             self.cache_quant_bits = None
 
@@ -134,9 +148,10 @@ from raylight.distributed_modules.attention.backends.fusion.compress_lowrank imp
 
 
 class CompactCache:
-    def __init__(self, quantize=True, quant_bits=8):
+    def __init__(self, quantize=True, quant_bits=8, allow_deprecated=False):
         self.quantize = quantize
         self.quant_bits = quant_bits
+        self.allow_deprecated = allow_deprecated
         self.base = {}
         self.delta_base = {}
         # OPT: LRU dequantized-base cache.  Avoids redundant INT8/INT4 → FP16
@@ -148,7 +163,7 @@ class CompactCache:
         _DEQUANT_CACHE_MAX = 512  # well above typical layer counts
         self._dequant_cache_max = _DEQUANT_CACHE_MAX
         if quantize:
-            assert ALLOW_DEPRECATED or quant_bits in [4, 8]
+            assert self.allow_deprecated or quant_bits in [4, 8]
         self.passed_count = 0
 
     def _invalidate_dequant(self, key: str):
@@ -180,7 +195,7 @@ class CompactCache:
             self.delta_base[key] = None
 
     # @Profiler.prof_func("compact.CompactCache.get_base")
-    def get_base(self, key, expected_shape: tuple = None, expected_dtype: torch.dtype = None):
+    def get_base(self, key, expected_shape: Optional[tuple] = None, expected_dtype: Optional[torch.dtype] = None):
         # Fast path: return cached dequantized tensor if available
         cached = self._dequant_cache.get(key)
         if cached is not None:

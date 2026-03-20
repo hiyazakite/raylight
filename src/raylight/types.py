@@ -94,5 +94,23 @@ class WorkerConfigLike(Protocol):
     local_rank: int
     device: torch.device
     global_world_size: int
-    is_fsdp: bool
+    device_mesh: Optional[Any]
     parallel_dict: Dict[str, Any]
+
+    @property
+    def is_fsdp(self) -> bool: ...
+
+    @property
+    def fsdp_cpu_offload(self) -> bool: ...
+
+    @property
+    def is_xdit(self) -> bool: ...
+
+    @property
+    def use_mmap(self) -> bool: ...
+
+    @property
+    def mmap_cache_size(self) -> int: ...
+
+    @property
+    def vram_limit_bytes(self) -> int: ...

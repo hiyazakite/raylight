@@ -29,13 +29,13 @@ class VAEContext(LazyTensorContext):
                           metadata: Any = None, **kwargs) -> Any:
         """Instantiate VAE model using comfy.sd.VAE."""
         import comfy.sd
-        from safetensors.torch import safe_open
+        import safetensors
 
         print(f"[VAEContext] Standard VAE init with {len(sd)} keys")
 
         metadata = None
         try:
-            with safe_open(state.unet_path, framework="pt") as f:
+            with safetensors.safe_open(state.unet_path, framework="pt") as f: # type: ignore
                 metadata = f.metadata()
             if metadata:
                 print(f"[VAEContext] Loaded metadata: contains 'config': {'config' in metadata}")

@@ -1,7 +1,10 @@
 import torch
 from torch import Tensor
 import torch.distributed
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from raylight.config import RaylightConfig
 from yunchang import LongContextAttention
 try:
     from yunchang.kernels import AttnType
@@ -45,6 +48,7 @@ class RaylightAttention(LongContextAttention):
         use_sync: bool = False,
         attn_type: AttnType = AttnType.FA,
         use_compact_ring: bool = False,
+        raylight_config: Optional['RaylightConfig'] = None,
     ) -> None:
         super().__init__(
             scatter_idx=scatter_idx,
@@ -57,6 +61,9 @@ class RaylightAttention(LongContextAttention):
         self.use_kv_cache = use_kv_cache
         self.use_compact_ring = use_compact_ring
         self.ring_impl_type = ring_impl_type
+        
+        # [SENIOR REFACTOR] The Unified Configuration Engine
+        self.raylight_config = raylight_config
         
         if (
             use_kv_cache
@@ -172,7 +179,8 @@ class RaylightAttention(LongContextAttention):
             use_compact_ring=self.use_compact_ring,
             has_mask=(mask is not None),
             layer_idx=call_idx,
-            ring_impl_type=self.ring_impl_type
+            ring_impl_type=self.ring_impl_type,
+            raylight_config=self.raylight_config
         )
         
         # Assertions to satisfy type checker
@@ -196,6 +204,7 @@ class RaylightAttention(LongContextAttention):
             return_attn_probs=return_attn_probs,
             group=self.ring_pg,
             attn_layer=attn if self.use_kv_cache else None,
+            raylight_config=self.raylight_config,
             **kwargs
         )
 

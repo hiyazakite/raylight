@@ -2,6 +2,9 @@ import torch
 import itertools
 import ray
 import comfy.model_management
+from typing import TypeVar, Union, Iterable, List, Any
+
+T = TypeVar("T")
 
 
 _RAY_CLUSTER_EPOCH = 0
@@ -206,7 +209,7 @@ def tiled_scale(
     )
 
 
-def cancellable_get(refs, timeout=0.1):
+def cancellable_get(refs: Union[ray.ObjectRef, Iterable[ray.ObjectRef]], timeout: float = 0.1) -> Union[T, List[T]]:
     """
     A Ray.get() replacement that checks for ComfyUI cancellation.
     Returns a list of results if refs is a list, otherwise a single result.
@@ -216,7 +219,7 @@ def cancellable_get(refs, timeout=0.1):
     remaining = list(refs) if is_list else [refs]
     
     # Store results in original order
-    results = [None] * len(remaining)
+    results: List[Any] = [None] * len(remaining)
     ref_to_idx = {ref: i for i, ref in enumerate(remaining)}
     
     # print(f"[Raylight] Awaiting {len(remaining)} Ray tasks with cancellation support...")

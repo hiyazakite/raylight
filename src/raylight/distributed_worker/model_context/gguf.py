@@ -169,6 +169,7 @@ class GGUFContext(ModelContext):
         world_size = config.global_world_size
         cache_id = hashlib.md5(model_path.encode()).hexdigest()[:16]
         shm_name = f"raylight_gguf_{cache_id}"
+        shm: Any = None
 
         # --- deterministic layout from sorted keys -----------------------
         layout = []
@@ -223,7 +224,7 @@ class GGUFContext(ModelContext):
                     f"[GGUFContext] shm size mismatch: need {total_bytes}, got {shm.size}"
                 )
 
-        ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+        ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf)) # type: ignore
         ok = _cuda_host_register(ptr, total_bytes)
         if not ok and is_writer:
             print("[GGUFContext] WARNING: cudaHostRegister failed (DMA will use staging buffer).")
@@ -235,7 +236,7 @@ class GGUFContext(ModelContext):
                 src = mmap_cache[key]
                 raw = src.as_subclass(torch.Tensor) if isinstance(src, GGMLTensor) else src
                 dst = torch.frombuffer(
-                    memoryview(shm.buf)[off:off + nb], dtype=dtype,
+                    memoryview(shm.buf)[off:off + nb], dtype=dtype, # type: ignore
                 ).reshape(s_shape)
                 dst.copy_(raw)
                 my_count += 1
@@ -248,7 +249,7 @@ class GGUFContext(ModelContext):
         pinned: Dict[str, torch.Tensor] = {}
         for key, off, nb, s_shape, dtype, tt, ts in layout:
             view = torch.frombuffer(
-                memoryview(shm.buf)[off:off + nb], dtype=dtype,
+                memoryview(shm.buf)[off:off + nb], dtype=dtype, # type: ignore
             ).reshape(s_shape)
             if tt is not None:
                 pinned[key] = GGMLTensor(view, tensor_type=tt, tensor_shape=ts)
@@ -260,7 +261,7 @@ class GGUFContext(ModelContext):
             f"{len(pinned)} tensors, {total_bytes / 1e9:.2f} GB — "
             f"copied {my_count} (shm={shm_name})"
         )
-        return pinned, shm
+        return pinned, shm # type: ignore
 
     # ─── Disk loading ────────────────────────────────────────
 

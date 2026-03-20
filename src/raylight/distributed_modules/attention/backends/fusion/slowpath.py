@@ -1,4 +1,5 @@
 import torch
+from typing import Optional
 import torch.distributed as dist
 from raylight.distributed_modules.attention.backends.fusion.compress_topk import (
     topk_compress,
@@ -23,7 +24,7 @@ from raylight.distributed_modules.attention.backends.fusion.utils import (
     COMPACT_COMPRESS_TYPE,
 )
 
-def slowpath_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, rank: int = None, sparse_ratio: int = None):
+def slowpath_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, rank: Optional[int] = None, sparse_ratio: Optional[int] = None):
     """
     Pure function to compress a tensor using the specified method.
     Input layout: (N, C)
@@ -54,8 +55,8 @@ def slowpath_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, ran
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK:
         assert rank is not None and rank >= 1, "Rank must be provided for LOW_RANK compression"
         # P2: pass cache_key for Q-matrix warm-start
-        import raylight.distributed_modules.attention.backends.fusion.context as _ctx
-        _qk = _ctx._current_cache_key
+        from raylight.distributed_modules.attention.backends.fusion.main import compact_get_current_cache_key
+        _qk = compact_get_current_cache_key()
         # assert shape
         u, v, _ = subspace_iter(x, rank, 2, cache_key=f"{_qk}-lr" if _qk else None)
         u = u.half()
@@ -71,8 +72,8 @@ def slowpath_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, ran
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_Q:
         assert rank is not None and rank >= 1, "Rank must be provided for LOW_RANK_Q compression"
         # P2: pass cache_key for Q-matrix warm-start
-        import raylight.distributed_modules.attention.backends.fusion.context as _ctx
-        _qk = _ctx._current_cache_key
+        from raylight.distributed_modules.attention.backends.fusion.main import compact_get_current_cache_key
+        _qk = compact_get_current_cache_key()
         u, v, _ = subspace_iter(x, rank, 2, cache_key=f"{_qk}-lrq" if _qk else None)
         assert u.size(1) == v.size(0)
         u = u.half()
@@ -94,7 +95,7 @@ def slowpath_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, ran
     comp_merged = torch.cat([x.view(-1) for x in comp_list], dim=0)
     return comp_merged
 
-def slowpath_decompress(x: torch.Tensor, shape: tuple, compress_type: COMPACT_COMPRESS_TYPE, rank: int = None, sparse_ratio: int = None):
+def slowpath_decompress(x: torch.Tensor, shape: tuple, compress_type: COMPACT_COMPRESS_TYPE, rank: Optional[int] = None, sparse_ratio: Optional[int] = None):
     """
     Pure function to decompress a tensor using the specified method.
     Output layout: (N, C)
@@ -161,13 +162,13 @@ def slowpath_decompress(x: torch.Tensor, shape: tuple, compress_type: COMPACT_CO
         q = q_half.view(torch.uint8).view(N, C // 8)
         # Reshape scales to (N, K) and (K, C)
         effective_rank = 1 if rank == -1 else rank # Redetermine for reshaping
-        scale_u = scale_u_flat.view(N, effective_rank)
-        scale_v = scale_v_flat.view(effective_rank, C)
+        scale_u = scale_u_flat.view(N, effective_rank) # type: ignore
+        scale_v = scale_v_flat.view(effective_rank, C) # type: ignore
         # dequantize_1bit now returns (N, C) directly
         return dequantize_1bit(q, scale_u, scale_v)
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK:
-        u = split_list[0].view(N, rank) # Reshape to (N, K)
-        v = split_list[1].view(rank, C) # Reshape to (K, C)
+        u = split_list[0].view(N, rank) # type: ignore
+        v = split_list[1].view(rank, C) # type: ignore
         return torch.matmul(u, v)
     elif compress_type == COMPACT_COMPRESS_TYPE.INT4:
         q_half = split_list[0]
@@ -176,21 +177,21 @@ def slowpath_decompress(x: torch.Tensor, shape: tuple, compress_type: COMPACT_CO
         min_v = split_list[2].view(1, C)
         return dequantize_int4(q, scale, min_v)
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_Q:
-        q_u = split_list[0].view(torch.uint8).view(N//2, rank)
-        scale_u = split_list[1].view(1, rank)
-        min_u = split_list[2].view(1, rank)
-        q_v = split_list[3].view(torch.uint8).view(C//2, rank)
-        scale_v = split_list[4].view(1, rank)
-        min_v = split_list[5].view(1, rank)
+        q_u = split_list[0].view(torch.uint8).view(N//2, rank) # type: ignore
+        scale_u = split_list[1].view(1, rank) # type: ignore
+        min_u = split_list[2].view(1, rank) # type: ignore
+        q_v = split_list[3].view(torch.uint8).view(C//2, rank) # type: ignore
+        scale_v = split_list[4].view(1, rank) # type: ignore
+        min_v = split_list[5].view(1, rank) # type: ignore
         u = dequantize_int4(q_u, scale_u, min_u)
         v = dequantize_int4(q_v, scale_v, min_v)
         return torch.matmul(u, v.t())
     elif compress_type == COMPACT_COMPRESS_TYPE.SPARSE:
-        idx_last_dim_size = SPARSE_LAST_DIM_SIZE//sparse_ratio
-        val_last_dim_size = SPARSE_LAST_DIM_SIZE//sparse_ratio//4
+        idx_last_dim_size = SPARSE_LAST_DIM_SIZE//sparse_ratio # type: ignore
+        val_last_dim_size = SPARSE_LAST_DIM_SIZE//sparse_ratio//4 # type: ignore
         val = split_list[0].view(-1, val_last_dim_size)
         idx = split_list[1].view(torch.uint8).view(-1, idx_last_dim_size)
-        return topk_decompress(val, idx, sparse_ratio).view(shape)
+        return topk_decompress(val, idx, sparse_ratio).view(shape) # type: ignore
     elif compress_type == COMPACT_COMPRESS_TYPE.BINARY_MEAN_AS_SCALE:
         # This type explicitly uses mean, equivalent to rank=-1
         return sim_binary(x, rank=-1)
@@ -205,7 +206,7 @@ def set_current_lowrank_scale(scale_k, scale_v):
     _current_lowrank_scale_k = scale_k
     _current_lowrank_scale_v = scale_v
 
-def sim_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, sparse_ratio: int = None, rank: int = None):
+def sim_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, sparse_ratio: Optional[int] = None, rank: Optional[int] = None):
     """
     Simulate the compression and decompression of a tensor using the specified method.
     Make it a pure function for testing.
@@ -229,23 +230,22 @@ def sim_compress(x: torch.Tensor, compress_type: COMPACT_COMPRESS_TYPE, sparse_r
         return sim_int4(x, dim=0)
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK:
         assert rank is not None
-        import raylight.distributed_modules.attention.backends.fusion.context as _ctx
-        _qk = _ctx._current_cache_key
+        from raylight.distributed_modules.attention.backends.fusion.main import compact_get_current_cache_key
+        _qk = compact_get_current_cache_key()
         u, v, _ = subspace_iter(x, rank, 2, cache_key=f"{_qk}-sim-lr" if _qk else None)
         return torch.matmul(u, v)
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_Q:
         assert rank is not None
-        import raylight.distributed_modules.attention.backends.fusion.context as _ctx
-        _qk = _ctx._current_cache_key
+        from raylight.distributed_modules.attention.backends.fusion.main import compact_get_current_cache_key
+        _qk = compact_get_current_cache_key()
         u, v, _ = subspace_iter(x, rank, 2, cache_key=f"{_qk}-sim-lrq" if _qk else None)
         u = sim_int4(u, dim=0)
         v = sim_int4(v, dim=1)
         return torch.matmul(u, v)
     elif compress_type == COMPACT_COMPRESS_TYPE.LOW_RANK_AWL:
         assert rank is not None
-        from raylight.distributed_modules.attention.backends.fusion.utils import ALLOW_DEPRECATED
-        assert ALLOW_DEPRECATED, "LOW_RANK_AWL is deprecated"
-        from raylight.distributed_modules.attention.backends.fusion.main import compact_get_current_cache_key
+        from raylight.distributed_modules.attention.backends.fusion.main import compact_get_current_cache_key, compact_config
+        assert compact_config().allow_deprecated, "LOW_RANK_AWL is deprecated"
         N, C = x.shape
         cache_key = compact_get_current_cache_key()
         is_k = cache_key.split("-")[-1] == 'k'

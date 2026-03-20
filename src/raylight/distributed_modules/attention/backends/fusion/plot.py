@@ -69,7 +69,7 @@ def plot_low_rank_factors(
     axes[1].set_ylabel("Rank (K)")
     fig.colorbar(im_v, ax=axes[1])
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # Adjust layout to prevent title overlap
+    plt.tight_layout(rect=(0, 0.03, 1, 0.95))  # Adjust layout to prevent title overlap
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)

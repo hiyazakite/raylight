@@ -46,7 +46,7 @@ class FSDPContext(ModelContext):
             dummy_sd: Dict[str, torch.Tensor] = {}
             metadata = None
             try:
-                with safe_open(state.unet_path, framework="pt") as f:
+                with safe_open(state.unet_path, framework="pt") as f: # type: ignore
                     metadata = f.metadata()
                     for k in f.keys():
                         t_slice = f.get_slice(k)
@@ -117,7 +117,7 @@ class FSDPContext(ModelContext):
             sd,
             config.local_rank,
             getattr(config, "device_mesh", None),
-            config.parallel_dict.get("fsdp_cpu_offload", False),
+            config.fsdp_cpu_offload,
             model_options=model_options,
             metadata=metadata,
             load_weights=load_weights,
@@ -128,7 +128,7 @@ class FSDPContext(ModelContext):
 
         model.is_fsdp_baked = True
 
-        fsdp_cpu_offload = config.parallel_dict.get("fsdp_cpu_offload", False)
+        fsdp_cpu_offload = config.fsdp_cpu_offload
         if not fsdp_cpu_offload:
             from raylight.distributed_modules.pinned_cache import FSDPShardPinnedCache
             model.fsdp_shard_cache = FSDPShardPinnedCache()

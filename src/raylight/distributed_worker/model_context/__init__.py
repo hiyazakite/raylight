@@ -33,7 +33,7 @@ def get_context(
     Returns:
         Appropriate ModelContext subclass instance
     """
-    use_mmap = config.parallel_dict.get("use_mmap", True)
+    use_mmap = config.use_mmap
 
     if model_type == "vae":
         return VAEContext(use_mmap=use_mmap)

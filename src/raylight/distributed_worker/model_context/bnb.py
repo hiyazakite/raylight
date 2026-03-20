@@ -39,7 +39,7 @@ class BNBContext(ModelContext):
                 unet_path,
                 config.local_rank,
                 config.device_mesh,
-                config.parallel_dict.get("fsdp_cpu_offload", False),
+                config.fsdp_cpu_offload,
             )
             model.fsdp_state_dict = state_dict
             return model

@@ -6,8 +6,7 @@ from raylight.utils.common import cleanup_memory, force_malloc_trim
 from typing import Optional, Any
 from raylight.distributed_worker.worker_config import WorkerConfig
 
-# Gate expensive per-chunk diagnostics behind env var (each .item() forces GPU→CPU sync)
-DEBUG_VAE_STATS = os.environ.get("RAYLIGHT_DEBUG_VAE", "0") == "1"
+# VAE debugging stats (formerly RAYLIGHT_DEBUG_VAE) enabled via config.debug.debug_vae
 
 class VaeManager:
     def __init__(self):
@@ -65,7 +64,7 @@ class VaeManager:
         if self.vae_model is None:
             return
         from raylight.distributed_worker.model_context import VAEContext
-        vae_ctx = VAEContext(use_mmap=config.parallel_dict.get("use_mmap", True))
+        vae_ctx = VAEContext(use_mmap=config.raylight_config.device.use_mmap)
         vae_ctx.offload(self.vae_model, lora_manager, {}, config, memory=memory)
         print(f"[RayWorker {config.local_rank}] VAE offloaded from VRAM.")
 
@@ -201,11 +200,11 @@ class VaeManager:
             
             # Post-processing: discard warmup
             # 4. Post-Process (Shape Fix + Warmup Discard)
-            images = self._post_process_images(images, discard_latent_frames, config.local_rank, shard_index)
+            images = self._post_process_images(images, discard_latent_frames, config.local_rank, config, shard_index)
             
             # 5. Handle Output (Mmap or CPU Transfer)
             # RETURNS: (shard_index, result_payload)
-            result = self._handle_output(images, shard_index, mmap_path, mmap_shape, output_offset, config.local_rank)
+            result = self._handle_output(images, shard_index, mmap_path, mmap_shape, output_offset, config.local_rank, config)
     
             # Proactive cleanup (images tensor is referenced in result if not mmap, but original is gone)
             del latents_to_decode
@@ -219,7 +218,7 @@ class VaeManager:
             # The master calls release_vae (or explicit offload) after all chunks complete.
             if not skip_offload:
                 from raylight.distributed_worker.model_context import VAEContext
-                vae_ctx = VAEContext(use_mmap=config.parallel_dict.get("use_mmap", True))
+                vae_ctx = VAEContext(use_mmap=config.raylight_config.device.use_mmap)
                 vae_ctx.offload(self.vae_model, lora_manager, {}, config)
                 print(f"[RayWorker {config.local_rank}] VAE Offload in finally block complete.")
                 force_malloc_trim()
@@ -250,11 +249,10 @@ class VaeManager:
         self._cached_dtype = (preference, dtype)
         return dtype
 
-    def _post_process_images(self, images, discard_latent_frames, local_rank, shard_index=None):
+    def _post_process_images(self, images, discard_latent_frames, local_rank, config: WorkerConfig, shard_index=None):
         """Normalizes image shape and handles warmup frame discarding."""
         # Debug stats (disabled by default — each .item() forces a GPU→CPU sync stall)
-        # Enable with RAYLIGHT_DEBUG_VAE=1 environment variable
-        if DEBUG_VAE_STATS:
+        if config.raylight_config.debug.debug_vae:
             raw_min, raw_max, raw_mean = images.min().item(), images.max().item(), images.mean().item()
             print(f"[RayWorker {local_rank}] RAW decode stats: min={raw_min:.4f}, max={raw_max:.4f}, mean={raw_mean:.4f}")
             if torch.isnan(images).any():
@@ -282,11 +280,11 @@ class VaeManager:
             
         return images
 
-    def _handle_output(self, images, shard_index, mmap_path, mmap_shape, output_offset, local_rank):
+    def _handle_output(self, images, shard_index, mmap_path, mmap_shape, output_offset, local_rank, config: WorkerConfig):
         """Handles output transport: direct mmap write or CPU serialization."""
         
         # Debug stats (disabled by default — each .item() forces a GPU→CPU sync stall)
-        if DEBUG_VAE_STATS:
+        if config.raylight_config.debug.debug_vae:
             stats_min, stats_max, stats_mean = images.min().item(), images.max().item(), images.mean().item()
             print(f"[RayWorker {local_rank}] Shard {shard_index} statistics: min={stats_min:.4f}, max={stats_max:.4f}, mean={stats_mean:.4f}")
         

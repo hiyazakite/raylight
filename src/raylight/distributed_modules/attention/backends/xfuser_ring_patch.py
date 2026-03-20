@@ -229,7 +229,7 @@ def xdit_ring_zigzag_flash_attn_forward_patched(
     assert causal == True, "zigzag ring is only supported for causal=True"
     
     if RingComm is None:
-        raise ImportError("yunchang is required for xfuser ring attention")
+        raise ImportError("yunchang.ring.utils.RingComm is required for xfuser ring attention")
     comm = RingComm(process_group)
     rank = comm.rank
     world_size = comm.world_size
@@ -237,8 +237,8 @@ def xdit_ring_zigzag_flash_attn_forward_patched(
     # In zigzag, query/key/value are each [rank, 2*world_size - rank - 1] blocks
     block_seq_len = q.shape[1] // 2
     
-    out = None
-    lse = None
+    out: Optional[torch.Tensor] = None
+    lse: Optional[torch.Tensor] = None
 
     if attn_layer is not None:
         k, v = get_cache_manager().update_and_get_kv_cache(
@@ -260,23 +260,28 @@ def xdit_ring_zigzag_flash_attn_forward_patched(
                 causal=_causal, mask=_mask_chunk
             )
         else:
+            if AttnType is None:
+                raise ImportError("yunchang.kernels.AttnType is required for flash attention")
+            if select_flash_attn_impl is None:
+                raise ImportError("yunchang.kernels.select_flash_attn_impl is required for flash attention")
             _attn_type = getattr(AttnType, "FA") if attn_type is None else attn_type
-            fn: Any = select_flash_attn_impl(_attn_type, stage="fwd-only", attn_processor=attn_processor)
+            fn: Any = select_flash_attn_impl(_attn_type, stage="fwd-only", attn_processor=attn_processor) # type: ignore
             return fn(
                 _q, _k, _v, dropout_p=dropout_p, softmax_scale=softmax_scale,
                 causal=_causal, window_size=window_size, softcap=0.0,
                 alibi_slopes=alibi_slopes, return_softmax=True and dropout_p > 0
             )
 
-    curr_k, curr_v = k, v
-    next_k = None
-    next_v = None
+    curr_k: torch.Tensor = k
+    curr_v: torch.Tensor = v
+    next_k: Optional[torch.Tensor] = None
+    next_v: Optional[torch.Tensor] = None
 
     for step in range(world_size):
         if step + 1 != world_size:
-            next_k = comm.send_recv(curr_k)
-            next_v = comm.send_recv(curr_v)
-            comm.commit()
+            next_k = comm.send_recv(curr_k) # type: ignore
+            next_v = comm.send_recv(curr_v) # type: ignore
+            comm.commit() # type: ignore
 
         recv_rank = (rank - step) % world_size
         
@@ -284,27 +289,27 @@ def xdit_ring_zigzag_flash_attn_forward_patched(
             # Step 0: Causal attn on full local Q vs full local K
             m_chunk = get_zigzag_mask_chunk(mask, rank, rank, world_size, block_seq_len) if has_nontrivial_mask else None
             block_out, block_lse = iterate_attn(q, curr_k, curr_v, _causal=True, _mask_chunk=m_chunk)
-            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse) # type: ignore
         elif step <= rank:
             # Attend to the first half of the received blocks (K_recv_rank)
-            k0 = curr_k[:, :block_seq_len]
-            v0 = curr_v[:, :block_seq_len]
+            k0 = curr_k[:, :block_seq_len] # type: ignore
+            v0 = curr_v[:, :block_seq_len] # type: ignore
             m_chunk = get_zigzag_mask_chunk(mask, rank, recv_rank, world_size, block_seq_len, k_slice=0) if has_nontrivial_mask else None
             block_out, block_lse = iterate_attn(q, k0, v0, _causal=False, _mask_chunk=m_chunk)
-            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse) # type: ignore
         else:
             # Only the second half of Q attends to the received blocks
             q1 = q[:, block_seq_len:]
             m_chunk = get_zigzag_mask_chunk(mask, rank, recv_rank, world_size, block_seq_len, q_slice=1) if has_nontrivial_mask else None
             block_out, block_lse = iterate_attn(q1, curr_k, curr_v, _causal=False, _mask_chunk=m_chunk)
             out, lse = update_out_and_lse(
-                out, lse, block_out, block_lse, 
+                out, lse, block_out, block_lse, # type: ignore
                 slice_=(slice(None), slice(block_seq_len, None))
             )
             
         if step + 1 != world_size:
-            comm.wait()
-            curr_k, curr_v = next_k, next_v
+            comm.wait() # type: ignore
+            curr_k, curr_v = next_k, next_v # type: ignore
 
     if out is None:
         out = torch.zeros_like(q)
@@ -450,13 +455,12 @@ def xdit_ring_flash_attn_forward_patched(
                 raise ImportError("yunchang is required for xfuser ring attention updates")
             if block_lse is None:
                 raise RuntimeError("LSE is None from block attention, but required for ring attention update.")
-            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse) # type: ignore
 
         if step + 1 != world_size:
             comm.wait()
-            assert next_k is not None and next_v is not None
-            k = next_k
-            v = next_v
+            k = next_k # type: ignore
+            v = next_v # type: ignore
 
     if out is None:
         out = torch.zeros_like(q)

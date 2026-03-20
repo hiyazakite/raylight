@@ -1,5 +1,5 @@
 import torch
-from torch.distributed._tensor import DTensor
+from torch.distributed.tensor._api import DTensor
 
 
 def detect_dtype_mismatch(module, ref_dtype):

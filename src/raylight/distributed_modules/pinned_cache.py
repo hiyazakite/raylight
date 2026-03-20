@@ -64,6 +64,8 @@ def _cuda_host_register(ptr: int, size: int) -> bool:
         torch.cuda.current_device()  # lazily initialises CUDA context
 
         cudart = torch.cuda.cudart()
+        if cudart is None:
+            return False
         # cudaHostRegisterPortable = 1 (visible to all CUDA contexts)
         # pybind11 binding expects plain Python ints, NOT ctypes wrappers.
         err = cudart.cudaHostRegister(int(ptr), int(size), int(1))
@@ -81,6 +83,8 @@ def _cuda_host_register(ptr: int, size: int) -> bool:
 def _cuda_host_unregister(ptr: int) -> bool:
     try:
         cudart = torch.cuda.cudart()
+        if cudart is None:
+            return False
         err = cudart.cudaHostUnregister(int(ptr))
         if isinstance(err, tuple):
             err = err[0]
@@ -745,7 +749,7 @@ class SharedPinnedParamCache(BasePinnedCache):
 
         for i, (name, off, nb, shape, dtype) in enumerate(param_layout):
             view = torch.frombuffer(
-                memoryview(self._shm.buf)[off:off + nb], dtype=dtype,
+                memoryview(self._shm.buf)[off:off + nb], dtype=dtype, # type: ignore
             ).reshape(shape)
             self._cpu_params[name] = view
             if i % self._world_size == self._local_rank:
@@ -762,7 +766,7 @@ class SharedPinnedParamCache(BasePinnedCache):
         # Buffers are tiny; rank 0 copies them all.
         for i, (name, off, nb, shape, dtype) in enumerate(buffer_layout):
             view = torch.frombuffer(
-                memoryview(self._shm.buf)[off:off + nb], dtype=dtype,
+                memoryview(self._shm.buf)[off:off + nb], dtype=dtype, # type: ignore
             ).reshape(shape)
             self._cpu_buffers[name] = view
             if i % self._world_size == self._local_rank:
@@ -796,6 +800,7 @@ class SharedPinnedParamCache(BasePinnedCache):
         )
 
     def _register_shm(self, total_bytes: int) -> None:
+        assert self._shm is not None
         ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._shm.buf))
         ok = _cuda_host_register(ptr, total_bytes)
         self._registered_ptr = ptr
@@ -951,12 +956,12 @@ class SharedPinnedParamCache(BasePinnedCache):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _is_fsdp_dtensor(param: torch.Tensor) -> bool:
-    from torch.distributed._tensor import DTensor
+    from torch.distributed.tensor._api import DTensor
     return isinstance(param, DTensor) or isinstance(param.data, DTensor)
 
 
 def _as_dtensor(param: torch.Tensor):
-    from torch.distributed._tensor import DTensor
+    from torch.distributed.tensor._api import DTensor
     if isinstance(param, DTensor):
         return param
     return param.data
@@ -965,7 +970,7 @@ def _as_dtensor(param: torch.Tensor):
 def _local_cuda(param: torch.Tensor) -> "torch.Tensor | None":
     """Return the rank-local CUDA backing tensor, or None if not on CUDA."""
     dt = _as_dtensor(param)
-    local = dt.to_local()
+    local = dt.to_local() # type: ignore
     if local.device.type != "cuda" or local.numel() == 0:
         return None
     return local
@@ -1069,7 +1074,7 @@ class FSDPShardPinnedCache(BasePinnedCache):
                 continue
 
             dt = _as_dtensor(param)
-            dt._local_tensor.copy_(cpu_buf, non_blocking=non_blocking)
+            dt._local_tensor.copy_(cpu_buf, non_blocking=non_blocking) # type: ignore
             reloaded += 1
 
         # Restore buffers

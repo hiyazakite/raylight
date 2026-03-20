@@ -5,6 +5,8 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 import ray
+import ray.actor
+from typing import Tuple, List, Dict, Any, Callable, Optional, Union, cast
 
 import comfy.patcher_extension as pe
 
@@ -16,6 +18,7 @@ from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 
 from raylight.utils.common import patch_ray_tqdm
 from raylight.utils.gguf import check_mmap_leak
+from raylight.config import RaylightConfig
 from raylight.utils.memory import monitor_memory, MemoryPolicy
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from raylight.comfy_dist.utils import cancellable_get
@@ -45,24 +48,30 @@ class RayWorker:
 
 
 
-    def __init__(self, local_rank, device_id, parallel_dict):
+    def __init__(self, local_rank, device_id, parallel_dict, raylight_config=None):
         self.local_rank = local_rank
         self.device_id = device_id
         self.parallel_dict = parallel_dict
-        self.global_world_size = self.parallel_dict["global_world_size"]
+        
+        # [SENIOR REFACTOR] Fallback to from_env if not provided (safety)
+        from raylight.config import RaylightConfig
+        self.raylight_config = raylight_config or RaylightConfig.from_env()
+
+        self.global_world_size = self.raylight_config.device.world_size
 
         self.model = None
         self.model_type = None
         self.state_dict = None
         self.overwrite_cast_dtype = None
         
-        # Create Immutable Config
+        # Create Immutable Config for managers
         self.config = WorkerConfig(
             local_rank=self.local_rank,
             device_id=self.device_id,
             device=torch.device(f"cuda:{self.device_id}"),
             parallel_dict=self.parallel_dict,
-            global_world_size=self.global_world_size
+            global_world_size=self.global_world_size,
+            raylight_config=self.raylight_config
         )
 
         # Managers
@@ -74,7 +83,7 @@ class RayWorker:
         
         # LRU cache for mmap'd state dicts (replaces worker_mmap_cache)
         from raylight.utils.cache import LRUStateCache
-        cache_size = parallel_dict.get("mmap_cache_size", 4) 
+        cache_size = self.raylight_config.device.mmap_cache_size
         if cache_size < 3:
             print(f"[RayWorker {self.local_rank}] WARNING: mmap_cache_size={cache_size} is too small for UNET+VAE. Forcing to 4.")
             cache_size = 4
@@ -173,7 +182,7 @@ class RayWorker:
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
 
         self.is_model_loaded = False
-        self.is_cpu_offload = self.parallel_dict.get("fsdp_cpu_offload", False)
+        self.is_cpu_offload = self.raylight_config.strategy.fsdp_cpu_offload
 
         os.environ["XDIT_LOGGING_LEVEL"] = "WARN"
         os.environ["NCCL_DEBUG"] = "WARN"
@@ -185,7 +194,6 @@ class RayWorker:
                 rank=local_rank,
                 world_size=self.global_world_size,
                 timeout=timedelta(minutes=1),
-                # device_id=self.device
             )
         elif sys.platform.startswith("win"):
             os.environ["USE_LIBUV"] = "0"
@@ -194,44 +202,47 @@ class RayWorker:
                 rank=local_rank,
                 world_size=self.global_world_size,
                 timeout=timedelta(minutes=1),
-                # device_id=self.device
             )
 
-        # (TODO-Komikndr) Should be modified so it can do support DP on top of FSDP
-        if self.parallel_dict["is_xdit"] or self.parallel_dict["is_fsdp"]:
-            self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
-            self.config.device_mesh = self.device_mesh
-        else:
-            print(f"Running Ray in normal seperate sampler with: {self.global_world_size} number of workers")
+        # Initialize Device Mesh for FSDP or Sequence Parallelism
+        if self.raylight_config.meta.is_distributed:
+            if self.raylight_config.strategy.fsdp_enabled or self.raylight_config.meta.total_sp_degree > 1:
+                self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
+                self.config.device_mesh = self.device_mesh
+            else:
+                print(f"Running Ray in normal separate sampler with: {self.global_world_size} number of workers")
 
-        # From mochi-xdit, xdit, pipelines.py
-        if self.parallel_dict["is_xdit"]:
+        # Initialize XDiT Environment for Sequence Parallelism
+        if self.raylight_config.meta.total_sp_degree > 1:
             from xfuser.core.distributed import (
                 init_distributed_environment,
                 initialize_model_parallel,
             )
-            xfuser_attn.set_attn_type(self.parallel_dict["attention"])
-            xfuser_attn.set_sync_ulysses(self.parallel_dict["sync_ulysses"])
-            xfuser_attn.set_ring_impl_type(self.parallel_dict.get("ring_impl_type", "basic"))
+            # Inject unified attention config
+            xfuser_attn.set_config(self.raylight_config)
 
-            self.cp_degree = self.parallel_dict["ulysses_degree"] * self.parallel_dict["ring_degree"]
-            self.cfg_degree = self.parallel_dict["cfg_degree"]
-            self.ulysses_degree = self.parallel_dict["ulysses_degree"]
-            self.ring_degree = self.parallel_dict["ring_degree"]
-            self.cfg_degree = self.parallel_dict["cfg_degree"]
+            strategy = self.raylight_config.strategy
+            self.ulysses_degree = strategy.ulysses_degree
+            self.ring_degree = strategy.ring_degree
+            self.cfg_degree = strategy.cfg_degree
+            self.cp_degree = self.ulysses_degree * self.ring_degree
             
-            # Cleanup previous state if any (Robustness for restarts)
+            # Cleanup previous xfuser state if any (Robustness for restarts)
             try:
                 from xfuser.core.distributed import parallel_state
-                if parallel_state.get_world_size() > 1:
+                if parallel_state.model_parallel_is_initialized():
                     parallel_state.destroy_model_parallel()
-                if dist.is_initialized():
-                    dist.destroy_process_group()
+                # DO NOT destroy the main process group here! 
+                # It was just initialized above and xfuser will reuse it.
             except Exception as e:
-                print(f"[Raylight] Cleanup warning: {e}")
+                print(f"[Raylight] xfuser cleanup warning: {e}")
 
-            init_distributed_environment(rank=self.local_rank, world_size=self.global_world_size)
-            print("XDiT is enable")
+            init_distributed_environment(
+                rank=self.local_rank, 
+                world_size=self.global_world_size,
+                local_rank=self.local_rank
+            )
+            print("[RayWorker] XDiT (Sequence Parallelism) Enabled.")
 
             initialize_model_parallel(
                 sequence_parallel_degree=self.cp_degree,
@@ -241,7 +252,7 @@ class RayWorker:
             )
 
             print(
-                f"Parallel Degree: Ulysses={self.ulysses_degree}, Ring={self.ring_degree}, CFG={self.cfg_degree}"
+                f"  -> Parallel Degrees: Ulysses={self.ulysses_degree}, Ring={self.ring_degree}, CFG={self.cfg_degree}"
             )
 
 
@@ -273,8 +284,6 @@ class RayWorker:
     def get_compute_capability(self):
         return self.compute_capability
 
-    def get_parallel_dict(self):
-        return self.parallel_dict
 
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
@@ -415,9 +424,17 @@ class RayWorker:
         self.model = ctx.load(state, self.config, self.state_cache)
         
         # Stamp user VRAM limit on model for hot_load budget calculation
-        vram_limit = self.parallel_dict.get("vram_limit_bytes", 0)
+        vram_limit = self.config.vram_limit_bytes
         if self.model is not None and vram_limit > 0:
             self.model.vram_limit_bytes = vram_limit
+        
+        # NOTE: sequential loading check handled in nodes.py
+        # but actors themselves don't need to know if they are and it's fine
+        
+        # 6. Re-apply VRAM limits again (Safety)
+        if vram_limit > 0:
+            if self.model is not None:
+                self.model.vram_limit_bytes = vram_limit
 
         # Format flags and coordinating refs
         self.is_gguf = unet_path.lower().endswith(".gguf") or dequant_dtype is not None
@@ -426,7 +443,7 @@ class RayWorker:
             # budget enforcement inside GGUFModelPatcher.load() will cap
             # lowvram_model_memory so ComfyUI places only budget-worth of
             # modules on CUDA and streams the rest per-layer.
-            vram_limit = self.parallel_dict.get("vram_limit_bytes", 0)
+            vram_limit = self.config.vram_limit_bytes
             if vram_limit > 0:
                 print(f"[RayWorker {self.local_rank}] GGUF: Partial VRAM load (limit {vram_limit / 1e9:.1f} GB)...")
             else:
@@ -455,7 +472,7 @@ class RayWorker:
             self._load_via_context(unet_path, model_options)
             
             # FSDP Specific: Link the lazy state dict to the patcher
-            if self.parallel_dict.get("is_fsdp"):
+            if self.config.is_fsdp:
                     # Note: model_context.load() already attaches fsdp_state_dict to the model returned.
                     # We only need to set it if we have an explicit override in self.state_dict.
                 if self.state_dict is not None:
@@ -464,14 +481,14 @@ class RayWorker:
             self.is_model_loaded = True
 
             # Explicitly mark as baked for LoRA reloading logic
-            if self.parallel_dict.get("is_fsdp") and self.model is not None:
+            if self.config.is_fsdp and self.model is not None:
                 self.model.is_fsdp_baked = True
 
             return True
 
     def load_gguf_unet(self, unet_path, dequant_dtype, patch_dtype):
         with monitor_memory(f"RayWorker {self.local_rank} - load_gguf_unet", device=self.device):
-            if self.parallel_dict["is_fsdp"] is True:
+            if self.config.is_fsdp is True:
                 raise ValueError("FSDP Sharding for GGUF is not supported")
             
             self._load_via_context(unet_path, {}, dequant_dtype, patch_dtype)
@@ -488,7 +505,7 @@ class RayWorker:
         
         if reload_params is not None:
              print(f"[RayWorker {self.local_rank}] GGUF Optimization: Using Unified Parallel Disk Loading (Mmap)...")
-             if self.parallel_dict["is_fsdp"] is True:
+             if self.config.is_fsdp is True:
                 raise ValueError("FSDP Sharding for GGUF is not supported")
             
              self._load_via_context(
@@ -521,7 +538,7 @@ class RayWorker:
         current_hash = getattr(self.lora_manager, "_current_lora_config_hash", None)
         
         if (self.model is not None and 
-            (getattr(self.model, "is_fsdp_baked", False) or self.parallel_dict.get("is_fsdp")) and 
+            (getattr(self.model, "is_fsdp_baked", False) or self.config.is_fsdp) and 
             current_hash != config_hash):
             
             print(f"[RayWorker {self.local_rank}] Model is FSDP-baked and LoRA config changed ({current_hash} -> {config_hash}). Forcing base reload.")
@@ -734,6 +751,11 @@ class RayWorker:
             skip_offload=skip_offload,
         )
 
+    def get_raylight_config(self) -> RaylightConfig:
+        return self.raylight_config
+
+    def get_parallel_dict(self) -> Dict[str, Any]:
+        return self.parallel_dict
 
 
     @patch_temp_fix_ck_ops
@@ -869,11 +891,13 @@ def ray_nccl_tester(world_size):
 
 def make_ray_actor_fn(
     world_size,
-    parallel_dict
+    parallel_dict,
+    raylight_config=None
 ):
     def _init_ray_actor(
         world_size=world_size,
-        parallel_dict=parallel_dict
+        parallel_dict=parallel_dict,
+        raylight_config=raylight_config
     ):
         ray_actors = dict()
         gpu_actor = ray.remote(RayWorker)
@@ -891,26 +915,18 @@ def make_ray_actor_fn(
             ray.kill(stale, no_restart=True)
 
         for local_rank in range(world_size):
-            # Prepare runtime_env for backend config
+            # [SENIOR REFACTOR] Propagate system environment to Ray Workers
             init_runtime_env = {}
-            env_vars = {}
-            
-            if "attention_backend" in parallel_dict:
-                env_vars["RAYLIGHT_ATTN_BACKEND"] = parallel_dict["attention_backend"]
-            
-            if parallel_dict.get("use_kitchen"):
-                env_vars["RAYLIGHT_ENABLE_KITCHEN"] = "1"
-            
-            if parallel_dict.get("kv_cache_quant_enable"):
-                env_vars["RAYLIGHT_COMPACT_QUANTIZED_CACHE"] = "1"
-                if "kv_cache_quant_bits" in parallel_dict:
-                    env_vars["RAYLIGHT_COMPACT_CACHE_QUANT_BITS"] = str(parallel_dict["kv_cache_quant_bits"])
-            if "delta_compression" in parallel_dict:
-                env_vars["RAYLIGHT_DELTA_COMPRESSION"] = str(parallel_dict["delta_compression"])
-            if "compact_warmup_steps" in parallel_dict:
-                env_vars["RAYLIGHT_COMPACT_WARMUP_STEPS"] = str(parallel_dict["compact_warmup_steps"])
-
-            if env_vars:
+            if raylight_config:
+                env_vars = {
+                    "RAYLIGHT_ATTN_BACKEND": raylight_config.strategy.attention_backend,
+                    "RAYLIGHT_ENABLE_KITCHEN": "1" if raylight_config.debug.enable_kitchen else "0",
+                    "RAYLIGHT_COMPACT_WARMUP_STEPS": str(raylight_config.compact.warmup_steps),
+                    "RAYLIGHT_DELTA_COMPRESSION": raylight_config.compact.delta_compression.name,
+                }
+                if raylight_config.compact.kv_cache_quant_enable:
+                    env_vars["RAYLIGHT_COMPACT_QUANTIZED_CACHE"] = "1"
+                    env_vars["RAYLIGHT_COMPACT_CACHE_QUANT_BITS"] = str(raylight_config.compact.kv_cache_quant_bits)
                 init_runtime_env["env_vars"] = env_vars
 
             gpu_actors.append(
@@ -922,6 +938,7 @@ def make_ray_actor_fn(
                     local_rank=local_rank,
                     device_id=0,
                     parallel_dict=parallel_dict,
+                    raylight_config=raylight_config
                 )
             )
         ray_actors["workers"] = gpu_actors
@@ -937,7 +954,7 @@ def make_ray_actor_fn(
     return _init_ray_actor
 
 
-def ensure_fresh_actors(ray_actors_init):
+def ensure_fresh_actors(ray_actors_init: Tuple[Dict[str, Any], Callable[[], Dict[str, Any]]]) -> Tuple[Dict[str, Any], List[Any], RaylightConfig]:
     """
     Ensures that the Ray actors are 'fresh' - i.e. if a model is currently 
     loaded, it kills and restarts them to ensure a clean slate.
@@ -988,10 +1005,10 @@ def ensure_fresh_actors(ray_actors_init):
                     pass
         
         # Re-initialize using the factory function (which closure-captures the config)
-        ray_actors = ray_actor_fn()
-        gpu_actors = ray_actors["workers"]
+        ray_actors = cast(Dict[str, Any], ray_actor_fn())
+        gpu_actors = cast(List[Any], ray_actors["workers"])
 
-    # Re-verify parallel_dict from the (potentially new) actors
-    parallel_dict = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
+    # Re-verify config from the (potentially new) actors
+    config = cast(RaylightConfig, cancellable_get(gpu_actors[0].get_raylight_config.remote()))
 
-    return ray_actors, gpu_actors, parallel_dict
+    return ray_actors, gpu_actors, config
