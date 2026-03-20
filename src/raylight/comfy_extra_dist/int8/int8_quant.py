@@ -76,6 +76,7 @@ def stochastic_round_int8_delta(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+@torch.compiler.disable
 def int8_forward_dynamic(
     x: Tensor,
     weight: Tensor,
@@ -98,6 +99,7 @@ def int8_forward_dynamic(
 
 
 @torch.no_grad()
+@torch.compiler.disable
 def int8_forward_dynamic_per_row(
     x: Tensor,
     weight: Tensor,

@@ -1,0 +1,3 @@
+When inside development container tests have to be run with 
+
+export PYTHONPATH=$PYTHONPATH:/root/ComfyUI/custom_nodes/raylight/src && export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib/python3.12/site-packages/nvidia/nccl/lib:/usr/local/lib/python3.12/site-packages/nvidia/nvshmem/lib:/usr/local/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib && export CUDA_VISIBLE_DEVICES=0 && python3 <path_to_test>

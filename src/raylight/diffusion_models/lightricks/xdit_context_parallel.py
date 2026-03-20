@@ -267,6 +267,7 @@ def usp_dit_forward(
     return x
 
 
+@torch.compiler.disable
 def usp_cross_attn_forward(
         self,
         x,

@@ -14,9 +14,9 @@ from raylight.distributed_modules.usp import USPInjectRegistry
 from raylight.distributed_modules.cfg import CFGParallelInjectRegistry
 
 
-from raylight.utils.common import patch_ray_tqdm, cleanup_memory
+from raylight.utils.common import patch_ray_tqdm
 from raylight.utils.gguf import check_mmap_leak
-from raylight.utils.memory import monitor_memory
+from raylight.utils.memory import monitor_memory, MemoryPolicy
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from raylight.comfy_dist.utils import cancellable_get
 from ray.exceptions import RayActorError
@@ -160,10 +160,7 @@ class RayWorker:
         # Mark the model as NOT loaded so the next run does a full disk reload
         # instead of trying to hot-load from the (now-empty) parameters.
         self.is_model_loaded = False
-        import gc as _gc
-        _gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.memory.teardown()
         print(f"[RayWorker {self.local_rank}] Pinned cache released via remote call.")
 
     # ------------------------------------------------------------------ init (continued)
@@ -171,6 +168,7 @@ class RayWorker:
     def _init_device_and_comms(self, local_rank):
         """Second phase of __init__: device, process group, device mesh."""
         self.device = torch.device(f"cuda:{self.device_id}")
+        self.memory = MemoryPolicy(device=self.device)
         self.device_mesh = None
         self.compute_capability = int("{}{}".format(*torch.cuda.get_device_capability()))
 
@@ -310,7 +308,7 @@ class RayWorker:
         from raylight.distributed_worker.model_context import get_context
         unet_path = getattr(self.model, "unet_path", "")
         ctx = get_context(unet_path, self.config)
-        is_destroyed = ctx.offload(self.model, self.lora_manager, self.state_cache, self.config)
+        is_destroyed = ctx.offload(self.model, self.lora_manager, self.state_cache, self.config, memory=self.memory)
         if is_destroyed:
             print(f"[RayWorker {self.local_rank}] Model offload resulted in destruction. Clearing reference.")
             self._teardown_pinned_cache()
@@ -325,43 +323,6 @@ class RayWorker:
         # self.current_sd_ref = None
         
         print(f"[RayWorker {self.local_rank}] Offload complete (Model object preserved for hot-reload).")
-
-    
-    def _common_offload_cleanup(self):
-        """Shared post-offload cleanup for all model formats."""
-        # Clear LoRA tracking for fresh re-application after reload
-        self.lora_manager.clear_tracking()
-        print(f"[RayWorker {self.local_rank}] LoRA tracking cleared.")
-        
-        # Move buffers to CPU if model still exists
-        if self.model is not None:
-            diffusion_model = getattr(self.model, "model", None)
-            if diffusion_model is not None:
-                try:
-                    for name, buf in diffusion_model.named_buffers():
-                        if buf is not None and buf.device.type == 'cuda':
-                            buf.data = buf.data.to('cpu', non_blocking=True)
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                except Exception as e:
-                    print(f"[RayWorker {self.local_rank}] Buffer cleanup warning: {e}")
-                
-                # Delete cached PE tensors
-                inner = getattr(diffusion_model, 'diffusion_model', None)
-                for attr in ['_cached_pe', 'cached_pe', 'pe_cache', '_pe']:
-                    if hasattr(diffusion_model, attr):
-                        delattr(diffusion_model, attr)
-                    if inner is not None and hasattr(inner, attr):
-                        delattr(inner, attr)
-        
-        # Force garbage collection and CUDA cleanup
-        cleanup_memory()
-        mem_now = torch.cuda.memory_allocated(self.device) / 1e9
-        print(f"[RayWorker {self.local_rank}] Post-Offload VRAM: {mem_now:.2f}GB")
-
-    def cleanup_memory(self):
-        cleanup_memory()
-
 
     def patch_cfg(self):
         if self.model is not None:
@@ -448,7 +409,7 @@ class RayWorker:
             print(f"[RayWorker {self.local_rank}] Clearing previous model to free memory before reload...")
             self._teardown_pinned_cache()
             self.model = None
-            cleanup_memory()
+            self.memory.after_model_swap()
         
         # FUNCTIONAL LOAD: Update references from return values
         self.model = ctx.load(state, self.config, self.state_cache)
@@ -472,7 +433,7 @@ class RayWorker:
                 print(f"[RayWorker {self.local_rank}] GGUF: Forcing immediate VRAM load...")
             self.model.load(self.device, force_patch_weights=True)
             self.model.current_device = self.device
-            cleanup_memory()
+            self.memory.after_reload()
             check_mmap_leak(unet_path)
 
         import ray
@@ -571,7 +532,7 @@ class RayWorker:
             if state:
                 # Clear old
                 self.model = None
-                cleanup_memory()
+                self.memory.after_model_swap()
                 
                 # Load new
                 from raylight.distributed_worker.model_context import get_context
@@ -670,7 +631,7 @@ class RayWorker:
         self.model = ctx.instantiate_model(state_dict, state, self.config)
         
         self.is_model_loaded = True
-        cleanup_memory()
+        self.memory.after_reload()
 
     def reload_model_if_needed(self, load_device=None):
         from raylight.distributed_worker.model_context import get_context
@@ -708,7 +669,7 @@ class RayWorker:
         ray.actor.exit_actor()
 
     def ray_vae_loader(self, vae_path):
-        self.vae_manager.load_vae(vae_path, self.config, self.state_cache)
+        self.vae_manager.load_vae(vae_path, self.config, self.state_cache, memory=self.memory)
         self.vae_model = self.vae_manager.vae_model
         # Return compression factors to avoid extra round-trips
         return (
@@ -718,10 +679,10 @@ class RayWorker:
 
     def ray_vae_offload(self):
         """Offload VAE from VRAM after all work-stealing chunks complete."""
-        self.vae_manager.offload_vae_from_device(self.config, self.lora_manager)
+        self.vae_manager.offload_vae_from_device(self.config, self.lora_manager, memory=self.memory)
 
     def ray_vae_release(self):
-        result = self.vae_manager.release_vae(self.local_rank)
+        result = self.vae_manager.release_vae(self.local_rank, memory=self.memory)
         self.vae_model = None
         return result
 

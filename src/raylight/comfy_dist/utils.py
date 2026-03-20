@@ -11,6 +11,27 @@ def get_ray_cluster_epoch():
     return _RAY_CLUSTER_EPOCH
 
 
+# Version-safe decorator factory for disabling torch.compile / torch._dynamo
+def _get_torch_compiler_disable_decorator():
+    try:
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+            return lambda: torch.compiler.disable
+    except Exception:
+        pass
+
+    # No-op decorator factory for older PyTorch / absent compiler
+    def _noop_factory():
+        def _noop(fn):
+            return fn
+
+        return _noop
+
+    return _noop_factory
+
+
+_torch_compiler_disable = _get_torch_compiler_disable_decorator()
+
+
 def clear_ray_cluster(ray_actors=None, reason=None):
     """Best-effort cleanup of Ray workers after a fatal workflow error."""
     global _RAY_CLUSTER_EPOCH
@@ -39,6 +60,7 @@ def clear_ray_cluster(ray_actors=None, reason=None):
 
 
 @torch.inference_mode()
+@_torch_compiler_disable()
 def tiled_scale_multidim(
     samples,
     function,

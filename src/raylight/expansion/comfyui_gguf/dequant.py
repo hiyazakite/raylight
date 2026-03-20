@@ -2,6 +2,31 @@
 import gguf
 import torch
 from tqdm import tqdm
+from packaging import version
+
+
+# Backward/forward-compatible way to decide whether to disable torch.compile
+def get_torch_compiler_disable_decorator():
+    """Return a decorator that disables torch.compile when available.
+
+    We force-disable compilation for GGUF dequant paths because calling
+    `as_subclass(torch.Tensor)` during tracing can trigger Dynamo internal
+    assertion failures across some PyTorch builds. It's safer to prevent
+    tracing here and let the surrounding compiled blocks call into the
+    dequant routines at runtime.
+    """
+    def dummy_decorator(*args, **kwargs):
+        def noop(x):
+            return x
+
+        return noop
+
+    if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+        return torch.compiler.disable
+    return dummy_decorator
+
+
+torch_compiler_disable = get_torch_compiler_disable_decorator()
 
 
 def _const_like(ref, values, dtype, shape=None):
@@ -38,6 +63,7 @@ def is_quantized(tensor):
     return not is_torch_compatible(tensor)
 
 
+@torch_compiler_disable()
 def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
     qtype = getattr(tensor, "tensor_type", None)
     

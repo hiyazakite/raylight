@@ -66,6 +66,8 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
         n = super().clone(*args, **kwargs)
         n.__class__ = RaylightModelPatcher
         n.pinned_param_cache = getattr(self, "pinned_param_cache", None)
+        # Mark clones so __del__ doesn't destroy the shared cache.
+        n._is_cache_owner = False
         return n
 
     # ------------------------------------------------------- pin guard
@@ -240,6 +242,12 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
         self.object_patches_backup.clear()
 
     def __del__(self):
+        # Only the original model (cache owner) may clean up the pinned
+        # cache.  Clones share the same cache object — if a clone's
+        # __del__ ran cleanup(), it would destroy the cache while the
+        # original model still relies on it for hot-reload.
+        if not getattr(self, "_is_cache_owner", True):
+            return
         cache = getattr(self, "pinned_param_cache", None)
         if cache is not None:
             try:
@@ -323,6 +331,7 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
         n.is_cpu_offload = self.is_cpu_offload
         # Share the shard cache reference — both patcher instances back the same model
         n.fsdp_shard_cache = getattr(self, "fsdp_shard_cache", None)
+        n._is_cache_owner = False
 
         return n
 
@@ -593,6 +602,8 @@ class FSDPModelPatcher(comfy.model_patcher.ModelPatcher):
                 pass
 
     def __del__(self):
+        if not getattr(self, "_is_cache_owner", True):
+            return
         try:
             self.release_memory()
         except:

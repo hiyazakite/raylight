@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import torch
-from raylight.distributed_modules.attention.standard import StandardAttentionBackend
+from raylight.distributed_modules.attention.backends.standard import StandardAttentionBackend
 
 def run_test():
     print("Testing StandardAttentionBackend with a mask...")

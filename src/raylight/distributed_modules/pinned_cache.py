@@ -479,11 +479,11 @@ class PinnedParamCache(BasePinnedCache):
                 self._cpu_params[name] = pinned
                 needs_sync = True
             else:
-                # Already on CPU — pin in-place: pin_memory() allocates a
-                # new page-locked tensor, then we swap param.data to it so
-                # the original unpinned tensor is freed immediately (refcount
-                # drops to 0).  Net RAM delta ≈ one param's worth at peak.
-                pinned = self._pin(param.data.detach().clone())
+                # Already on CPU — allocate a pinned buffer and copy in one
+                # shot.  Avoids the transient unpinned clone that
+                # .detach().clone().pin_memory() would create.
+                pinned = torch.empty_like(param.data, device="cpu").pin_memory()
+                pinned.copy_(param.data)
                 self._cpu_params[name] = pinned
                 param.data = pinned          # swap — original freed by RC
                 pinned_cpu += 1
@@ -496,7 +496,8 @@ class PinnedParamCache(BasePinnedCache):
                 self._cpu_buffers[name] = pinned
                 needs_sync = True
             else:
-                pinned = self._pin(buf.data.detach().clone())
+                pinned = torch.empty_like(buf.data, device="cpu").pin_memory()
+                pinned.copy_(buf.data)
                 self._cpu_buffers[name] = pinned
                 buf.data = pinned
             buf_count += 1
@@ -749,8 +750,14 @@ class SharedPinnedParamCache(BasePinnedCache):
             self._cpu_params[name] = view
             if i % self._world_size == self._local_rank:
                 self._owned_params.add(name)
-                # Copy this param — our responsibility
-                view.copy_(param_dict[name].data.cpu())
+                # DMA directly from CUDA into host-registered shm —
+                # avoids the temporary pageable CPU tensor that
+                # .data.cpu() would allocate.
+                src = param_dict[name].data
+                if src.device.type == "cuda":
+                    view.copy_(src)          # CUDA→registered-host DMA
+                else:
+                    view.copy_(src)          # CPU memcpy
 
         # Buffers are tiny; rank 0 copies them all.
         for i, (name, off, nb, shape, dtype) in enumerate(buffer_layout):
@@ -760,7 +767,11 @@ class SharedPinnedParamCache(BasePinnedCache):
             self._cpu_buffers[name] = view
             if i % self._world_size == self._local_rank:
                 self._owned_buffers.add(name)
-                view.copy_(buf_dict[name].data.cpu())
+                src = buf_dict[name].data
+                if src.device.type == "cuda":
+                    view.copy_(src)
+                else:
+                    view.copy_(src)
 
         # ── Step 4: Barrier — all copies complete ──────────────────────
         if dist.is_initialized():

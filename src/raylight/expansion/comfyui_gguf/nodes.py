@@ -313,6 +313,14 @@ class RayGGUFLoader:
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
                 "cache_patched_weights": ("BOOLEAN", {"default": False}),
+                "torch_compile": (
+                    ["disabled", "inductor", "inductor_reduce_overhead"],
+                    {"default": "disabled", "tooltip": "Apply torch.compile to transformer blocks for faster inference. 'inductor' uses Triton codegen; 'inductor_reduce_overhead' adds CUDA-graph wrapping around compiled kernels. First run will be slow due to compilation warmup."},
+                ),
+                "torch_compile_dynamic": (
+                    ["auto", "true", "false"],
+                    {"default": "auto", "tooltip": "Dynamic shape tracing. 'auto': starts static, switches to dynamic on shape change. 'true': always symbolic shapes (avoids recompiles but slightly slower kernels). 'false': always static (fastest kernels, recompiles on any shape change)."},
+                ),
             },
         }
 
@@ -329,6 +337,8 @@ class RayGGUFLoader:
         dequant_dtype,
         patch_dtype,
         cache_patched_weights=False,
+        torch_compile="disabled",
+        torch_compile_dynamic="auto",
     ):
         ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
         parallel_dict: Any = parallel_dict
@@ -421,9 +431,36 @@ class RayGGUFLoader:
 
         ray.get(patched_futures)
 
-        # FINAL MEMORY TRIM: Sweep each actor to reclaim memory from initialization
-        for actor in gpu_actors:
-             actor.cleanup_memory.remote()
+        # Optional torch.compile
+        if torch_compile != "disabled":
+            from raylight.nodes import _check_compile_compatible, _discover_compile_keys
+            compile_ok, compile_reason = _check_compile_compatible(unet_name, parallel_dict, backend=torch_compile)
+            if not compile_ok:
+                print(f"[Raylight] WARNING: torch.compile skipped — {compile_reason}")
+            else:
+                import torch as _torch
+                from comfy_api.torch_helpers import set_torch_compile_wrapper
+                compile_mode = "reduce-overhead" if torch_compile == "inductor_reduce_overhead" else None
+                dynamic_map = {"auto": None, "true": True, "false": False}
+                compile_dynamic = dynamic_map[torch_compile_dynamic]
+                def _apply_compile(model, mode, dynamic):
+                    import torch
+                    torch._dynamo.config.cache_size_limit = 64
+                    try:
+                        torch._dynamo.config.recompile_limit = 256
+                    except Exception:
+                        pass
+                    m = model.clone()
+                    diffusion_model = m.get_model_object("diffusion_model")
+                    keys = _discover_compile_keys(diffusion_model)
+                    set_torch_compile_wrapper(model=m, backend="inductor", mode=mode, dynamic=dynamic, keys=keys)
+                    return m
+                compile_futures = [actor.model_function_runner.remote(_apply_compile, compile_mode, compile_dynamic) for actor in gpu_actors]
+                ray.get(compile_futures)
+                parts = ["transformer blocks"]
+                if compile_mode: parts.append(f"mode={compile_mode}")
+                if torch_compile_dynamic != "auto": parts.append(f"dynamic={torch_compile_dynamic}")
+                print(f"[Raylight] torch.compile (inductor, {', '.join(parts)}) applied to all GGUF workers")
 
         return (ray_actors,)
 

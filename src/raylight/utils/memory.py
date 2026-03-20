@@ -1,9 +1,166 @@
 import os
 import sys
 import glob
+import time
+import ctypes
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import psutil
 import gc
+
+
+# ---------------------------------------------------------------------------
+# MemoryPolicy — centralised memory lifecycle decisions
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MemorySnapshot:
+    """Point-in-time memory view.  Read-only, safe to log / serialise."""
+    vram_allocated_gb: float = 0.0
+    vram_reserved_gb: float = 0.0
+    rss_gb: float = 0.0
+    shm_gb: float = 0.0
+    mmap_gb: float = 0.0
+
+
+class MemoryPolicy:
+    """Centralised memory cleanup / query controller.
+
+    **Coupling contract** — this class depends *only* on PyTorch, the OS,
+    and stdlib.  It knows nothing about model formats, contexts, workers, or
+    Ray.  Callers declare **intent** (``after_offload``, ``after_reload``,
+    ``before_inference``); the policy decides *what* to do and *when*.
+
+    Designed to be instantiated once per ``RayWorker`` (or per-process)
+    and passed as a plain parameter wherever cleanup is needed.  Every
+    public method is safe to call with ``policy=None`` via the module-level
+    ``get_policy()`` / ``NullPolicy`` fallback — no sentinel checks needed
+    at call sites.
+    """
+
+    def __init__(
+        self,
+        device: Optional[torch.device] = None,
+        debounce_sec: float = 0.5,
+    ):
+        self._device = device
+        self._debounce_sec = debounce_sec
+        self._last_cleanup: float = 0.0
+
+    # ─── Intent-based API ────────────────────────────────────
+
+    def after_offload(self) -> None:
+        """Full cleanup after any offload path."""
+        self._sync()
+        self._debounced_gc()
+        self._release_cuda_cache()
+        self._malloc_trim()
+
+    def after_reload(self) -> None:
+        """Light sync after hot-reload — avoid gc before inference."""
+        self._sync()
+
+    def after_model_swap(self) -> None:
+        """Called between tear-down of old model and load of new one."""
+        self._debounced_gc()
+        self._release_cuda_cache()
+        self._malloc_trim()
+
+    def before_inference(self) -> None:
+        """Ensure GPU is quiesced before a forward pass."""
+        self._sync()
+
+    def teardown(self) -> None:
+        """Aggressive cleanup — final release, bypass debounce."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        self._malloc_trim()
+
+    # ─── Queries ─────────────────────────────────────────────
+
+    def vram_allocated_gb(self) -> float:
+        """Current VRAM allocated (GB) on this policy's device."""
+        if not torch.cuda.is_available():
+            return 0.0
+        try:
+            return torch.cuda.memory_allocated(self._device) / 1e9
+        except Exception:
+            return 0.0
+
+    def snapshot(self) -> MemorySnapshot:
+        """Point-in-time memory view for logging."""
+        va, vr = get_vram_gb(self._device)
+        return MemorySnapshot(
+            vram_allocated_gb=va,
+            vram_reserved_gb=vr,
+            rss_gb=get_process_rss_gb(),
+            shm_gb=get_shm_usage_gb(),
+            mmap_gb=get_gguf_mmap_gb(),
+        )
+
+    def log_vram(self, tag: str) -> None:
+        """One-line VRAM log — replaces ad-hoc memory_allocated prints."""
+        print(f"[{tag}] VRAM: {self.vram_allocated_gb():.2f} GB")
+
+    # ─── Private ─────────────────────────────────────────────
+
+    def _sync(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self._device)
+
+    def _release_cuda_cache(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _debounced_gc(self) -> None:
+        now = time.monotonic()
+        if now - self._last_cleanup < self._debounce_sec:
+            return
+        self._last_cleanup = now
+        gc.collect()
+        try:
+            import comfy.model_management
+            comfy.model_management.soft_empty_cache()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.ipc_collect()
+
+    @staticmethod
+    def _malloc_trim() -> None:
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+
+
+class _NullPolicy(MemoryPolicy):
+    """No-op drop-in — all intent methods silently do nothing.
+
+    Used as the default when no real policy is available, so callers
+    never need ``if policy is not None:`` guards.
+    """
+
+    def after_offload(self) -> None: ...
+    def after_reload(self) -> None: ...
+    def after_model_swap(self) -> None: ...
+    def before_inference(self) -> None: ...
+    def teardown(self) -> None: ...
+    def log_vram(self, tag: str) -> None: ...
+
+
+#: Module-level null fallback — importers can use as default parameter.
+NULL_POLICY: MemoryPolicy = _NullPolicy()
+
+
+# ---------------------------------------------------------------------------
+# Original helper functions (unchanged)
+# ---------------------------------------------------------------------------
 
 def get_system_ram_gb():
     """Returns (used_gb, total_gb, available_gb, cached_gb)."""
