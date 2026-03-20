@@ -1,6 +1,6 @@
 import os
 import torch
-from raylight.utils.memory import monitor_memory
+from raylight.utils.memory import monitor_memory, MemoryPolicy, NULL_POLICY
 from raylight.utils.common import cleanup_memory, force_malloc_trim
 
 from typing import Optional, Any
@@ -19,7 +19,8 @@ class VaeManager:
         self, 
         vae_path: str, 
         config: WorkerConfig, 
-        state_cache: Any
+        state_cache: Any,
+        memory: MemoryPolicy = NULL_POLICY,
     ) -> Optional[Any]:
         from raylight.distributed_worker.model_context import get_context, ModelState
         from raylight.comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
@@ -51,13 +52,12 @@ class VaeManager:
 
         self.vae_model = vae_model
         
-        # Cleanup
-        cleanup_memory()
+        memory.after_reload()
         
         return vae_model
 
 
-    def offload_vae_from_device(self, config: WorkerConfig, lora_manager: Optional[Any] = None):
+    def offload_vae_from_device(self, config: WorkerConfig, lora_manager: Optional[Any] = None, memory: MemoryPolicy = NULL_POLICY):
         """Explicitly offload VAE from VRAM back to CPU/mmap after work-stealing completes."""
         # Release per-job caches (mmap buffer, dtype decision)
         self._mmap_cache = None
@@ -66,11 +66,10 @@ class VaeManager:
             return
         from raylight.distributed_worker.model_context import VAEContext
         vae_ctx = VAEContext(use_mmap=config.parallel_dict.get("use_mmap", True))
-        vae_ctx.offload(self.vae_model, lora_manager, {}, config)
+        vae_ctx.offload(self.vae_model, lora_manager, {}, config, memory=memory)
         print(f"[RayWorker {config.local_rank}] VAE offloaded from VRAM.")
-        force_malloc_trim()
 
-    def release_vae(self, local_rank: int):
+    def release_vae(self, local_rank: int, memory: MemoryPolicy = NULL_POLICY):
         """Explicitly release VAE model from memory to free RAM for other operations."""
         self._mmap_cache = None
         self._cached_dtype = None
@@ -79,11 +78,7 @@ class VaeManager:
             del self.vae_model
             self.vae_model = None
             
-            # Aggressive cleanup (force=True bypasses debounce for teardown)
-            cleanup_memory(force=True)
-            
-            # Force OS to reclaim freed memory
-            force_malloc_trim()
+            memory.teardown()
             
             print(f"[RayWorker {local_rank}] VAE released.")
         return True

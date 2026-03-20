@@ -12,6 +12,16 @@ import torch
 from typing import Optional, Dict
 
 
+_compiler_disable = getattr(torch, 'compiler', None)
+_compiler_disable = getattr(_compiler_disable, 'disable', None) if _compiler_disable else None
+
+def _maybe_compiler_disable(fn):
+    """Apply @torch.compiler.disable if available, else return fn unchanged."""
+    if _compiler_disable is not None:
+        return _compiler_disable(fn)
+    return fn
+
+
 class MaterializedTensor(torch.Tensor):
     """A regular tensor that remembers its mmap source for pointer-swap offload."""
 
@@ -38,6 +48,7 @@ class MaterializedTensor(torch.Tensor):
         # Keep reference to original mmap for pointer-swap
         object.__setattr__(self, '_mmap_ref', mmap_ref)
 
+    @_maybe_compiler_disable
     def to(self, *args, **kwargs) -> 'MaterializedTensor':
         """Preserve MaterializedTensor type and mmap ref during transfer."""
         device = None
@@ -130,6 +141,7 @@ class LazySafetensor(torch.Tensor):
     def is_mmap(self) -> bool:
         return object.__getattribute__(self, '_is_mmap')
 
+    @_maybe_compiler_disable
     def to(self, *args, **kwargs) -> MaterializedTensor:
         """Materialize and transfer to target device.
 

@@ -119,14 +119,28 @@ _orig_unload_all_models = comfy.model_management.unload_all_models
 
 
 def _patched_unload_all_models():
-    """Drop-in replacement that also frees Ray worker pinned caches.
+    """Drop-in replacement that cleans orphaned /dev/shm on full unload.
 
-    ComfyUI calls this from the "Unload model" / "Free model and node cache"
-    buttons.  Internal Raylight samplers must use ``_orig_unload_all_models``
-    to avoid destroying the hot-reload cache on every sample.
+    ComfyUI calls ``unload_all_models`` from multiple sites:
+
+    * ``main.py`` — "Unload model" / "Free model and node cache" buttons
+    * ``execution.py`` — OOM recovery, ``DISABLE_SMART_MEMORY`` end-of-prompt
+    * Custom nodes that want a full VRAM flush
+
+    We must NOT call ``release_all_pinned_caches()`` here because the
+    pinned RAM cache is designed to survive across prompts — that's the
+    whole point of hot-reload.  Pinned caches are released via explicit
+    paths instead:
+
+    * ``_teardown_pinned_cache`` — on model switch (``load_unet``)
+    * ``release_pinned_cache`` — ``RayWorker.kill()`` / actor shutdown
+    * ``release_all_pinned_caches`` — can still be invoked directly by
+      custom nodes that need a hard reset.
+
+    Orphaned /dev/shm segments from dead actors are cleaned up below.
     """
     _orig_unload_all_models()
-    release_all_pinned_caches()
+    _cleanup_stale_shm()
 
 
 comfy.model_management.unload_all_models = _patched_unload_all_models
@@ -666,6 +680,42 @@ class RayInitializerAdvanced(RayInitializer):
 # ---------------------------------------------------------------------------
 # INT8 architecture exclusion lists (shared with standalone INT8 loader)
 # ---------------------------------------------------------------------------
+# Known transformer block attribute names across architectures.
+_TRANSFORMER_BLOCK_NAMES = [
+    "double_blocks", "single_blocks",   # Flux / HunyuanDiT
+    "layers",                            # Lumina / Z-Image
+    "transformer_blocks",                # SD / SDXL
+    "blocks",                            # generic
+    "visual_transformer_blocks",         # Qwen
+    "text_transformer_blocks",           # Qwen
+]
+
+
+def _discover_compile_keys(diffusion_model) -> list[str]:
+    """Find per-block compile keys for a diffusion model.
+
+    Compiling individual transformer blocks avoids tracing the outer forward
+    (which may contain concrete-int ops that crash Inductor, e.g. Lumina
+    pos_ids_x) while still getting Triton speedups on the heavy matmul path.
+    Falls back to ["diffusion_model"] if no known block attributes are found.
+    """
+    keys: list[str] = []
+    for layer_name in _TRANSFORMER_BLOCK_NAMES:
+        if hasattr(diffusion_model, layer_name):
+            blocks = getattr(diffusion_model, layer_name)
+            for i in range(len(blocks)):
+                keys.append(f"diffusion_model.{layer_name}.{i}")
+    return keys if keys else ["diffusion_model"]
+
+
+def _check_compile_compatible(unet_name: str, parallel_dict: dict, backend: str = "inductor") -> tuple[bool, str]:
+    """Check if torch.compile is safe for this model + config. Returns (ok, reason)."""
+    # VRAM limit check applies to ALL backends — device transitions break everything
+    if parallel_dict.get("vram_limit_bytes", 0) > 0:
+        return False, "partial VRAM load (vram_limit_gb is set) — streams layers CPU↔GPU dynamically, causing continuous recompilation"
+    return True, ""
+
+
 def _guess_int8_exclusions(unet_name: str) -> list:
     """Best-effort architecture detection from filename for INT8 layer exclusions."""
     try:
@@ -700,6 +750,14 @@ class RayUNETLoader:
                     "RAY_ACTORS_INIT",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
+                "torch_compile": (
+                    ["disabled", "inductor", "inductor_reduce_overhead"],
+                    {"default": "disabled", "tooltip": "Apply torch.compile to transformer blocks for faster inference. 'inductor' uses Triton codegen; 'inductor_reduce_overhead' adds CUDA-graph wrapping around compiled kernels. First run will be slow due to compilation warmup."},
+                ),
+                "torch_compile_dynamic": (
+                    ["auto", "true", "false"],
+                    {"default": "auto", "tooltip": "Dynamic shape tracing. 'auto': starts static, switches to dynamic on shape change. 'true': always symbolic shapes (avoids recompiles but slightly slower kernels). 'false': always static (fastest kernels, recompiles on any shape change)."},
+                ),
             },
         }
 
@@ -713,7 +771,7 @@ class RayUNETLoader:
     def IS_CHANGED(cls, **kwargs):
         return get_ray_cluster_epoch()
 
-    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype):
+    def load_ray_unet(self, ray_actors_init, unet_name, weight_dtype, torch_compile="disabled", torch_compile_dynamic="auto"):
         with monitor_memory("RayUNETLoader.load_ray_unet"):
             ray_actors, gpu_actors, parallel_dict = ensure_fresh_actors(ray_actors_init)
 
@@ -780,6 +838,36 @@ class RayUNETLoader:
                 for i in range(0, len(gpu_actors), _PATCH_BATCH):
                     batch = gpu_actors[i:i + _PATCH_BATCH]
                     cancellable_get([a.patch_cfg.remote() for a in batch])
+
+        # Optional torch.compile
+        if torch_compile != "disabled":
+            compile_ok, compile_reason = _check_compile_compatible(unet_name, parallel_dict, backend=torch_compile)
+            if not compile_ok:
+                print(f"[Raylight] WARNING: torch.compile skipped — {compile_reason}")
+            else:
+                import torch as _torch
+                from comfy_api.torch_helpers import set_torch_compile_wrapper
+                compile_mode = "reduce-overhead" if torch_compile == "inductor_reduce_overhead" else None
+                dynamic_map = {"auto": None, "true": True, "false": False}
+                compile_dynamic = dynamic_map[torch_compile_dynamic]
+                def _apply_compile(model, mode, dynamic):
+                    import torch
+                    torch._dynamo.config.cache_size_limit = 64
+                    try:
+                        torch._dynamo.config.recompile_limit = 256
+                    except Exception:
+                        pass
+                    m = model.clone()
+                    diffusion_model = m.get_model_object("diffusion_model")
+                    keys = _discover_compile_keys(diffusion_model)
+                    set_torch_compile_wrapper(model=m, backend="inductor", mode=mode, dynamic=dynamic, keys=keys)
+                    return m
+                compile_futures = [actor.model_function_runner.remote(_apply_compile, compile_mode, compile_dynamic) for actor in gpu_actors]
+                cancellable_get(compile_futures)
+                parts = ["transformer blocks"]
+                if compile_mode: parts.append(f"mode={compile_mode}")
+                if torch_compile_dynamic != "auto": parts.append(f"dynamic={torch_compile_dynamic}")
+                print(f"[Raylight] torch.compile (inductor, {', '.join(parts)}) applied to all workers")
 
         # Track workers globally so the unload hook can reach them
         _register_workers(gpu_actors)

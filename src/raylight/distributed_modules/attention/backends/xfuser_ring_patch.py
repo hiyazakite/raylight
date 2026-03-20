@@ -73,7 +73,7 @@ def compute_chunked_lse(q_t, k_t, softmax_scale, mask=None, causal=False):
 
             if mask is not None:
                 m_chunk = mask[:, :, i:end, :] if mask.shape[2] > 1 else mask
-                attn_chunk.add_(m_chunk)
+                attn_chunk = attn_chunk + m_chunk
 
             if causal:
                 row_indices = torch.arange(i, end, device=q_t.device).view(1, 1, -1, 1)

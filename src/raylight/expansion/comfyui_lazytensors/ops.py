@@ -7,7 +7,7 @@ wrappers to replace module parameters without triggering materialization/copy.
 import torch
 import comfy.ops
 import comfy.model_management
-from .lazy_tensor import LazySafetensor
+from .lazy_tensor import LazySafetensor, _maybe_compiler_disable
 from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
 
 def move_patch_to_device(item, device):
@@ -75,6 +75,7 @@ class SafetensorLayer(torch.nn.Module):
             
         return weight
 
+    @_maybe_compiler_disable
     def cast_bias_weight(self, input=None, dtype=None, device=None, bias_dtype=None):
         if input is not None:
             if dtype is None:
