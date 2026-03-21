@@ -957,23 +957,39 @@ def make_ray_actor_fn(
     return _init_ray_actor
 
 
-def ensure_fresh_actors(ray_actors_init: Tuple[Dict[str, Any], Callable[[], Dict[str, Any]]]) -> Tuple[Dict[str, Any], List[Any], RaylightConfig]:
+def ensure_fresh_actors(ray_actors_init: Union[List[Any], Tuple[Any, ...]]) -> Tuple[Dict[str, Any], List[Any], RaylightConfig]:
     """
-    Ensures that the Ray actors are 'fresh' - i.e. if a model is currently 
-    loaded, it kills and restarts them to ensure a clean slate.
+    Ensures that the Ray actors are 'fresh'. 
+    Restarts if:
+      1. A model is currently loaded (zero-state safety).
+      2. The attention/parallelism configuration has changed.
+      3. An actor has crashed or is unresponsive.
     """
-    ray_actors, ray_actor_fn = ray_actors_init
+    if len(ray_actors_init) == 3:
+        ray_actors, ray_actor_fn, new_config = ray_actors_init
+    else:
+        # Backward compatibility for old loaders
+        ray_actors, ray_actor_fn = ray_actors_init
+        new_config = None
+
     gpu_actors = ray_actors["workers"]
 
     needs_restart = False
     try:
-        # Check first actor; if it has a model, we force a restart for 'freshness'
+        # 1. Check if model is loaded
         is_loaded = cancellable_get(gpu_actors[0].get_is_model_loaded.remote())
         if is_loaded:
             print("[Raylight] Workers already have a model loaded. Restarting for fresh slate...")
             needs_restart = True
+        
+        # 2. Check for configuration change
+        if not needs_restart and new_config is not None:
+            old_config = cast(RaylightConfig, cancellable_get(gpu_actors[0].get_raylight_config.remote()))
+            # Compare strategy and device config for changes that require restart
+            if old_config.strategy != new_config.strategy or old_config.device.world_size != new_config.device.world_size:
+                print(f"[Raylight] Configuration change detected ({old_config.strategy.attention_type.name} -> {new_config.strategy.attention_type.name}). Restarting workers...")
+                needs_restart = True
     except (RayActorError, IndexError, Exception):
-        # Actor already dead, crashed, or some other issue
         print("[Raylight] Workers in bad state or crashed. Restarting...")
         needs_restart = True
 

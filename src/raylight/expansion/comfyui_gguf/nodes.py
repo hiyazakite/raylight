@@ -36,6 +36,68 @@ update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 
 
+def _is_ltxav_av_block(block) -> bool:
+    """Return True if a transformer block is a dual-stream LTXAV audio-video block.
+
+    LTXAV's BasicAVTransformerBlock is identified by its audio-specific attention
+    modules. This check is used to filter blocks that cannot be compiled with GGUF.
+    """
+    return hasattr(block, "audio_attn1")
+
+
+def _gguf_discover_compile_keys(diffusion_model) -> list[str]:
+    """Build per-block compile keys for GGUF models, excluding blocks that would thrash.
+
+    GGUF applies torch.compiler.disable on every linear layer's dequant path.
+    When Dynamo traces a transformer block that contains GGUF graph breaks, it
+    creates resume functions that capture the local stack state (___stack0).
+    Those captured tensors are freshly allocated on every forward call, so their
+    addresses always change, invalidating Dynamo's guard every step. This causes
+    the model to recompile on every single denoising step, hammering the
+    accumulated_recompile_limit and degrading performance severely.
+
+    LTXAV-style dual-stream blocks (audio_attn1 present) are the specific case
+    where this matters: they have many intermediate tensors, del-statements
+    between GGUF graph breaks, and a complex dual-stream data flow that produces
+    many resume points. Excluding them from compile keys stops the thrashing.
+
+    Other architectures (Flux, SD, SDXL, ...) compile as normal.
+    """
+    from raylight.nodes import _TRANSFORMER_BLOCK_NAMES, _discover_compile_keys
+
+    # Check whether all discovered transformer blocks are LTXAV-style.
+    # If the model has no transformer blocks at all, fall back to the standard path.
+    for layer_name in _TRANSFORMER_BLOCK_NAMES:
+        blocks = getattr(diffusion_model, layer_name, None)
+        if blocks is None:
+            continue
+        av_blocks = [b for b in blocks if _is_ltxav_av_block(b)]
+        if av_blocks:
+            non_av = [b for b in blocks if not _is_ltxav_av_block(b)]
+            n_skipped = len(av_blocks)
+            print(
+                f"[Raylight GGUF compile] Skipping {n_skipped} LTXAV audio-video block(s) "
+                f"from torch.compile: GGUF dequant graph breaks inside these blocks cause "
+                f"Dynamo resume-function cache thrashing (___stack0 invalidation every step). "
+                f"The remaining {len(non_av)} block(s) will be compiled normally."
+            )
+            if non_av:
+                # Only compile the non-LTXAV-style blocks (unusual edge case)
+                keys = []
+                for i, b in enumerate(blocks):
+                    if not _is_ltxav_av_block(b):
+                        keys.append(f"diffusion_model.{layer_name}.{i}")
+                return keys
+
+            # All blocks are LTXAV-style — nothing to compile at block level.
+            # Return "diffusion_model" so the outer forward is still wrapped;
+            # the actual per-GGUF-layer disable annotations prevent any tracing.
+            return ["diffusion_model"]
+
+    # No LTXAV blocks found — standard path.
+    return _discover_compile_keys(diffusion_model)
+
+
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
     # Instance attributes:
@@ -432,7 +494,7 @@ class RayGGUFLoader:
 
         # Optional torch.compile
         if torch_compile != "disabled":
-            from raylight.nodes import _check_compile_compatible, _discover_compile_keys
+            from raylight.nodes import _check_compile_compatible
             compile_ok, compile_reason = _check_compile_compatible(unet_name, config, backend=torch_compile)
             if not compile_ok:
                 print(f"[Raylight] WARNING: torch.compile skipped — {compile_reason}")
@@ -451,7 +513,7 @@ class RayGGUFLoader:
                         pass
                     m = model.clone()
                     diffusion_model = m.get_model_object("diffusion_model")
-                    keys = _discover_compile_keys(diffusion_model)
+                    keys = _gguf_discover_compile_keys(diffusion_model)
                     set_torch_compile_wrapper(model=m, backend="inductor", mode=mode, dynamic=dynamic, keys=keys)
                     return m
                 compile_futures = [actor.model_function_runner.remote(_apply_compile, compile_mode, compile_dynamic) for actor in gpu_actors]

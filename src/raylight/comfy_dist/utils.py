@@ -62,7 +62,7 @@ def clear_ray_cluster(ray_actors=None, reason=None):
     _RAY_CLUSTER_EPOCH += 1
 
 
-@torch.inference_mode()
+@torch.no_grad()
 @_torch_compiler_disable()
 def tiled_scale_multidim(
     samples,
