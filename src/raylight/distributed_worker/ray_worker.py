@@ -372,25 +372,61 @@ class RayWorker:
         return info
 
 
-    def apply_dit_fast_attn(self, config: dict):
-        """Apply Temporal Attention Caching (DiTFastAttn) to the model.
-        
-        Wraps attention modules to reuse outputs across denoising timesteps.
+    def apply_cachedit(self, config: dict):
+        """Apply CacheDiT inter-step caching to the local transformer.
+
+        Resolves model_type == "Auto" from the loaded transformer class, then
+        patches transformer.forward with the lightweight warmup+skip cache.
+        Config keys: enabled, model_type, warmup_steps, skip_interval, noise_scale.
         """
         if self.model is None:
-            print(f"[RayWorker {self.local_rank}] No model loaded, skipping DiTFastAttn.")
+            print(f"[RayWorker {self.local_rank}] No model loaded, skipping CacheDiT.")
             return False
-            
-        from raylight.distributed_modules.temporal_cache import apply_temporal_caching
-        
-        print(f"[RayWorker {self.local_rank}] Applying DiTFastAttn temporal caching with config: {config}")
-        
-        # Apply the monkey-patches and get the shared step tracker
-        tracker = apply_temporal_caching(self.model, config)
-        
-        # Store the tracker so the sampler manager can step it
-        self.sampler_manager.temporal_cache_tracker = tracker
-        
+
+        from raylight.comfy_extra_dist.nodes_cachedit import (
+            MODEL_PRESETS,
+            CacheDiTConfig,
+            _auto_detect_model_type,
+            _cleanup_transformer_cache,
+            _enable_lightweight_cache,
+        )
+
+        if not config.get("enabled", True):
+            transformer = getattr(getattr(self.model, "model", None), "diffusion_model", self.model)
+            _cleanup_transformer_cache(transformer)
+            print(f"[RayWorker {self.local_rank}] CacheDiT disabled — cache cleared.")
+            return True
+
+        # Resolve transformer
+        transformer = getattr(getattr(self.model, "model", None), "diffusion_model", None)
+        if transformer is None:
+            transformer = self.model
+
+        # Resolve model type
+        model_type = config.get("model_type", "Auto")
+        if model_type == "Auto":
+            model_type = _auto_detect_model_type(transformer)
+
+        preset = MODEL_PRESETS.get(model_type, MODEL_PRESETS["Custom"])
+        warmup = config.get("warmup_steps", 0)
+        skip = config.get("skip_interval", 0)
+        noise = config.get("noise_scale", -1.0)
+
+        resolved_warmup = warmup if warmup > 0 else preset.warmup_steps
+        resolved_skip = skip if skip > 0 else preset.skip_interval
+        resolved_noise = noise if noise >= 0.0 else preset.noise_scale
+
+        print(
+            f"[RayWorker {self.local_rank}] CacheDiT: model_type={model_type}, "
+            f"warmup={resolved_warmup}, skip={resolved_skip}, noise={resolved_noise:.4f}"
+        )
+
+        _enable_lightweight_cache(
+            transformer,
+            warmup_steps=resolved_warmup,
+            skip_interval=resolved_skip,
+            noise_scale=resolved_noise,
+        )
         return True
 
 

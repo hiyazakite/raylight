@@ -138,15 +138,25 @@ def tiled_scale_multidim(
 
         # handle entire input fitting in a single tile
         if all(s.shape[d + 2] <= tile[d] for d in range(dims)):
-            output[b:b + 1] = function(s).to(output_device)
+            # Cast explicitly to float32 so the output buffer (float32) is always correct
+            # regardless of whether the decode_fn returns bf16 or fp32.
+            output[b:b + 1] = function(s).to(dtype=torch.float32, device=output_device)
             if pbar is not None:
                 pbar.update(1)
             continue
 
-        out = torch.zeros([s.shape[0], out_channels] + mult_list_upscale(s.shape[2:]), device=output_device)
-        out_div = torch.zeros([s.shape[0], out_channels] + mult_list_upscale(s.shape[2:]), device=output_device)
+        # #4: accumulate on GPU in native dtype (bf16 from VAE) — avoids N per-tile D2H copies.
+        # out / out_div are lazily allocated on the first tile so we pick up ps.device / ps.dtype
+        # automatically without a probe call.
+        out = None
+        out_div = None
+        acc_shape = [s.shape[0], out_channels] + mult_list_upscale(s.shape[2:])
 
         positions = [range(0, s.shape[d + 2] - overlap[d], tile[d] - overlap[d]) if s.shape[d + 2] > tile[d] else [0] for d in range(dims)]
+
+        # Cache feathered masks by tile output shape — all interior tiles share one shape
+        # so the feathering computation and allocation happen only once per batch element.
+        _mask_cache: dict = {}
 
         for it in itertools.product(*positions):
             s_in = s
@@ -158,17 +168,34 @@ def tiled_scale_multidim(
                 s_in = s_in.narrow(d + 2, pos, l)
                 upscaled.append(round(get_pos(d, pos)))
 
-            ps = function(s_in).to(output_device)
-            mask = torch.ones_like(ps)
+            # #5: keep ps on GPU in native dtype — no .float() and no .to(output_device) here.
+            # The single cast to float32 + D2H happens once at the end of the batch element.
+            ps = function(s_in)
 
-            for d in range(2, dims + 2):
-                feather = round(get_scale(d - 2, overlap[d - 2]))
-                if feather >= mask.shape[d]:
-                    continue
-                for t in range(feather):
-                    a = (t + 1) / feather
-                    mask.narrow(d, t, 1).mul_(a)
-                    mask.narrow(d, mask.shape[d] - 1 - t, 1).mul_(a)
+            # Lazy init accumulators on the same device/dtype as ps (GPU, bf16).
+            if out is None:
+                out = torch.zeros(acc_shape, device=ps.device, dtype=ps.dtype)
+                out_div = torch.zeros(acc_shape, device=ps.device, dtype=ps.dtype)
+
+            # Reuse mask for tiles with identical output shape (all interior tiles).
+            # Edge tiles with different shapes each get their own cache entry.
+            ps_shape_key = tuple(ps.shape)
+            if ps_shape_key not in _mask_cache:
+                mask = torch.ones_like(ps)
+                for d in range(2, dims + 2):
+                    feather = round(get_scale(d - 2, overlap[d - 2]))
+                    if feather >= mask.shape[d]:
+                        continue
+                    # Broadcastable 1D ramp: 2 kernel launches per dim instead of
+                    # 2*feather scalar mul_ launches (e.g. 6 vs 48 for 3D, feather=8).
+                    ramp_shape = [1] * len(mask.shape)
+                    ramp_shape[d] = feather
+                    ramp = (torch.arange(1, feather + 1, dtype=mask.dtype, device=mask.device) / feather).reshape(ramp_shape)
+                    mask.narrow(d, 0, feather).mul_(ramp)
+                    mask.narrow(d, mask.shape[d] - feather, feather).mul_(ramp.flip([d]))
+                _mask_cache[ps_shape_key] = mask
+            else:
+                mask = _mask_cache[ps_shape_key]
 
             o = out
             o_d = out_div
@@ -176,13 +203,15 @@ def tiled_scale_multidim(
                 o = o.narrow(d + 2, upscaled[d], mask.shape[d + 2])
                 o_d = o_d.narrow(d + 2, upscaled[d], mask.shape[d + 2])
 
-            o.add_(ps * mask)
+            # addcmul_ fuses multiply+add in-place, eliminating the temporary (ps * mask) allocation.
+            o.addcmul_(ps, mask)
             o_d.add_(mask)
 
             if pbar is not None:
                 pbar.update(1)
 
-        output[b:b + 1] = out / out_div.clamp(min=1e-8)
+        # Single D2H transfer per batch element: divide on GPU, cast to float32, move to output_device.
+        output[b:b + 1] = (out / out_div.clamp(min=1e-8)).to(dtype=torch.float32, device=output_device)
     return output
 
 

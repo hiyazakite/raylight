@@ -327,7 +327,9 @@ class VaeManager:
                 if write_len > 0:
                     out_buffer[output_offset : output_offset + write_len].copy_(flat_images.to(torch.float32), non_blocking=True)
             
-            torch.cuda.synchronize() # Ensure copy completes before we return/cleanup
+            # Sync only the current stream, not the entire device.
+            # This unblocks the CPU to return results while other CUDA streams remain live.
+            torch.cuda.current_stream(config.device).synchronize()
             
             # Return metadata only
             result_payload = {

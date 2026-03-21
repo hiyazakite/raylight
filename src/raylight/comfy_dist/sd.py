@@ -233,7 +233,8 @@ def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16):
     steps += samples.shape[0] * comfy.utils.get_tiled_scale_steps(samples.shape[3], samples.shape[2], tile_x * 2, tile_y // 2, overlap)
     pbar = comfy.utils.ProgressBar(steps)
 
-    decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
+    # .float() removed: tiled_scale_multidim accumulates in native dtype and casts once at the end.
+    decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device))
     output = self.process_output(
         (
             comfy_dist.utils.tiled_scale(samples, decode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount=self.upscale_ratio, output_device=self.output_device, pbar=pbar) +
@@ -245,15 +246,17 @@ def decode_tiled_(self, samples, tile_x=64, tile_y=64, overlap=16):
 
 def decode_tiled_1d(self, samples, tile_x=128, overlap=32):
     if samples.ndim == 3:
-        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
+        # .float() removed: tiled_scale_multidim casts once at the end.
+        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device))
     else:
         og_shape = samples.shape
         samples = samples.reshape((og_shape[0], og_shape[1] * og_shape[2], -1))
-        decode_fn = lambda a: self.first_stage_model.decode(a.reshape((-1, og_shape[1], og_shape[2], a.shape[-1])).to(self.vae_dtype).to(self.device)).float()
+        decode_fn = lambda a: self.first_stage_model.decode(a.reshape((-1, og_shape[1], og_shape[2], a.shape[-1])).to(self.vae_dtype).to(self.device))
 
     return self.process_output(comfy_dist.utils.tiled_scale_multidim(samples, decode_fn, tile=(tile_x,), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device))
 
 
 def decode_tiled_3d(self, samples, tile_t=999, tile_x=32, tile_y=32, overlap=(1, 8, 8)):
-    decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
+    # .float() removed: tiled_scale_multidim casts once at the end.
+    decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device))
     return self.process_output(comfy_dist.utils.tiled_scale_multidim(samples, decode_fn, tile=(tile_t, tile_x, tile_y), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, index_formulas=self.upscale_index_formula, output_device=self.output_device))

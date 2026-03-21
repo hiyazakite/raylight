@@ -738,93 +738,21 @@ _TRANSFORMER_BLOCK_NAMES = [
     "text_transformer_blocks",           # Qwen
 ]
 
-_LIGHTRICKS_COMPILE_LEAF_NAMES = [
-    "attn1",
-    "attn2",
-    "ff",
-    "audio_attn1",
-    "audio_attn2",
-    "audio_to_video_attn",
-    "video_to_audio_attn",
-    "audio_ff",
-]
 
-_LIGHTRICKS_EXTRA_BLOCK_PATHS = [
-    "video_embeddings_connector.transformer_1d_blocks",
-    "audio_embeddings_connector.transformer_1d_blocks",
-]
-
-
-def _resolve_chained_attr(obj, chained_attr: str):
-    probe = obj
-    for attr in chained_attr.split("."):
-        if not hasattr(probe, attr):
-            return None
-        probe = getattr(probe, attr)
-    return probe
-
-
-def _is_lightricks_block(module) -> bool:
-    return getattr(module.__class__, "__module__", "").startswith("comfy.ldm.lightricks")
-
-
-def _extend_compile_keys_for_blocks(keys: list[str], prefix: str, blocks, prefer_leaf_modules: bool = False):
-    for i in range(len(blocks)):
-        block = blocks[i]
-        if prefer_leaf_modules and _is_lightricks_block(block):
-            leaf_keys = [
-                f"{prefix}.{i}.{name}"
-                for name in _LIGHTRICKS_COMPILE_LEAF_NAMES
-                if hasattr(block, name)
-            ]
-            if leaf_keys:
-                keys.extend(leaf_keys)
-                continue
-
-        keys.append(f"{prefix}.{i}")
-
-
-def _discover_compile_keys(
-    diffusion_model,
-    prefer_leaf_modules: bool = False,
-    include_extra_block_paths: bool = False,
-) -> list[str]:
+def _discover_compile_keys(diffusion_model) -> list[str]:
     """Find per-block compile keys for a diffusion model.
 
     Compiling individual transformer blocks avoids tracing the outer forward
     (which may contain concrete-int ops that crash Inductor, e.g. Lumina
     pos_ids_x) while still getting Triton speedups on the heavy matmul path.
-
-    For GGUF-backed Lightricks models, prefer compiling attention / feed-forward
-    leaf modules instead of the full AV block. The AV outer forward contains
-    in-place residual ops (`Tensor.add_`, `Tensor.addcmul_`) around GGUF graph
-    breaks, which can otherwise trigger repeated Dynamo resumes/recompiles.
-
     Falls back to ["diffusion_model"] if no known block attributes are found.
     """
     keys: list[str] = []
     for layer_name in _TRANSFORMER_BLOCK_NAMES:
         if hasattr(diffusion_model, layer_name):
             blocks = getattr(diffusion_model, layer_name)
-            _extend_compile_keys_for_blocks(
-                keys,
-                f"diffusion_model.{layer_name}",
-                blocks,
-                prefer_leaf_modules=prefer_leaf_modules,
-            )
-
-    if include_extra_block_paths:
-        for path in _LIGHTRICKS_EXTRA_BLOCK_PATHS:
-            blocks = _resolve_chained_attr(diffusion_model, path)
-            if blocks is None:
-                continue
-            _extend_compile_keys_for_blocks(
-                keys,
-                f"diffusion_model.{path}",
-                blocks,
-                prefer_leaf_modules=prefer_leaf_modules,
-            )
-
+            for i in range(len(blocks)):
+                keys.append(f"diffusion_model.{layer_name}.{i}")
     return keys if keys else ["diffusion_model"]
 
 
@@ -834,71 +762,8 @@ def _check_compile_compatible(unet_name: str, config: RaylightConfig, backend: s
         
     if config.device.vram_limit_gb > 0:
         return False, "torch.compile is incompatible with VRAM limits (LowVram mode)"
-    
+
     return True, ""
-
-
-def _resolve_inductor_compile_options(
-    torch_compile: str,
-    torch_compile_dynamic: str,
-) -> tuple[str | None, bool | None]:
-    """Normalize node UI compile options into `torch.compile` arguments."""
-    compile_mode = "reduce-overhead" if torch_compile == "inductor_reduce_overhead" else None
-    dynamic_map = {"auto": None, "true": True, "false": False}
-    return compile_mode, dynamic_map[torch_compile_dynamic]
-
-
-def _configure_dynamo_for_raylight_compile() -> None:
-    """Apply conservative Dynamo cache settings used by Raylight compile flows."""
-    import torch
-
-    torch._dynamo.config.cache_size_limit = 64
-    try:
-        torch._dynamo.config.recompile_limit = 256
-    except Exception:
-        pass
-
-
-def _apply_inductor_compile_to_model(
-    model,
-    mode,
-    dynamic,
-    compile_key_options: dict | None = None,
-    prepare_diffusion_model=None,
-):
-    """Clone a model, optionally prepare its diffusion model, then apply Inductor."""
-    from comfy_api.torch_helpers import set_torch_compile_wrapper
-
-    _configure_dynamo_for_raylight_compile()
-
-    compiled_model = model.clone()
-    diffusion_model = compiled_model.get_model_object("diffusion_model")
-
-    if prepare_diffusion_model is not None:
-        prepare_diffusion_model(diffusion_model)
-
-    keys = _discover_compile_keys(diffusion_model, **(compile_key_options or {}))
-    set_torch_compile_wrapper(
-        model=compiled_model,
-        backend="inductor",
-        mode=mode,
-        dynamic=dynamic,
-        keys=keys,
-    )
-    return compiled_model
-
-
-def _format_compile_summary_parts(
-    target_description: str,
-    compile_mode: str | None,
-    torch_compile_dynamic: str,
-) -> list[str]:
-    parts = [target_description]
-    if compile_mode:
-        parts.append(f"mode={compile_mode}")
-    if torch_compile_dynamic != "auto":
-        parts.append(f"dynamic={torch_compile_dynamic}")
-    return parts
 
 
 def _guess_int8_exclusions(unet_name: str) -> list:
@@ -995,7 +860,7 @@ class RayUNETLoader:
 
         # PARALLEL LOADING (Fast)
         # Uses ModelContext with zero-copy mmap for optimal speed
-        print(f"[Raylight] Parallel Load ({'FSDP' if config.strategy.fsdp_enabled else 'Standard'}): Creating lazy wrappers...")
+        print(f"[Raylight] Parallel Load ({'FSDP' if config.strategy.is_fsdp else 'Standard'}): Creating lazy wrappers...")
         for actor in gpu_actors:
             loaded_futures.append(
                 actor.load_unet.remote(unet_path, model_options=model_options)
@@ -1012,7 +877,7 @@ class RayUNETLoader:
         
         # Access USP/CFG degrees safely from Strategy
         strategy = config.strategy
-        if config.meta.total_sp_degree > 1:
+        if strategy.is_xdit:
             if strategy.ulysses_degree > 1 or strategy.ring_degree > 1:
                 print(f"[Raylight] Batched USP Patching ({_PATCH_BATCH} workers at a time)...")
                 for i in range(0, len(gpu_actors), _PATCH_BATCH):
@@ -1030,24 +895,24 @@ class RayUNETLoader:
             if not compile_ok:
                 print(f"[Raylight] WARNING: torch.compile skipped — {compile_reason}")
             else:
-                compile_mode, compile_dynamic = _resolve_inductor_compile_options(
-                    torch_compile,
-                    torch_compile_dynamic,
-                )
-                compile_futures = [
-                    actor.model_function_runner.remote(
-                        _apply_inductor_compile_to_model,
-                        compile_mode,
-                        compile_dynamic,
-                    )
-                    for actor in gpu_actors
-                ]
+                import torch as _torch
+                from comfy_api.torch_helpers import set_torch_compile_wrapper
+                compile_mode = "reduce-overhead" if torch_compile == "inductor_reduce_overhead" else None
+                dynamic_map = {"auto": None, "true": True, "false": False}
+                compile_dynamic = dynamic_map[torch_compile_dynamic]
+                def _apply_compile(model, mode, dynamic):
+                    import torch
+                    torch._dynamo.config.cache_size_limit = 64
+                    m = model.clone()
+                    diffusion_model = m.get_model_object("diffusion_model")
+                    keys = _discover_compile_keys(diffusion_model)
+                    set_torch_compile_wrapper(model=m, backend="inductor", mode=mode, dynamic=dynamic, keys=keys)
+                    return m
+                compile_futures = [actor.model_function_runner.remote(_apply_compile, compile_mode, compile_dynamic) for actor in gpu_actors]
                 cancellable_get(compile_futures)
-                parts = _format_compile_summary_parts(
-                    "transformer blocks",
-                    compile_mode,
-                    torch_compile_dynamic,
-                )
+                parts = ["transformer blocks"]
+                if compile_mode: parts.append(f"mode={compile_mode}")
+                if torch_compile_dynamic != "auto": parts.append(f"dynamic={torch_compile_dynamic}")
                 print(f"[Raylight] torch.compile (inductor, {', '.join(parts)}) applied to all workers")
 
         # Track workers globally so the unload hook can reach them
@@ -1246,8 +1111,8 @@ class DPKSamplerAdvanced:
 
             gpu_actors = ray_actors["workers"]
 
-            config = cast(RaylightConfig, cancellable_get(gpu_actors[0].get_raylight_config.remote()))
-            if config is not None and config.meta.total_sp_degree > 1:
+            parallel_dict: Any = cancellable_get(gpu_actors[0].get_parallel_dict.remote())
+            if parallel_dict is not None and parallel_dict.get("is_xdit") is True:
                 raise ValueError(
                     """
                 Data Parallel KSampler only supports FSDP or standard Data Parallel (DP).
@@ -1296,7 +1161,7 @@ class DPKSamplerAdvanced:
             if results is None:
                  raise RuntimeError("Raylight: Sampling failed or was cancelled.")
             
-            if config is not None and config.meta.total_sp_degree > 1:
+            if parallel_dict is not None and parallel_dict.get("is_xdit"):
                  return (results[0][0],)
 
             # Standard mode: concat shards
@@ -1473,9 +1338,11 @@ class RayVAEDecodeDistributed:
             
             # Chunk size heuristic: aim for ~2-3x more chunks than workers
             # to allow load balancing, but not so small that overhead dominates.
-            # Minimum 2 latent frames per chunk to keep context overhead low.
+            # Minimum 8 latent frames per chunk: each non-last chunk decodes 1 extra
+            # look-ahead latent for boundary continuity, so floor of 8 keeps that
+            # overhead at ~11% vs 33–50% with smaller values.
             target_chunks = num_workers * 3
-            frames_per_chunk = max(2, total_frames // target_chunks)
+            frames_per_chunk = max(8, total_frames // target_chunks)
             # For very short videos, fall back to 1 chunk per worker
             if total_frames <= num_workers:
                 frames_per_chunk = 1
@@ -1550,7 +1417,10 @@ class RayVAEDecodeDistributed:
                             pass
                     raise Exception("Raylight: VAE Decode canceled by user.")
 
-                ready, _ = ray.wait(list(inflight.keys()), num_returns=1, timeout=1.0)
+                # 50ms timeout: low enough that a fast GPU (chunk done in ~200ms)
+                # gets its next chunk dispatched within one poll interval instead of
+                # waiting up to 1s idle before the master notices it's free.
+                ready, _ = ray.wait(list(inflight.keys()), num_returns=1, timeout=0.05)
                 if not ready:
                     continue
                     
