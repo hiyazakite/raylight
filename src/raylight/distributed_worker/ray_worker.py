@@ -212,14 +212,15 @@ class RayWorker:
             else:
                 print(f"Running Ray in normal separate sampler with: {self.global_world_size} number of workers")
 
+        # Inject unified attention config (Always sync to the module)
+        xfuser_attn.set_config(self.raylight_config)
+
         # Initialize XDiT Environment for Sequence Parallelism
         if self.raylight_config.meta.total_sp_degree > 1:
             from xfuser.core.distributed import (
                 init_distributed_environment,
                 initialize_model_parallel,
             )
-            # Inject unified attention config
-            xfuser_attn.set_config(self.raylight_config)
 
             strategy = self.raylight_config.strategy
             self.ulysses_degree = strategy.ulysses_degree
@@ -920,6 +921,8 @@ def make_ray_actor_fn(
             if raylight_config:
                 env_vars = {
                     "RAYLIGHT_ATTN_BACKEND": raylight_config.strategy.attention_backend,
+                    "RAYLIGHT_ATTN_TYPE": raylight_config.strategy.attention_type.name,
+                    "RAYLIGHT_RING_IMPL": raylight_config.strategy.ring_impl,
                     "RAYLIGHT_ENABLE_KITCHEN": "1" if raylight_config.debug.enable_kitchen else "0",
                     "RAYLIGHT_COMPACT_WARMUP_STEPS": str(raylight_config.compact.warmup_steps),
                     "RAYLIGHT_DELTA_COMPRESSION": raylight_config.compact.delta_compression.name,

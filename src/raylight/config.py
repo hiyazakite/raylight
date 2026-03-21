@@ -241,9 +241,27 @@ class RaylightConfig:
     @classmethod
     def from_env(cls) -> "RaylightConfig":
         """Centralized factory for environment-based configuration."""
+        # For Enums, we must handle strings safely
+        def _get_enum(env_name, enum_cls, default):
+            val = os.getenv(env_name)
+            if val:
+                try: return enum_cls[val]
+                except KeyError: pass
+            return default
+
         return cls(
             strategy=ExecutionStrategy(
+                attention_backend=os.getenv("RAYLIGHT_ATTN_BACKEND", "STANDARD"),
+                attention_type=_get_enum("RAYLIGHT_ATTN_TYPE", RaylightAttnType, RaylightAttnType.TORCH),
+                ring_impl=os.getenv("RAYLIGHT_RING_IMPL", "basic"),
                 fsdp_parallel_load=os.getenv("RAYLIGHT_FSDP_PARALLEL_LOAD", "1") == "1",
+            ),
+            compact=CompactConfig(
+                enabled=os.getenv("RAYLIGHT_COMPACT", "0") == "1",
+                warmup_steps=int(os.getenv("RAYLIGHT_COMPACT_WARMUP_STEPS", "1")),
+                delta_compression=_get_enum("RAYLIGHT_DELTA_COMPRESSION", CompactCompressType, CompactCompressType.IDENTITY),
+                kv_cache_quant_enable=os.getenv("RAYLIGHT_COMPACT_QUANTIZED_CACHE", "0") == "1",
+                kv_cache_quant_bits=int(os.getenv("RAYLIGHT_COMPACT_CACHE_QUANT_BITS", "8")),
             ),
             debug=DebugConfig(
                 verbose_attn=os.getenv("RAYLIGHT_VERBOSE_ATTN", "0") == "1",
