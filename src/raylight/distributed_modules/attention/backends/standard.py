@@ -21,9 +21,18 @@ class StandardAttentionBackend(AttentionBackend):
         print(f"Using XFuser {attn_type_name} attention, Sync Ulysses: {strat.sync_ulysses}, Impl: {strat.ring_impl}")
         
         # Map our internal RaylightAttnType to yunchang's AttnType
-        # Note: We assume the names match or we have a mapping logic
+        _yunchang_map = {
+            "FLASH_ATTN": "FA",
+            "FLASH_ATTN_3": "FA3",
+            "SAGE_AUTO_DETECT": "SAGE_AUTO",
+            "SAGE_FP16_CUDA": "SAGE_FP16",
+            "SAGE_FP8_CUDA": "SAGE_FP8",
+        }
+        
+        effective_name = _yunchang_map.get(attn_type_name, attn_type_name)
+        
         try:
-            attn_enum = AttnType[attn_type_name]
+            attn_enum = AttnType[effective_name]
         except KeyError:
             attn_enum = AttnType.FA # Default fallback
         

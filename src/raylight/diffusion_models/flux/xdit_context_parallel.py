@@ -79,6 +79,19 @@ def attention(q, k, v, pe, mask=None, **kwargs) -> Tensor:
     return x
 
 
+def _invert_slices(slices, length):
+    sorted_slices = sorted(slices)
+    result = []
+    current = 0
+    for start, end in sorted_slices:
+        if current < start:
+            result.append((current, start))
+        current = max(current, end)
+    if current < length:
+        result.append((current, length))
+    return result
+
+
 def usp_dit_forward(
     self,
     img: Tensor,
@@ -89,6 +102,7 @@ def usp_dit_forward(
     y: Tensor,
     guidance: Tensor = None,
     control=None,
+    timestep_zero_index=None,
     transformer_options={},
     attn_mask: Tensor = None,
 ) -> Tensor:
@@ -119,8 +133,24 @@ def usp_dit_forward(
     txt = self.txt_in(txt)
 
     vec_orig = vec
+    txt_vec = vec
+    modulation_dims = None
+    double_extra_kwargs = {}
+    single_extra_kwargs = {}
+    if timestep_zero_index is not None:
+        modulation_dims = []
+        batch = vec.shape[0] // 2
+        vec_orig = vec_orig.reshape(2, batch, vec.shape[1]).movedim(0, 1)
+        invert = _invert_slices(timestep_zero_index, img.shape[1])
+        for s in invert:
+            modulation_dims.append((s[0], s[1], 0))
+        for s in timestep_zero_index:
+            modulation_dims.append((s[0], s[1], 1))
+        double_extra_kwargs["modulation_dims_img"] = modulation_dims
+        txt_vec = vec[:batch]
+
     if self.params.global_modulation:
-        vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(vec_orig))
+        vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(txt_vec))
 
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     if img_ids is not None:
@@ -162,7 +192,8 @@ def usp_dit_forward(
                                                txt=args["txt"],
                                                vec=args["vec"],
                                                pe=args["pe"],
-                                               attn_mask=args.get("attn_mask"))
+                                               attn_mask=args.get("attn_mask"),
+                                               **double_extra_kwargs)
                 return out
 
             out = blocks_replace[("double_block", i)]({"img": img,
@@ -178,7 +209,8 @@ def usp_dit_forward(
                              txt=txt,
                              vec=vec,
                              pe=pe_image,
-                             attn_mask=attn_mask)
+                             attn_mask=attn_mask,
+                             **double_extra_kwargs)
 
         if control is not None:  # Controlnet
             control_i = control.get("input")
@@ -206,6 +238,14 @@ def usp_dit_forward(
         vec, _ = self.single_stream_modulation(vec_orig)
     img = extract_local_tensor(img, ring_impl_type=_get_ring_impl_type())
     # ======================== ADD SEQUENCE PARALLEL ========================= #
+
+    if modulation_dims is not None:
+        txt_len = txt.shape[1]
+        modulation_dims_combined = [
+            (0 if x[0] == 0 else x[0] + txt_len, x[1] + txt_len, x[2])
+            for x in modulation_dims
+        ]
+        single_extra_kwargs = {"modulation_dims": modulation_dims_combined}
 
     # Pre-compute the number of text tokens that fall within this rank's
     # local chunk.  After extract_local_tensor the combined (txt+img)
@@ -238,7 +278,8 @@ def usp_dit_forward(
                 out["img"] = block(args["img"],
                                    vec=args["vec"],
                                    pe=args["pe"],
-                                   attn_mask=args.get("attn_mask"))
+                                   attn_mask=args.get("attn_mask"),
+                                   **single_extra_kwargs)
                 return out
 
             out = blocks_replace[("single_block", i)]({"img": img,
@@ -248,7 +289,7 @@ def usp_dit_forward(
                                                       {"original_block": block_wrap})
             img = out["img"]
         else:
-            img = block(img, vec=vec, pe=pe_combine, attn_mask=attn_mask)
+            img = block(img, vec=vec, pe=pe_combine, attn_mask=attn_mask, **single_extra_kwargs)
 
         if control is not None:  # Controlnet
             control_o = control.get("output")
@@ -264,7 +305,10 @@ def usp_dit_forward(
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     img = img[:, txt.shape[1]:, ...]
 
-    img = self.final_layer(img, vec_orig)  # (N, T, patch_size ** 2 * out_channels)
+    final_extra_kwargs = {}
+    if modulation_dims is not None:
+        final_extra_kwargs["modulation_dims"] = modulation_dims
+    img = self.final_layer(img, vec_orig, **final_extra_kwargs)  # (N, T, patch_size ** 2 * out_channels)
     return img
 
 

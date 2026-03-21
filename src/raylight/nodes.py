@@ -306,10 +306,6 @@ class RayInitializer:
                     ["STANDARD", "COMPACT"],
                     {"default": "STANDARD"},
                 ),
-                "ring_impl_type": (
-                    ["basic", "zigzag"],
-                    {"default": "basic", "tooltip": "Ring attention implementation. 'zigzag' provides load-balancing for causal attention."}
-                ),
                 "ray_object_store_gb": ("FLOAT", {
                     "default": 0.0,
                     "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
@@ -335,8 +331,25 @@ class RayInitializer:
                     "max": 100,
                     "tooltip": "Number of warmup steps before compression starts (CompactFusion). 1 is recommended by paper, but higher values (e.g. 5) are safer."
                 }),
+                "ring_impl_type": (
+                    ["basic", "zigzag"],
+                    {"default": "basic", "tooltip": "Ring attention implementation. 'zigzag' provides load-balancing for causal attention."}
+                ),
+                "vram_limit_gb": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 128.0,
+                    "step": 0.5,
+                    "tooltip": "Max VRAM (GB) per GPU for model weights. 0 = auto (use all available). Useful for sharing VRAM with other tasks or forcing CPU offload for large models."
+                }),
             },
             "optional": {
+                "ray_dashboard_address": ("STRING", {
+                    "default": "None",
+                    "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"}),
+                "torch_dist_address": ("STRING", {
+                    "default": "127.0.0.1:29500",
+                    "tooltip": "Might need to restart ComfyUI to apply"}),
                 "gpu_indices": ("STRING", {
                     "default": "",
                     "tooltip": "Comma-separated list of GPU indices to use (e.g., '0,1'). Overrides automatic selection."
@@ -347,20 +360,13 @@ class RayInitializer:
                 }),
                 "use_mmap": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Use memory-mapped (zero-copy) model loading. Enabled: parallel loading with OS page cache sharing. Disabled: sequential leader-follower loading (use if mmap causes issues)."
+                    "tooltip": "Use memory-mapped (zero-copy) model loading."
                 }),
                 "mmap_cache_size": ("INT", {
-                    "default": 4, # Increased default for safety
+                    "default": 4,
                     "min": 1,
                     "max": 100,
-                    "tooltip": "Number of models to keep in mmap cache (NOT GB). Zero-copy, so high values are cheap."
-                }),
-                "vram_limit_gb": ("FLOAT", {
-                    "default": 0.0,
-                    "min": 0.0,
-                    "max": 128.0,
-                    "step": 0.5,
-                    "tooltip": "Max VRAM (GB) per GPU for model weights. 0 = auto (use all available). Useful for sharing VRAM with other tasks or forcing CPU offload for large models."
+                    "tooltip": "Number of models to keep in mmap cache."
                 }),
             }
         }
@@ -390,18 +396,18 @@ class RayInitializer:
         use_kitchen: bool = False,
         attention_backend: str = "STANDARD",
         ray_object_store_gb: float = 0.0,
-        ray_dashboard_address: str = "None",
-        torch_dist_address: str = "None",
-        gpu_indices: str = "",
-        skip_comm_test: bool = True,
-        use_mmap: bool = True,
-        mmap_cache_size: int = 4,
         kv_cache_quant_enable: bool = False,
         kv_cache_quant_bits: int = 8,
         delta_compression: str = "BINARY",
         compact_warmup_steps: int = 1,
         ring_impl_type: str = "basic",
         vram_limit_gb: float = 0.0,
+        ray_dashboard_address: str = "None",
+        torch_dist_address: str = "None",
+        gpu_indices: str = "",
+        skip_comm_test: bool = True,
+        use_mmap: bool = True,
+        mmap_cache_size: int = 4,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # THIS IS PYTORCH DIST ADDRESS
@@ -423,11 +429,25 @@ class RayInitializer:
                     pass
 
             # Map string inputs to Enums
+            # [SENIOR REFACTOR] Handle mapping between yunchang AttnType and RaylightAttnType
+            # Basic node uses AttnType names, Advanced uses RaylightAttnType names.
+            _attn_map = {
+                "FA": RaylightAttnType.FLASH_ATTN,
+                "FA3": RaylightAttnType.FLASH_ATTN_3,
+                "SAGE_AUTO": RaylightAttnType.SAGE_AUTO_DETECT,
+                "SAGE_FP16": RaylightAttnType.SAGE_FP16_CUDA,
+                "SAGE_FP8": RaylightAttnType.SAGE_FP8_CUDA,
+                "YUNCHANG": RaylightAttnType.FLASH_ATTN, # Fallback
+                "XFORMERS": RaylightAttnType.FLASH_ATTN, # Fallback
+            }
             try:
-                attn_type_enum = RaylightAttnType[XFuser_attention]
-            except KeyError:
+                if XFuser_attention in _attn_map:
+                    attn_type_enum = _attn_map[XFuser_attention]
+                else:
+                    attn_type_enum = RaylightAttnType[XFuser_attention]
+            except (KeyError, ValueError):
                 attn_type_enum = RaylightAttnType.TORCH
-                
+            
             try:
                 comp_type_enum = CompactCompressType(delta_compression)
             except ValueError:
@@ -585,7 +605,7 @@ class RayInitializer:
             # Track workers for the unload hook (will be updated by loader nodes)
             _register_workers(ray_actors["workers"])
 
-            return ([ray_actors, ray_actor_fn],)
+            return ([ray_actors, ray_actor_fn, config],)
 
 
 class RayInitializerAdvanced(RayInitializer):
@@ -597,15 +617,6 @@ class RayInitializerAdvanced(RayInitializer):
                     "default": "local",
                     "tooltip": "Address of Ray cluster different than torch distributed address"}),
                 "ray_cluster_namespace": ("STRING", {"default": "default"}),
-                "ray_object_store_gb": ("FLOAT", {
-                    "default": 0.0,
-                    "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
-                "ray_dashboard_address": ("STRING", {
-                    "default": "None",
-                    "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"}),
-                "torch_dist_address": ("STRING", {
-                    "default": "127.0.0.1:29500",
-                    "tooltip": "Might need to restart ComfyUI to apply"}),
                 "GPU": ("INT", {"default": 2}),
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
@@ -631,6 +642,13 @@ class RayInitializerAdvanced(RayInitializer):
                     "default": False,
                     "tooltip": "Enable FP8 weight quantization using ComfyUI-Kitchen for reduced VRAM."
                 }),
+                "attention_backend": (
+                    ["STANDARD", "COMPACT"],
+                    {"default": "STANDARD"},
+                ),
+                "ray_object_store_gb": ("FLOAT", {
+                    "default": 0.0,
+                    "tooltip": "Ray shared memory object store size in GB. 0.0 = Auto (Use Ray default ~30% of System RAM). Increase if you see spilling to disk."}),
                 "kv_cache_quant_enable": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Enable KV cache quantization for CompactFusion."
@@ -647,12 +665,31 @@ class RayInitializerAdvanced(RayInitializer):
                     {"default": "BINARY",
                      "tooltip": "Compression type for delta updates (CompactFusion). BINARY (INT1) is fastest/smallest."}
                 ),
+                "compact_warmup_steps": ("INT", {
+                    "default": 1,
+                    "min": 0,
+                    "max": 100,
+                     "tooltip": "Number of warmup steps before compression starts (CompactFusion). 1 is recommended by paper, but higher values (e.g. 5) are safer."
+                }),
                 "ring_impl_type": (
                     ["basic", "zigzag"],
                     {"default": "basic", "tooltip": "Ring attention implementation. 'zigzag' provides load-balancing for causal attention."}
                 ),
+                "vram_limit_gb": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 128.0,
+                    "step": 0.5,
+                    "tooltip": "Max VRAM (GB) per GPU for model weights. 0 = auto (use all available). Useful for sharing VRAM with other tasks or forcing CPU offload for large models."
+                }),
             },
             "optional": {
+                "ray_dashboard_address": ("STRING", {
+                    "default": "None",
+                    "tooltip": "Same format as torch_dist_address, you need to install ray dashboard to monitor"}),
+                "torch_dist_address": ("STRING", {
+                    "default": "127.0.0.1:29500",
+                    "tooltip": "Might need to restart ComfyUI to apply"}),
                 "gpu_indices": ("STRING", {
                     "default": "",
                     "tooltip": "Comma-separated list of GPU indices to use (e.g., '0,1'). Overrides automatic selection."
@@ -701,21 +738,93 @@ _TRANSFORMER_BLOCK_NAMES = [
     "text_transformer_blocks",           # Qwen
 ]
 
+_LIGHTRICKS_COMPILE_LEAF_NAMES = [
+    "attn1",
+    "attn2",
+    "ff",
+    "audio_attn1",
+    "audio_attn2",
+    "audio_to_video_attn",
+    "video_to_audio_attn",
+    "audio_ff",
+]
 
-def _discover_compile_keys(diffusion_model) -> list[str]:
+_LIGHTRICKS_EXTRA_BLOCK_PATHS = [
+    "video_embeddings_connector.transformer_1d_blocks",
+    "audio_embeddings_connector.transformer_1d_blocks",
+]
+
+
+def _resolve_chained_attr(obj, chained_attr: str):
+    probe = obj
+    for attr in chained_attr.split("."):
+        if not hasattr(probe, attr):
+            return None
+        probe = getattr(probe, attr)
+    return probe
+
+
+def _is_lightricks_block(module) -> bool:
+    return getattr(module.__class__, "__module__", "").startswith("comfy.ldm.lightricks")
+
+
+def _extend_compile_keys_for_blocks(keys: list[str], prefix: str, blocks, prefer_leaf_modules: bool = False):
+    for i in range(len(blocks)):
+        block = blocks[i]
+        if prefer_leaf_modules and _is_lightricks_block(block):
+            leaf_keys = [
+                f"{prefix}.{i}.{name}"
+                for name in _LIGHTRICKS_COMPILE_LEAF_NAMES
+                if hasattr(block, name)
+            ]
+            if leaf_keys:
+                keys.extend(leaf_keys)
+                continue
+
+        keys.append(f"{prefix}.{i}")
+
+
+def _discover_compile_keys(
+    diffusion_model,
+    prefer_leaf_modules: bool = False,
+    include_extra_block_paths: bool = False,
+) -> list[str]:
     """Find per-block compile keys for a diffusion model.
 
     Compiling individual transformer blocks avoids tracing the outer forward
     (which may contain concrete-int ops that crash Inductor, e.g. Lumina
     pos_ids_x) while still getting Triton speedups on the heavy matmul path.
+
+    For GGUF-backed Lightricks models, prefer compiling attention / feed-forward
+    leaf modules instead of the full AV block. The AV outer forward contains
+    in-place residual ops (`Tensor.add_`, `Tensor.addcmul_`) around GGUF graph
+    breaks, which can otherwise trigger repeated Dynamo resumes/recompiles.
+
     Falls back to ["diffusion_model"] if no known block attributes are found.
     """
     keys: list[str] = []
     for layer_name in _TRANSFORMER_BLOCK_NAMES:
         if hasattr(diffusion_model, layer_name):
             blocks = getattr(diffusion_model, layer_name)
-            for i in range(len(blocks)):
-                keys.append(f"diffusion_model.{layer_name}.{i}")
+            _extend_compile_keys_for_blocks(
+                keys,
+                f"diffusion_model.{layer_name}",
+                blocks,
+                prefer_leaf_modules=prefer_leaf_modules,
+            )
+
+    if include_extra_block_paths:
+        for path in _LIGHTRICKS_EXTRA_BLOCK_PATHS:
+            blocks = _resolve_chained_attr(diffusion_model, path)
+            if blocks is None:
+                continue
+            _extend_compile_keys_for_blocks(
+                keys,
+                f"diffusion_model.{path}",
+                blocks,
+                prefer_leaf_modules=prefer_leaf_modules,
+            )
+
     return keys if keys else ["diffusion_model"]
 
 
@@ -727,6 +836,69 @@ def _check_compile_compatible(unet_name: str, config: RaylightConfig, backend: s
         return False, "torch.compile is incompatible with VRAM limits (LowVram mode)"
     
     return True, ""
+
+
+def _resolve_inductor_compile_options(
+    torch_compile: str,
+    torch_compile_dynamic: str,
+) -> tuple[str | None, bool | None]:
+    """Normalize node UI compile options into `torch.compile` arguments."""
+    compile_mode = "reduce-overhead" if torch_compile == "inductor_reduce_overhead" else None
+    dynamic_map = {"auto": None, "true": True, "false": False}
+    return compile_mode, dynamic_map[torch_compile_dynamic]
+
+
+def _configure_dynamo_for_raylight_compile() -> None:
+    """Apply conservative Dynamo cache settings used by Raylight compile flows."""
+    import torch
+
+    torch._dynamo.config.cache_size_limit = 64
+    try:
+        torch._dynamo.config.recompile_limit = 256
+    except Exception:
+        pass
+
+
+def _apply_inductor_compile_to_model(
+    model,
+    mode,
+    dynamic,
+    compile_key_options: dict | None = None,
+    prepare_diffusion_model=None,
+):
+    """Clone a model, optionally prepare its diffusion model, then apply Inductor."""
+    from comfy_api.torch_helpers import set_torch_compile_wrapper
+
+    _configure_dynamo_for_raylight_compile()
+
+    compiled_model = model.clone()
+    diffusion_model = compiled_model.get_model_object("diffusion_model")
+
+    if prepare_diffusion_model is not None:
+        prepare_diffusion_model(diffusion_model)
+
+    keys = _discover_compile_keys(diffusion_model, **(compile_key_options or {}))
+    set_torch_compile_wrapper(
+        model=compiled_model,
+        backend="inductor",
+        mode=mode,
+        dynamic=dynamic,
+        keys=keys,
+    )
+    return compiled_model
+
+
+def _format_compile_summary_parts(
+    target_description: str,
+    compile_mode: str | None,
+    torch_compile_dynamic: str,
+) -> list[str]:
+    parts = [target_description]
+    if compile_mode:
+        parts.append(f"mode={compile_mode}")
+    if torch_compile_dynamic != "auto":
+        parts.append(f"dynamic={torch_compile_dynamic}")
+    return parts
 
 
 def _guess_int8_exclusions(unet_name: str) -> list:
@@ -858,28 +1030,24 @@ class RayUNETLoader:
             if not compile_ok:
                 print(f"[Raylight] WARNING: torch.compile skipped — {compile_reason}")
             else:
-                import torch as _torch
-                from comfy_api.torch_helpers import set_torch_compile_wrapper
-                compile_mode = "reduce-overhead" if torch_compile == "inductor_reduce_overhead" else None
-                dynamic_map = {"auto": None, "true": True, "false": False}
-                compile_dynamic = dynamic_map[torch_compile_dynamic]
-                def _apply_compile(model, mode, dynamic):
-                    import torch
-                    torch._dynamo.config.cache_size_limit = 64
-                    try:
-                        torch._dynamo.config.recompile_limit = 256
-                    except Exception:
-                        pass
-                    m = model.clone()
-                    diffusion_model = m.get_model_object("diffusion_model")
-                    keys = _discover_compile_keys(diffusion_model)
-                    set_torch_compile_wrapper(model=m, backend="inductor", mode=mode, dynamic=dynamic, keys=keys)
-                    return m
-                compile_futures = [actor.model_function_runner.remote(_apply_compile, compile_mode, compile_dynamic) for actor in gpu_actors]
+                compile_mode, compile_dynamic = _resolve_inductor_compile_options(
+                    torch_compile,
+                    torch_compile_dynamic,
+                )
+                compile_futures = [
+                    actor.model_function_runner.remote(
+                        _apply_inductor_compile_to_model,
+                        compile_mode,
+                        compile_dynamic,
+                    )
+                    for actor in gpu_actors
+                ]
                 cancellable_get(compile_futures)
-                parts = ["transformer blocks"]
-                if compile_mode: parts.append(f"mode={compile_mode}")
-                if torch_compile_dynamic != "auto": parts.append(f"dynamic={torch_compile_dynamic}")
+                parts = _format_compile_summary_parts(
+                    "transformer blocks",
+                    compile_mode,
+                    torch_compile_dynamic,
+                )
                 print(f"[Raylight] torch.compile (inductor, {', '.join(parts)}) applied to all workers")
 
         # Track workers globally so the unload hook can reach them
