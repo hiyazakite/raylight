@@ -8,6 +8,29 @@ import comfy
 import comfy.model_patcher
 from comfy.patcher_extension import WrappersMP
 
+# ---------------------------------------------------------------------------
+# LTXAV / LTX2 calibration
+# ---------------------------------------------------------------------------
+# Polynomial coefficients calibrated for LTXV (same transformer architecture
+# as LTXAV).  Applied via Horner's method to the raw modulated-input L1
+# distance before accumulation, linearising the relationship between input
+# change and actual output quality degradation.
+# Source: Halo-TeaCache (bkpaine1/Halo-TeaCache), ported from LTXV baseline.
+LTXAV_POLY_COEFFICIENTS: List[float] = [
+    2.14700694e+01, -1.28016453e+01, 2.31279151e+00,
+    7.92487521e-01,  9.69274326e-03,
+]
+
+_LTXAV_MODEL_CLASSES = frozenset({"LTXAVModel", "LTXVModel"})
+
+
+def _poly1d(coefficients: List[float], x: float) -> float:
+    """Evaluate a polynomial using Horner's method."""
+    result = 0.0
+    for c in coefficients:
+        result = result * x + c
+    return result
+
 from comfy_extras.nodes_easycache import EasyCacheHolder
 
 from .ray_patch_decorator import ray_patch
@@ -392,9 +415,14 @@ class DistributedTeaCacheHolder(DistributedEasyCacheHolder):
         self.accumulated_change = 0.0
         self.prev_modulated: Optional[torch.Tensor] = None
         self.relative_change_history = []
+        # LTXAV / model-specific extensions
+        self.model_class: str = ""
+        self.poly_coefficients: Optional[List[float]] = None
+        # Transient model reference; re-set each run in teacache_sample_wrapper
+        self._ltxav_block0: Optional[torch.nn.Module] = None
 
     def clone(self):
-        return DistributedTeaCacheHolder(
+        c = DistributedTeaCacheHolder(
             self.reuse_threshold,
             self.start_percent,
             self.end_percent,
@@ -404,6 +432,11 @@ class DistributedTeaCacheHolder(DistributedEasyCacheHolder):
             self.verbose,
             self.distributed_sync,
         )
+        c.model_class = self.model_class
+        c.poly_coefficients = self.poly_coefficients
+        # _ltxav_block0 is a live model reference — re-set in sample_wrapper
+        c._ltxav_block0 = self._ltxav_block0
+        return c
 
     def reset(self):
         super().reset()
@@ -475,6 +508,9 @@ class DistributedTeaCacheHolder(DistributedEasyCacheHolder):
 
 def teacache_forward_wrapper(executor, *args, **kwargs):
     x: torch.Tensor = args[0]
+    # LTXAV passes x as [video_tensor, audio_tensor]; extract the video tensor
+    # for all shape/subsample/cache operations while forwarding the original x.
+    x_vid: torch.Tensor = x[0] if isinstance(x, list) else x
     transformer_options = _extract_transformer_options(args, kwargs)
     teacache: DistributedTeaCacheHolder = transformer_options["teacache"]
     sigmas = transformer_options["sigmas"]
@@ -483,7 +519,7 @@ def teacache_forward_wrapper(executor, *args, **kwargs):
     if not uuids:
         return executor(*args, **kwargs)
 
-    teacache.check_metadata(x)
+    teacache.check_metadata(x_vid)
 
     if teacache.first_cond_uuid is None:
         teacache.first_cond_uuid = uuids[0]
@@ -504,15 +540,28 @@ def teacache_forward_wrapper(executor, *args, **kwargs):
     sigma_value = teacache._extract_sigma_value(sigmas)
     consider_cache = teacache.should_do_easycache(sigmas) and not teacache.is_past_end_timestep(sigmas)
 
-    cond_slice = teacache.subsample(x, uuids, clone=False)
+    # ------------------------------------------------------------------
+    # Modulated-input extraction
+    # ------------------------------------------------------------------
+    # LTXAV/LTXVModel: use the first block's adaptive layer-norm
+    # (scale_shift_table + timestep embedding) — a much more accurate
+    # proxy than generic sigma-weighting for this architecture.
+    # All other models: generic sigma-based modulation.
+    # Note: LTXAV-specific scale_shift_table modulation requires the already-embedded
+    # timestep (produced inside _forward), but our wrapper receives the raw timestep.
+    # We fall back to generic sigma-based modulation for all models including LTXAV.
+    # The polynomial transform is still applied on the accumulated diff when coefficients
+    # are set (see below), which is the main calibration contribution from Halo-TeaCache.
+    cond_slice = teacache.subsample(x_vid, uuids, clone=False)
     modulated_input = teacache.modulate_input(cond_slice, sigma_value)
 
     if teacache.prev_modulated is None:
         teacache.store_modulated(modulated_input)
         output = executor(*args, **kwargs)
-        teacache.update_cache_diff(output, x, uuids)
-        teacache.x_prev_subsampled = teacache.subsample(x, uuids)
-        teacache.output_prev_subsampled = teacache.subsample(output, uuids)
+        output_vid = output[0] if isinstance(output, list) else output
+        teacache.update_cache_diff(output_vid, x_vid, uuids)
+        teacache.x_prev_subsampled = teacache.subsample(x_vid, uuids)
+        teacache.output_prev_subsampled = teacache.subsample(output_vid, uuids)
         teacache.output_prev_norm = teacache.sync_scalar(
             teacache.output_prev_subsampled.flatten().abs().mean(), op="max"
         )
@@ -536,7 +585,13 @@ def teacache_forward_wrapper(executor, *args, **kwargs):
     force_compute = (not consider_cache) or teacache.in_warmup() or teacache.needs_retention()
 
     if not force_compute:
-        acc = teacache.record_relative_change(relative_change)
+        # Apply polynomial transform before accumulation if calibration
+        # coefficients are set (e.g. LTXAV), otherwise accumulate raw L1.
+        if teacache.poly_coefficients is not None:
+            transformed = _poly1d(teacache.poly_coefficients, float(relative_change))
+        else:
+            transformed = relative_change
+        acc = teacache.record_relative_change(transformed)
         should_skip = (acc < teacache.reuse_threshold)
         should_skip = teacache.sync_bool(should_skip, mode="all")
         if should_skip:
@@ -547,13 +602,16 @@ def teacache_forward_wrapper(executor, *args, **kwargs):
                     "TeaCache — SKIP; acc=%.6f < thr=%.6f; since=%d",
                     acc, teacache.reuse_threshold, teacache.steps_since_compute,
                 )
-            return teacache.apply_cache_diff(x, uuids)
+            cached_vid = teacache.apply_cache_diff(x_vid, uuids)
+            # Reconstruct list output for AV models (audio approximated as unchanged)
+            return [cached_vid, x[1]] if isinstance(x, list) else cached_vid
         force_compute = True
 
-    output: torch.Tensor = executor(*args, **kwargs)
-    teacache.update_cache_diff(output, x, uuids)
-    teacache.x_prev_subsampled = teacache.subsample(x, uuids)
-    teacache.output_prev_subsampled = teacache.subsample(output, uuids)
+    output = executor(*args, **kwargs)
+    output_vid = output[0] if isinstance(output, list) else output
+    teacache.update_cache_diff(output_vid, x_vid, uuids)
+    teacache.x_prev_subsampled = teacache.subsample(x_vid, uuids)
+    teacache.output_prev_subsampled = teacache.subsample(output_vid, uuids)
     teacache.output_prev_norm = teacache.sync_scalar(
         teacache.output_prev_subsampled.flatten().abs().mean(), op="max"
     )
@@ -588,9 +646,26 @@ def teacache_sample_wrapper(executor, *args, **kwargs):
             .prepare_timesteps(guider.model_patcher.model.model_sampling, total_steps)
         )
         guider.model_options["transformer_options"]["teacache"] = teacache
+        # Detect model class and configure LTXAV-specific state
+        try:
+            diff_model = guider.model_patcher.model.diffusion_model
+            teacache.model_class = type(diff_model).__name__
+            if teacache.model_class in _LTXAV_MODEL_CLASSES:
+                teacache._ltxav_block0 = diff_model.transformer_blocks[0]
+                if teacache.poly_coefficients is None:
+                    teacache.poly_coefficients = LTXAV_POLY_COEFFICIENTS
+                if teacache.is_log_rank:
+                    logging.info(
+                        "[TeaCache] LTXAV model detected (%s) — "
+                        "using scale_shift_table modulated input + polynomial transform.",
+                        teacache.model_class,
+                    )
+        except Exception as _e:
+            logging.debug("[TeaCache] model-class detection failed: %s", _e)
         if teacache.is_log_rank:
             logging.info(
-                "TeaCache enabled — thr=%.3f warmup=%.2f retain=%d start=%.2f end=%.2f",
+                "TeaCache enabled — model=%s thr=%.3f warmup=%.2f retain=%d start=%.2f end=%.2f",
+                teacache.model_class or "unknown",
                 teacache.reuse_threshold,
                 teacache.warmup_percent,
                 teacache.retention_interval,

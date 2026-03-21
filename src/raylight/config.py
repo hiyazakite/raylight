@@ -68,6 +68,16 @@ class ExecutionStrategy:
     attention_type: RaylightAttnType = RaylightAttnType.TORCH
     ring_impl: str = "basic"              # "basic" or "zigzag"
 
+    @property
+    def is_fsdp(self) -> bool:
+        """True when Fully Sharded Data Parallelism is active."""
+        return self.fsdp_enabled
+
+    @property
+    def is_xdit(self) -> bool:
+        """True when any sequence/CFG parallelism degree exceeds 1."""
+        return self.ulysses_degree * self.ring_degree * self.cfg_degree > 1
+
     def __post_init__(self):
         """Cross-field validation for strategy consistency."""
         total_sp = self.ulysses_degree * self.ring_degree * self.cfg_degree
