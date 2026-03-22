@@ -136,9 +136,11 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
 
             if isinstance(weight, DTensor):
                 weight += DTensor.from_local(function(strength * comfy.model_management.cast_to_device(diff_weight, weight.device, weight.dtype)), device_mesh)
-            else:
+            elif device_mesh is not None:
                 weight += function(strength * comfy.model_management.cast_to_device(diff_weight, weight.device, weight.dtype))
                 weight = DTensor.from_local(weight, device_mesh)
+            else:
+                weight += function(strength * comfy.model_management.cast_to_device(diff_weight, weight.device, weight.dtype))
         else:
             logging.warning("patch type not recognized {} {}".format(patch_type, key))
 

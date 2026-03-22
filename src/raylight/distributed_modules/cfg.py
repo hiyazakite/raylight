@@ -40,7 +40,7 @@ if hasattr(model_base, "WAN21"):
 if hasattr(model_base, "QwenImage"):
     @CFGParallelInjectRegistry.register(model_base.QwenImage)
     def _inject_qwen():
-        from ..diffusion_models.qwen.xdit_cfg_parallel import cfg_parallel_forward_wrapper
+        from ..diffusion_models.qwen_image.xdit_cfg_parallel import cfg_parallel_forward_wrapper
         return cfg_parallel_forward_wrapper
 
 if hasattr(model_base, "Chroma"):

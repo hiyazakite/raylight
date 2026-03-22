@@ -13,31 +13,9 @@ import torch
 import folder_paths
 import comfy.utils
 import comfy.lora
+from .int8_quant import _resolve_module, _layer_name_from_key
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# Helpers shared by loaders
-# ============================================================================
-
-def _resolve_module(model_patcher, layer_name):
-    """Walk model_patcher.model.diffusion_model to find a module by dotted name."""
-    parts = layer_name.split(".")
-    target = model_patcher.model.diffusion_model
-    for part in parts[1:] if parts[0] == "diffusion_model" else parts:
-        if part.isdigit():
-            target = target[int(part)]
-        else:
-            target = getattr(target, part)
-    return target
-
-
-def _layer_name_from_key(key):
-    layer_name = key[0] if isinstance(key, tuple) else key
-    if layer_name.endswith(".weight"):
-        layer_name = layer_name[:-7]
-    return layer_name
 
 
 # ============================================================================

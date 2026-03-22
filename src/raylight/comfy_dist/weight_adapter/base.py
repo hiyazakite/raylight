@@ -134,3 +134,32 @@ def tucker_weight_from_conv(up, down, mid):
 def tucker_weight(wa, wb, t):
     temp = torch.einsum("i j ..., j r -> i r ...", t, wb)
     return torch.einsum("i j ..., i r -> r j ...", temp, wa)
+
+
+def factorization(dimension: int, factor: int = -1) -> tuple[int, int]:
+    """
+    Return a tuple of two values of input dimension decomposed by the number closest to factor.
+    Second value is higher or equal than first value.
+    """
+    if factor > 0 and (dimension % factor) == 0 and dimension >= factor**2:
+        m = factor
+        n = dimension // factor
+        if m > n:
+            n, m = m, n
+        return m, n
+    if factor < 0:
+        factor = dimension
+    m, n = 1, dimension
+    length = m + n
+    while m < n:
+        new_m = m + 1
+        while dimension % new_m != 0:
+            new_m += 1
+        new_n = dimension // new_m
+        if new_m + new_n > length or new_m > factor:
+            break
+        else:
+            m, n = new_m, new_n
+    if m > n:
+        n, m = m, n
+    return m, n

@@ -173,13 +173,19 @@ class GGUFContext(ModelContext):
 
         # --- deterministic layout from sorted keys -----------------------
         layout = []
+        zero_byte_keys: Dict[str, torch.Tensor] = {}  # tensors with 0 bytes (scalars/empty)
         offset = 0
         for key in sorted(mmap_cache.keys()):
             tensor = mmap_cache[key]
             is_ggml = isinstance(tensor, GGMLTensor)
             raw = tensor.as_subclass(torch.Tensor) if is_ggml else tensor
-            aligned = _align_up(offset)
             nb = raw.nbytes
+            if nb == 0:
+                # torch.frombuffer cannot handle zero-length buffers;
+                # keep these tensors as-is (pinned privately).
+                zero_byte_keys[key] = tensor
+                continue
+            aligned = _align_up(offset)
             layout.append((
                 key, aligned, nb,
                 tuple(raw.shape), raw.dtype,
@@ -190,7 +196,9 @@ class GGUFContext(ModelContext):
         total_bytes = _align_up(offset)
 
         if total_bytes == 0:
-            return mmap_cache, None
+            # All tensors were zero-byte; nothing to share.
+            pinned_out: Dict[str, torch.Tensor] = dict(zero_byte_keys)
+            return pinned_out if pinned_out else mmap_cache, None
 
         # --- Step 1: Rank 0 creates /dev/shm segment ---
         if is_writer:
@@ -255,6 +263,9 @@ class GGUFContext(ModelContext):
                 pinned[key] = GGMLTensor(view, tensor_type=tt, tensor_shape=ts)
             else:
                 pinned[key] = view
+
+        # --- Add zero-byte tensors back (not in shm) ---
+        pinned.update(zero_byte_keys)
 
         print(
             f"[GGUFContext] Pinned mmap→shm (rank {local_rank}): "

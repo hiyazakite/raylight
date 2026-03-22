@@ -28,6 +28,6 @@ def cfg_parallel_forward_wrapper(executor, *args, **kwargs):
     if ref_latents is not None:
         ref_latents = torch.chunk(ref_latents, cfg_world_size, dim=0)[cfg_rank]
 
-    result = executor(x, timestep, context, attention_mask, guidance, ref_latents, transformer_options, **kwargs)
+    result = executor(x, timestep, context, attention_mask, ref_latents, additional_t_cond, transformer_options, **kwargs)
     result = get_cfg_group().all_gather(result, dim=0)
     return result

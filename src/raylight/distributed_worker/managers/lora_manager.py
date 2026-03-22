@@ -15,6 +15,7 @@ class LoraManager:
         self._applied_loras: Set[Tuple[str, float]] = set()
         self._lora_configs: Dict[str, List[Tuple[str, float]]] = {} # config_hash -> [(lora_path, strength), ...]
         self._current_lora_config_hash: Optional[str] = None
+        self._lora_seed: int = 318008
 
     def load_lora(
         self, 
@@ -22,13 +23,19 @@ class LoraManager:
         config: "WorkerConfig", 
         lora_path: str, 
         strength_model: float, 
-        lora_config_hash: Optional[str] = None
+        lora_config_hash: Optional[str] = None,
+        seed: int = 318008,
     ) -> bool:
         """Loads a LoRA into the model on this worker via mmap.
-        
+
+        For INT8-quantized models the LoRA adapters are automatically rewrapped
+        to use stochastic rounding in INT8 space (same logic as the standalone
+        RayINT8LoraLoader nodes).  Float-precision layers are unaffected.
+
         Note: The caller (RayWorker) MUST ensure the model is loaded/re-hydrated 
         before calling this method via reload_model_if_needed().
         """
+        self._lora_seed = seed
         filename = os.path.basename(lora_path)
         
         if filename.startswith("._") or filename == ".DS_Store":
@@ -162,7 +169,15 @@ class LoraManager:
         
         # Load Patches using Raylight's distributed lora helper
         loaded_patches = dist_load_lora(lora_patches, key_map)
-        
+
+        # INT8 auto-detection: rewrap adapters for quantized layers so the
+        # LoRA delta is applied correctly in INT8 space via stochastic rounding.
+        try:
+            from raylight.comfy_extra_dist.int8.int8_quant import wrap_patches_for_int8
+            loaded_patches = wrap_patches_for_int8(model, loaded_patches, seed=self._lora_seed)
+        except Exception as e:
+            print(f"[RayWorker {config.local_rank}] INT8 LoRA wrap skipped: {e}")
+
         # Apply to Model
         model.add_patches(loaded_patches, strength_model)
         
