@@ -246,6 +246,70 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers: module resolution + INT8 patch wrapping
+# (Also imported by nodes_int8_lora and lora_manager to avoid duplication)
+# ---------------------------------------------------------------------------
+
+def _resolve_module(model_patcher, layer_name):
+    """Walk model_patcher.model.diffusion_model to find a module by dotted name."""
+    parts = layer_name.split(".")
+    target = model_patcher.model.diffusion_model
+    for part in parts[1:] if parts[0] == "diffusion_model" else parts:
+        if part.isdigit():
+            target = target[int(part)]
+        else:
+            target = getattr(target, part)
+    return target
+
+
+def _layer_name_from_key(key):
+    layer_name = key[0] if isinstance(key, tuple) else key
+    if layer_name.endswith(".weight"):
+        layer_name = layer_name[:-7]
+    return layer_name
+
+
+def wrap_patches_for_int8(model_patcher, patch_dict, seed=318008):
+    """
+    Rewrap LoRA adapters in *patch_dict* to use INT8-aware stochastic rounding
+    for every layer whose weights are stored as INT8.  Non-quantized layers are
+    left untouched, so this is safe to call on any model.
+
+    Args:
+        model_patcher: ComfyUI ModelPatcher (with .model.diffusion_model).
+        patch_dict:    dict[key -> adapter] as returned by comfy.lora.load_lora
+                       or the distributed dist_load_lora helper.
+        seed:          Stochastic rounding seed (default 318008).
+
+    Returns:
+        The same *patch_dict*, with INT8 adapters substituted where appropriate.
+    """
+    if INT8LoRAPatchAdapter is None:
+        # comfy.weight_adapter not available; skip silently
+        return patch_dict
+
+    for key in list(patch_dict.keys()):
+        adapter = patch_dict[key]
+        # Only rewrap proper LoRAAdapter objects – leave diff/set tuples alone
+        if not hasattr(adapter, "loaded_keys") or not hasattr(adapter, "weights"):
+            continue
+        layer_name = _layer_name_from_key(key)
+        try:
+            target_module = _resolve_module(model_patcher, layer_name)
+            if hasattr(target_module, "_is_quantized") and target_module._is_quantized:
+                w_scale = target_module.weight_scale
+                if isinstance(w_scale, torch.Tensor):
+                    w_scale = w_scale.item() if w_scale.numel() == 1 else w_scale
+                patch_dict[key] = INT8LoRAPatchAdapter(
+                    adapter.loaded_keys, adapter.weights, w_scale, seed=seed,
+                )
+        except (AttributeError, KeyError, IndexError, TypeError):
+            pass  # Non-quantized or unresolvable layer – leave adapter as-is
+
+    return patch_dict
+
+
+# ---------------------------------------------------------------------------
 # Dynamic LoRA Synchronization Hook
 # ---------------------------------------------------------------------------
 

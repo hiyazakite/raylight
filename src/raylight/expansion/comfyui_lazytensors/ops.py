@@ -162,7 +162,7 @@ class SafetensorOps(comfy.ops.manual_cast):
             ).to(dtype=output_dtype)
 
     class LayerNorm(SafetensorLayer, comfy.ops.manual_cast.LayerNorm):
-        def __init__(self, normalized_shape, eps=1e-05, elementwise_affine=True, device=None, dtype=None):
+        def __init__(self, normalized_shape, eps=1e-05, elementwise_affine=True, bias=True, device=None, dtype=None):
             torch.nn.Module.__init__(self)
             if isinstance(normalized_shape, int):
                 normalized_shape = (normalized_shape,)

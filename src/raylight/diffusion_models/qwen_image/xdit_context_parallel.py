@@ -35,11 +35,15 @@ def usp_dit_forward(
     encoder_hidden_states = context
     encoder_hidden_states_mask = attention_mask
 
+    if encoder_hidden_states_mask is not None and not torch.is_floating_point(encoder_hidden_states_mask):
+        encoder_hidden_states_mask = (encoder_hidden_states_mask - 1).to(x.dtype) * torch.finfo(x.dtype).max
+
     hidden_states, img_ids, orig_shape = self.process_img(x)
     num_embeds = hidden_states.shape[1]
 
     timestep_zero_index = None
     if ref_latents is not None:
+        ref_num_tokens = []
         h = 0
         w = 0
         index = 0
@@ -70,10 +74,13 @@ def usp_dit_forward(
             kontext, kontext_ids, _ = self.process_img(ref, index=index, h_offset=h_offset, w_offset=w_offset)
             hidden_states = torch.cat([hidden_states, kontext], dim=1)
             img_ids = torch.cat([img_ids, kontext_ids], dim=1)
+            ref_num_tokens.append(kontext.shape[1])
         if timestep_zero:
             if index > 0:
                 timestep = torch.cat([timestep, timestep * 0], dim=0)
                 timestep_zero_index = num_embeds
+        transformer_options = transformer_options.copy()
+        transformer_options["reference_image_num_tokens"] = ref_num_tokens
 
     txt_start = round(max(
         ((x.shape[-1] + (self.patch_size // 2)) // self.patch_size) // 2,
@@ -83,6 +90,15 @@ def usp_dit_forward(
         torch.arange(txt_start, txt_start + context.shape[1], device=x.device)
         .reshape(1, -1, 1)
         .repeat(x.shape[0], 1, 3))
+
+    patches = transformer_options.get("patches", {})
+    if "post_input" in patches:
+        for p in patches["post_input"]:
+            out = p({"img": hidden_states, "txt": encoder_hidden_states, "img_ids": img_ids, "txt_ids": txt_ids, "transformer_options": transformer_options})
+            hidden_states = out["img"]
+            encoder_hidden_states = out["txt"]
+            img_ids = out["img_ids"]
+            txt_ids = out["txt_ids"]
 
     # SP Modified, freq rope : List[txt, img]
     image_rotary_emb = [self.pe_embedder(img_ids).squeeze(1).unsqueeze(2).to(x.dtype).contiguous(),
@@ -179,8 +195,8 @@ def usp_dit_forward(
     hidden_states = self.norm_out(hidden_states, temb)
     hidden_states = self.proj_out(hidden_states)
 
-    hidden_states = hidden_states[:, :num_embeds].view(orig_shape[0], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2)
-    hidden_states = hidden_states.permute(0, 3, 1, 4, 2, 5)
+    hidden_states = hidden_states[:, :num_embeds].view(orig_shape[0], orig_shape[-3], orig_shape[-2] // 2, orig_shape[-1] // 2, orig_shape[1], 2, 2)
+    hidden_states = hidden_states.permute(0, 4, 1, 2, 5, 3, 6)
     return hidden_states.reshape(orig_shape)[:, :, :, :x.shape[-2], :x.shape[-1]]
 
 
@@ -191,6 +207,7 @@ def usp_attn_forward(
     encoder_hidden_states_mask: torch.FloatTensor = None,
     attention_mask: Optional[torch.FloatTensor] = None,
     image_rotary_emb: Optional[torch.Tensor] = None,
+    transformer_options={},
     **kwargs
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     seq_txt = encoder_hidden_states.shape[1]

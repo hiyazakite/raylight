@@ -558,14 +558,15 @@ class RayWorker:
 
     # load_bnb_unet removed - migrated to BNBContext
 
-    def load_lora(self, lora_path, strength_model, lora_config_hash=None):
+    def load_lora(self, lora_path, strength_model, lora_config_hash=None, seed=318008):
         self.reload_model_if_needed()
         return self.lora_manager.load_lora(
-            self.model, 
-            self.config, 
-            lora_path, 
-            strength_model, 
-            lora_config_hash
+            self.model,
+            self.config,
+            lora_path,
+            strength_model,
+            lora_config_hash,
+            seed=seed,
         )
 
     def reapply_loras_for_config(self, config_hash):
