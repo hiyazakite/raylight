@@ -22,6 +22,7 @@ from .distributed_worker.ray_worker import (
     ensure_fresh_actors,
     ray_nccl_tester,
 )
+from .comfy_extra_dist.nodes_idlora import RayIDLoraKSampler
 from .comfy_dist.utils import cancellable_get, clear_ray_cluster, get_ray_cluster_epoch
 from raylight.utils.memory import monitor_memory
 from .config import (
@@ -1560,7 +1561,6 @@ class RayOffloadModel:
         return (latent,)
 
 
-
 class RayLoraLoaderModelOnly:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1623,7 +1623,7 @@ NODE_CLASS_MAPPINGS = {
     "DPKSamplerAdvanced": DPKSamplerAdvanced,
     "RayUNETLoader": RayUNETLoader,
     "RayLoraLoaderModelOnly": RayLoraLoaderModelOnly,
-
+    "RayIDLoraKSampler": RayIDLoraKSampler,
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
     "DPNoiseList": DPNoiseList,
@@ -1636,7 +1636,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DPKSamplerAdvanced": "Data Parallel KSampler (Advanced)",
     "RayUNETLoader": "Load Diffusion Model (Ray)",
     "RayLoraLoaderModelOnly": "Ray LoRA Loader",
-
+    "RayIDLoraKSampler": "Ray ID-LoRA KSampler",
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
     "DPNoiseList": "Data Parallel Noise List",
