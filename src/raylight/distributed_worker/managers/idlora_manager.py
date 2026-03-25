@@ -76,6 +76,12 @@ class IDLoraManager:
                 except Exception:
                     pass
 
+                try:
+                    if hasattr(model, "clean_hooks"): # Prevent hook bloat on repeated generations
+                        model.clean_hooks()
+                except Exception:
+                    pass
+
                 # Reset CompactFusion state
                 try:
                     from raylight.distributed_modules.attention.backends.fusion.main import compact_reset
@@ -249,12 +255,15 @@ class IDLoraManager:
                     flush=True,
                 )
 
-            def _calc_batch(x_packed, sigma, conds_to_run, ref_audio_override=None):
+            def _calc_batch(x_packed, sigma, conds_to_run, ref_audio_override=None, model_options_override=None):
                 s = sigma.to(device=device)
                 if s.dim() == 0:
                     s = s.expand(batch_size)
 
-                step_model_options = comfy.model_patcher.create_model_options_clone(model_options)
+                if model_options_override is not None:
+                    step_model_options = comfy.model_patcher.create_model_options_clone(model_options_override)
+                else:
+                    step_model_options = comfy.model_patcher.create_model_options_clone(model_options)
                 step_model_options.setdefault("transformer_options", {})["sample_sigmas"] = sigmas
 
                 if ref_audio_override is not None:
@@ -272,6 +281,31 @@ class IDLoraManager:
                     s,
                     step_model_options,
                 )
+
+            # ------------------------------------------------------------------
+            # Add STG hooks to transformer blocks dynamically
+            # ------------------------------------------------------------------
+            if getattr(denoise_config, "stg_scale", 0.0) > 0.0:
+                def make_stg_wrapper(orig_fn, block_idx):
+                    def wrapper(x, *args, **kwargs):
+                        opts = kwargs.get("transformer_options", {})
+                        skips = opts.get("stg_skip_blocks", None)
+                        if skips is not None and block_idx in skips:
+                            return torch.zeros_like(x)
+                        return orig_fn(x, *args, **kwargs)
+                    return wrapper
+
+                try:
+                    blocks = model.model.diffusion_model.transformer_blocks
+                    for i, block in enumerate(blocks):
+                        if not hasattr(block.attn1, "_orig_forward_stg"):
+                            block.attn1._orig_forward_stg = block.attn1.forward
+                            block.attn1.forward = make_stg_wrapper(block.attn1.forward, i)
+                        if hasattr(block, "audio_attn1") and not hasattr(block.audio_attn1, "_orig_forward_stg"):
+                            block.audio_attn1._orig_forward_stg = block.audio_attn1.forward
+                            block.audio_attn1.forward = make_stg_wrapper(block.audio_attn1.forward, i)
+                except Exception as e:
+                    print(f"[RayWorker 0] Warning: Failed to attach STG wrappers: {e}", flush=True)
 
             # ------------------------------------------------------------------
             # Euler denoising loop
@@ -299,6 +333,7 @@ class IDLoraManager:
                     do_acfg = denoise_config.audio_guidance_scale > 1.0
 
                     # ---- Positive / negative batch via real ComfyUI cond path ----
+                    x0_neg_flat = None
                     if do_vcfg or do_acfg:
                         x0_pos_flat, x0_neg_flat = _calc_batch(
                             packed,
@@ -314,20 +349,60 @@ class IDLoraManager:
                             ref_audio_override=ref_audio,
                         )[0]
 
-                    v_x0, a_x0 = comfy.utils.unpack_latents(x0_pos_flat, latent_shapes)
+                    v_x0_pos, a_x0_pos = comfy.utils.unpack_latents(x0_pos_flat, latent_shapes)
+                    v_x0, a_x0 = v_x0_pos.clone(), a_x0_pos.clone()
 
                     # ---- CFG (video + audio can have different scales) ----
                     if do_vcfg or do_acfg:
                         v_x0_neg, a_x0_neg = comfy.utils.unpack_latents(x0_neg_flat, latent_shapes)
                         if do_vcfg:
-                            v_x0 = v_x0 + (denoise_config.video_guidance_scale - 1.0) * (v_x0 - v_x0_neg)
+                            v_x0 = v_x0 + (denoise_config.video_guidance_scale - 1.0) * (v_x0_pos - v_x0_neg)
                         if do_acfg:
-                            a_x0 = a_x0 + (denoise_config.audio_guidance_scale - 1.0) * (a_x0 - a_x0_neg)
+                            a_x0 = a_x0 + (denoise_config.audio_guidance_scale - 1.0) * (a_x0_pos - a_x0_neg)
+                        try:
+                            del x0_neg_flat, v_x0_neg, a_x0_neg
+                        except Exception:
+                            pass
+
+                    # ---- STG (Spatio-Temporal Guidance) ----
+                    stg_blocks = getattr(denoise_config, "stg_block_idx", None)
+                    if getattr(denoise_config, "stg_scale", 0.0) > 0.0 and stg_blocks is not None:
+                        stg_opts = comfy.model_patcher.create_model_options_clone(model_options)
+                        stg_opts.setdefault("transformer_options", {})["stg_skip_blocks"] = set(stg_blocks)
+                        x0_stg_flat = _calc_batch(
+                            packed,
+                            sigma,
+                            [processed_conds["positive"]],
+                            ref_audio_override=ref_audio,
+                            model_options_override=stg_opts
+                        )[0]
+                        v_x0_stg, a_x0_stg = comfy.utils.unpack_latents(x0_stg_flat, latent_shapes)
+                        v_x0 = v_x0 + denoise_config.stg_scale * (v_x0_pos - v_x0_stg)
+                        a_x0 = a_x0 + denoise_config.stg_scale * (a_x0_pos - a_x0_stg)
+                        del x0_stg_flat, v_x0_stg, a_x0_stg
+
+                    # ---- AV Bimodal Guidance ----
+                    if getattr(denoise_config, "av_bimodal_scale", 0.0) > 1.0:
+                        iso_opts = comfy.model_patcher.create_model_options_clone(model_options)
+                        iso_t_opts = iso_opts.setdefault("transformer_options", {})
+                        iso_t_opts["a2v_cross_attn"] = False
+                        iso_t_opts["v2a_cross_attn"] = False
+                        x0_iso_flat = _calc_batch(
+                            packed,
+                            sigma,
+                            [processed_conds["positive"]],
+                            ref_audio_override=ref_audio,
+                            model_options_override=iso_opts
+                        )[0]
+                        v_x0_iso, a_x0_iso = comfy.utils.unpack_latents(x0_iso_flat, latent_shapes)
+                        v_x0 = v_x0 + (denoise_config.av_bimodal_scale - 1.0) * (v_x0_pos - v_x0_iso)
+                        a_x0 = a_x0 + (denoise_config.av_bimodal_scale - 1.0) * (a_x0_pos - a_x0_iso)
+                        del x0_iso_flat, v_x0_iso, a_x0_iso
 
                     # ---- Identity guidance (extra no-ref pass) ----
                     # Forward pass without ref_audio, then amplify the delta
                     # introduced by the reference on audio only.
-                    if denoise_config.identity_guidance_scale > 0.0 and ref_audio is not None:
+                    if getattr(denoise_config, "identity_guidance_scale", 0.0) > 0.0 and ref_audio is not None:
                         x0_noref_flat = _calc_batch(
                             packed,
                             sigma,
@@ -336,7 +411,10 @@ class IDLoraManager:
                         )[0]
                         _, a_x0_noref = comfy.utils.unpack_latents(x0_noref_flat, latent_shapes)
                         id_scale = denoise_config.identity_guidance_scale
-                        a_x0 = a_x0 + id_scale * (a_x0 - a_x0_noref)
+                        a_x0 = a_x0 + id_scale * (a_x0_pos - a_x0_noref)
+                        del x0_noref_flat, a_x0_noref
+                    
+                    del v_x0_pos, a_x0_pos, x0_pos_flat
 
                     # ---- State cleanup between passes ----
                     # Clear trivial mask cache to ensure next pass (with or without ref) 
