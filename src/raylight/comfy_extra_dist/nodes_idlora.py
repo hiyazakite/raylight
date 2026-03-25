@@ -42,6 +42,7 @@ class RayIDLoraKSampler:
             "optional": {
                 "reference_audio_latent": ("LATENT", {"tooltip": "Encoded reference audio from LTXVAudioVAEEncode — speaker identity"}),
                 "stg_scale": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1}),
+                "stg_blocks": ("STRING", {"default": "0,1,2,3"}),
                 "av_bimodal_scale": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1}),
             },
         }
@@ -65,6 +66,7 @@ class RayIDLoraKSampler:
         latent_image,
         reference_audio_latent=None,
         stg_scale=0.0,
+        stg_blocks="",
         av_bimodal_scale=0.0,
     ):
         from raylight.distributed_worker.managers.idlora_manager import IDLoraDenoiseConfig
@@ -92,6 +94,7 @@ class RayIDLoraKSampler:
 
             v_mask = None
             a_mask = None
+            av_masks = None
             if "noise_mask" in latent_image and latent_image["noise_mask"] is not None:
                 av_masks = latent_image["noise_mask"].unbind()
                 v_mask = av_masks[0].cpu()  # (B, 1, F, H, W)
@@ -115,13 +118,15 @@ class RayIDLoraKSampler:
                 v_noise = torch.randn(v_clean.shape, generator=gen, dtype=dtype)
                 v_mask_eff = v_mask.to(dtype=dtype) if v_mask is not None else torch.ones(1, 1, 1, 1, 1, dtype=dtype)
                 v_scaled_mask = v_mask_eff * sigma_max
-                v_f = v_noise * v_scaled_mask + v_clean * (1.0 - v_scaled_mask)
+                v_f = torch.lerp(v_clean, v_noise, v_scaled_mask)
+                del v_noise, v_mask_eff, v_scaled_mask
 
                 a_clean = audio_samples.to(dtype=dtype, device="cpu")
                 a_noise = torch.randn(a_clean.shape, generator=gen, dtype=dtype)
                 a_mask_eff = a_mask.to(dtype=dtype) if a_mask is not None else torch.ones(1, 1, 1, 1, dtype=dtype)
                 a_scaled_mask = a_mask_eff * sigma_max
-                a_f = a_noise * a_scaled_mask + a_clean * (1.0 - a_scaled_mask)
+                a_f = torch.lerp(a_clean, a_noise, a_scaled_mask)
+                del a_noise, a_mask_eff, a_scaled_mask
             else:
                 v_clean = video_samples.to(dtype=dtype, device="cpu")
                 a_clean = audio_samples.to(dtype=dtype, device="cpu")
@@ -161,11 +166,23 @@ class RayIDLoraKSampler:
             v_clean_ref = ray.put(v_clean)
             a_clean_ref = ray.put(a_clean)
 
+            # Eagerly free huge CPU tensors in main process now that Ray Object Store has them
+            del v_f, a_f, v_clean, a_clean, v_mask_send, v_mask, a_mask, sigmas_cpu, ref_audio
+            del video_samples, audio_samples, av_latents
+            if "noise_mask" in latent_image and latent_image["noise_mask"] is not None:
+                del av_masks
+            gc.collect()
+
+            stg_block_idx = None
+            if stg_scale > 0.0 and stg_blocks:
+                stg_block_idx = [int(x.strip()) for x in stg_blocks.split(",") if x.strip().isdigit()]
+
             denoise_config = IDLoraDenoiseConfig(
                 video_guidance_scale=video_guidance_scale,
                 audio_guidance_scale=audio_guidance_scale,
                 identity_guidance_scale=identity_guidance_scale,
                 stg_scale=stg_scale,
+                stg_block_idx=stg_block_idx,
                 av_bimodal_scale=av_bimodal_scale,
             )
             config_ref = ray.put(denoise_config)
