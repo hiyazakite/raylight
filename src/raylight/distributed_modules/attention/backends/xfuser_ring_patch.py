@@ -86,6 +86,43 @@ def compute_chunked_lse(q_t, k_t, softmax_scale, mask=None, causal=False):
     return lse
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Standalone compiled FlexAttention wrapper.
+# flex_attention needs torch.compile to produce fused Triton kernels.
+# Our call chain is inside @torch.compiler.disable, which prevents internal
+# compilation. This standalone function creates its own compilation context.
+# ────────────────────────────────────────────────────────────────────────────
+
+_compiled_flex_fn = None
+
+def _flex_attn_with_mask(q, k, v, mask, softmax_scale):
+    """Compiled wrapper for flex_attention with additive mask.
+    
+    Must be compiled via torch.compile to produce fused Triton kernels.
+    The score_mod closure captures `mask` as a function argument so Dynamo
+    can properly guard on shape changes.
+    """
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score + mask[b, h % mask.shape[1], q_idx, kv_idx]
+    
+    out, aux = flex_attention(
+        q, k, v,
+        score_mod=score_mod,
+        scale=softmax_scale,
+        return_aux=AuxRequest(lse=True),
+    )
+    lse = getattr(aux, "lse", None)
+    return out, lse
+
+
+def _get_compiled_flex_fn():
+    """Lazily compile and cache the flex_attention wrapper."""
+    global _compiled_flex_fn
+    if _compiled_flex_fn is None:
+        _compiled_flex_fn = torch.compile(_flex_attn_with_mask)
+    return _compiled_flex_fn
+
+
 def manual_block_attention(
     q, k, v, 
     dropout_p=0.0, 
@@ -100,15 +137,17 @@ def manual_block_attention(
     if softmax_scale is None:
         softmax_scale = q.size(-1) ** -0.5
 
-    # 1. Try FlexAttention (Fastest, avoids materializing large masks)
+    # 1. FlexAttention with explicit compilation.
+    # flex_attention requires torch.compile for fused Triton kernels. Our parent
+    # call chain has @torch.compiler.disable, which prevents flex_attention's
+    # internal compile from generating kernels (falls back to unfused vmap OOM).
+    # Solution: extract the call into a standalone compiled function defined at
+    # module scope, which creates its own compilation context.
     if _HAS_FLEX_ATTN and mask is not None:
-        def score_mod(score, b, h, q_idx, kv_idx):
-            return score + mask[b, h % mask.shape[1], q_idx, kv_idx]
-
         if flex_attention is None or AuxRequest is None:
             raise ImportError("FlexAttention components not available despite _HAS_FLEX_ATTN being True")
 
-        # We need to ensure they match (B, H, S, D).
+        # We need (B, H, S, D) layout for flex_attention.
         if q.dim() == 3:
             b, l, dim = q.shape
             h = mask.shape[1]
@@ -128,9 +167,8 @@ def manual_block_attention(
         else:
             raise ValueError(f"Expected 3D or 4D query, got {q.dim()}D")
 
-        res = flex_attention(q_flex, k_flex, v_flex, score_mod=score_mod, return_aux=AuxRequest(lse=True))
-        out, aux = res
-        lse = getattr(aux, "lse", None)
+        compiled_fn = _get_compiled_flex_fn()
+        out, lse = compiled_fn(q_flex, k_flex, v_flex, mask, softmax_scale)
         out = out.transpose(1, 2).contiguous()
         return out, lse
 

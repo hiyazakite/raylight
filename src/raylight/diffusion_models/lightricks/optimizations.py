@@ -21,13 +21,16 @@ RAYLIGHT_DEBUG = os.environ.get("RAYLIGHT_DEBUG", "0") == "1"
 # Positional Embedding Caching
 # ---------------------------------------------------------------------------
 
-def _get_pe_cache_key(pixel_coords_chunk, frame_rate, dtype):
-    """Build a cache key from coord shapes, frame_rate, and dtype."""
+def _get_pe_cache_key(pixel_coords_chunk, frame_rate, dtype, ref_audio_seq_len=0):
+    """Build a cache key from coord shapes, values, frame_rate, and dtype."""
     if isinstance(pixel_coords_chunk, (list, tuple)):
         shapes = tuple(tuple(p.shape) for p in pixel_coords_chunk)
     else:
         shapes = tuple(pixel_coords_chunk.shape)
-    return (shapes, frame_rate, dtype)
+    
+    # We include ref_audio_seq_len specifically as a proxy for the coordinate shift
+    # introduced by ID-LoRA.
+    return (shapes, frame_rate, dtype, ref_audio_seq_len)
 
 
 def prepare_pe_cached(model, pixel_coords_chunk, frame_rate, input_dtype):
@@ -37,7 +40,8 @@ def prepare_pe_cached(model, pixel_coords_chunk, frame_rate, input_dtype):
     constant during a single generation run. Caching eliminates redundant PE
     computation on every denoising step.
     """
-    cache_key = _get_pe_cache_key(pixel_coords_chunk, frame_rate, input_dtype)
+    ref_audio_seq_len = getattr(model, "_ref_audio_seq_len", 0)
+    cache_key = _get_pe_cache_key(pixel_coords_chunk, frame_rate, input_dtype, ref_audio_seq_len)
 
     cached = getattr(model, "_raylight_pe_cache", None)
     if cached is not None and cached[0] == cache_key:

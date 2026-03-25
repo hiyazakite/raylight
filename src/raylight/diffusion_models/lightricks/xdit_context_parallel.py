@@ -231,7 +231,48 @@ def usp_dit_forward(
     # ======================== ADD SEQUENCE PARALLEL ========================= #
     # 1. Pad inputs to world size
     x, x_orig = pad_group_to_world_size(x, dim=1)
-    context, _ = pad_group_to_world_size(context, dim=1)
+    context, context_orig = pad_group_to_world_size(context, dim=1)
+    
+    # NEW: Generate padding masks BEFORE chunking so Ring Attention ignores padding
+    usp_padding_masks = {}
+    
+    x_is_group = isinstance(x, (list, tuple))
+    x_device = x[0].device if x_is_group else x.device
+    
+    def add_mask(q_pad, k_pad, q_orig, k_orig):
+        if q_pad == 0 or k_pad == 0: return
+        if q_pad == q_orig and k_pad == k_orig: return
+        mask_key = (q_pad, k_pad)
+        if mask_key not in usp_padding_masks:
+            m = torch.zeros(1, 1, q_pad, k_pad, dtype=input_dtype, device=x_device)
+            if q_pad > q_orig:
+                m[:, :, q_orig:, :] = float("-inf")
+            if k_pad > k_orig:
+                m[:, :, :, k_orig:] = float("-inf")
+            usp_padding_masks[mask_key] = m
+    
+    if x_is_group and len(x) >= 2:
+        v_pad, a_pad = x[0].shape[1], x[1].shape[1]  # type: ignore
+        v_orig, a_orig = x_orig[0], x_orig[1]  # type: ignore
+        c_pad = context[0].shape[1] if isinstance(context, (list, tuple)) else context.shape[1]  # type: ignore
+        c_orig = context_orig[0] if isinstance(context_orig, (list, tuple)) else context_orig  # type: ignore
+        add_mask(v_pad, v_pad, v_orig, v_orig)
+        add_mask(a_pad, a_pad, a_orig, a_orig)
+        add_mask(v_pad, a_pad, v_orig, a_orig)
+        add_mask(a_pad, v_pad, a_orig, v_orig)
+        add_mask(v_pad, c_pad, v_orig, c_orig)
+        add_mask(a_pad, c_pad, a_orig, c_orig)
+    else:
+        v_pad = x[0].shape[1] if x_is_group else x.shape[1]  # type: ignore
+        v_orig = x_orig[0] if isinstance(x_orig, (list, tuple)) else x_orig  # type: ignore
+        c_pad = context[0].shape[1] if isinstance(context, (list, tuple)) else context.shape[1]  # type: ignore
+        c_orig = context_orig[0] if isinstance(context_orig, (list, tuple)) else context_orig  # type: ignore
+        add_mask(v_pad, v_pad, v_orig, v_orig)
+        add_mask(v_pad, c_pad, v_orig, c_orig)
+        
+    # ALWAYS set masks (even if empty) so stale masks from a previous forward
+    # pass (e.g. with-ref-audio → without-ref-audio) are cleared.
+    transformer_options["usp_padding_masks"] = usp_padding_masks
     # Important: pad pixel_coords before slicing to ensure consistent chunking
     pixel_coords_padded, _ = pad_group_to_world_size(pixel_coords, dim=2) # (B, 1, T, 3) -> dim 2 is seq
 
@@ -261,6 +302,9 @@ def usp_dit_forward(
         logger.info("[RayWorker %d] Blocks complete. Peak VRAM: %.1fMB", sp_rank, torch.cuda.max_memory_allocated()/1024**2)
     
     x = sp_gather_group(x, x_orig, dim=1)
+    
+    # Clean up padding masks to prevent leaking into other code paths
+    transformer_options.pop("usp_padding_masks", None)
 
     # Process output
     x = self._process_output(x, embedded_timestep, keyframe_idxs, **merged_args)
@@ -289,18 +333,16 @@ def usp_cross_attn_forward(
         q = apply_rotary_emb(q, pe)
         k = apply_rotary_emb(k, pe if k_pe is None else k_pe)
 
-    # Optimization: Only pass mask if it's not None and not trivial
-    # We check if it's None first as it's the fastest
-    if mask is not None:
-        # For LTX, masks are usually additive (0 for keep, -inf for mask)
-        # We can do a very quick check: if it's all zeros, it's an identity mask.
-        # However, to avoid frequent GPU-CPU syncs, we trust the top-level usp_dit_forward
-        # which already cleaned up the global attention_mask.
-        # But for self_attention_mask or others, we might want to check.
-        pass
-
     # Pass metadata if available in transformer_options
     mod_idx = transformer_options.get("block_index", None)
+    
+    # Optimization: Only pass mask if it's not None and not trivial
+    if mask is None:
+        sp_world_size = get_sequence_parallel_world_size()
+        q_len_full = q.shape[1] * sp_world_size
+        k_len_full = k.shape[1] * sp_world_size
+        usp_masks = transformer_options.get("usp_padding_masks", {})
+        mask = usp_masks.get((q_len_full, k_len_full), None)
     
     from raylight.distributed_modules.attention.backends.fusion.main import compact_get_step
     

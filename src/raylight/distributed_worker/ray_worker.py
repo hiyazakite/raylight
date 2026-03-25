@@ -27,6 +27,7 @@ from ray.exceptions import RayActorError
 from raylight.distributed_worker.managers.lora_manager import LoraManager
 from raylight.distributed_worker.managers.vae_manager import VaeManager
 from raylight.distributed_worker.managers.sampler_manager import SamplerManager
+from raylight.distributed_worker.managers.idlora_manager import IDLoraManager
 
 
 
@@ -78,6 +79,7 @@ class RayWorker:
         self.lora_manager = LoraManager() # Stateless
         self.vae_manager = VaeManager() # Stateless
         self.sampler_manager = SamplerManager() # Stateless initialization
+        self.idlora_manager = IDLoraManager() # Stateless initialization
         
 
         
@@ -857,6 +859,36 @@ class RayWorker:
              # OPTIMIZATION: Do not clear reload_params blindly.
              # self.reload_params = None
         return result
+
+    @patch_temp_fix_ck_ops
+    def idlora_sample(
+        self,
+        video_dict,
+        audio_dict,
+        positive,
+        negative,
+        sigmas,
+        ref_audio=None,
+        denoise_config=None,
+        v_clean=None,
+        a_clean=None,
+    ):
+        self.reload_model_if_needed()
+
+        # Context extraction + denoising loop handled entirely in idlora_manager.
+        return self.idlora_manager.idlora_denoise(
+            model=self.model,
+            config=self.config,
+            video_dict=video_dict,
+            audio_dict=audio_dict,
+            positive=positive,
+            negative=negative,
+            sigmas=sigmas,
+            ref_audio=ref_audio,
+            denoise_config=denoise_config,
+            v_clean=v_clean,
+            a_clean=a_clean,
+        )
 
 
 

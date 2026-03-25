@@ -151,9 +151,16 @@ class SamplerManager:
              work_model, final_samples, noise_mask, disable_pbar, work_latent, model_modified = ctx
              
              # 2. Noise Generation
+             import comfy.nested_tensor
+             import comfy.sample
              if not add_noise:
                  # OPTIMIZATION: Use zeros_like to avoid CPU->GPU transfer if latent is already on GPU
-                 noise = torch.zeros_like(work_latent["samples"])
+                 # Handle NestedTensor (e.g. LTXVConcatAVLatent output fed with add_noise=False)
+                 samples = work_latent["samples"]
+                 if isinstance(samples, comfy.nested_tensor.NestedTensor):
+                     noise = comfy.nested_tensor.NestedTensor(tuple(torch.zeros_like(t) for t in samples.unbind()))
+                 else:
+                     noise = torch.zeros_like(samples)
              else:
                  noise = Noise_RandomNoise(noise_seed).generate_noise(work_latent)
 
