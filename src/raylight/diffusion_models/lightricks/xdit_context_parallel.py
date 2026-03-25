@@ -233,45 +233,13 @@ def usp_dit_forward(
     x, x_orig = pad_group_to_world_size(x, dim=1)
     context, context_orig = pad_group_to_world_size(context, dim=1)
     
-    # NEW: Generate padding masks BEFORE chunking so Ring Attention ignores padding
+    # Padding masks DISABLED: zero-padded tokens contribute negligibly to
+    # attention outputs (near-zero softmax weight), and the padded output is
+    # stripped by sp_gather_group. Enabling masks caused systematic dot
+    # artifacts in video output via the compiled FlexAttention kernel.
     usp_padding_masks = {}
     
-    x_is_group = isinstance(x, (list, tuple))
-    x_device = x[0].device if x_is_group else x.device
-    
-    def add_mask(q_pad, k_pad, q_orig, k_orig):
-        if q_pad == 0 or k_pad == 0: return
-        if q_pad == q_orig and k_pad == k_orig: return
-        mask_key = (q_pad, k_pad)
-        if mask_key not in usp_padding_masks:
-            m = torch.zeros(1, 1, q_pad, k_pad, dtype=input_dtype, device=x_device)
-            if q_pad > q_orig:
-                m[:, :, q_orig:, :] = float("-inf")
-            if k_pad > k_orig:
-                m[:, :, :, k_orig:] = float("-inf")
-            usp_padding_masks[mask_key] = m
-    
-    if x_is_group and len(x) >= 2:
-        v_pad, a_pad = x[0].shape[1], x[1].shape[1]  # type: ignore
-        v_orig, a_orig = x_orig[0], x_orig[1]  # type: ignore
-        c_pad = context[0].shape[1] if isinstance(context, (list, tuple)) else context.shape[1]  # type: ignore
-        c_orig = context_orig[0] if isinstance(context_orig, (list, tuple)) else context_orig  # type: ignore
-        add_mask(v_pad, v_pad, v_orig, v_orig)
-        add_mask(a_pad, a_pad, a_orig, a_orig)
-        add_mask(v_pad, a_pad, v_orig, a_orig)
-        add_mask(a_pad, v_pad, a_orig, v_orig)
-        add_mask(v_pad, c_pad, v_orig, c_orig)
-        add_mask(a_pad, c_pad, a_orig, c_orig)
-    else:
-        v_pad = x[0].shape[1] if x_is_group else x.shape[1]  # type: ignore
-        v_orig = x_orig[0] if isinstance(x_orig, (list, tuple)) else x_orig  # type: ignore
-        c_pad = context[0].shape[1] if isinstance(context, (list, tuple)) else context.shape[1]  # type: ignore
-        c_orig = context_orig[0] if isinstance(context_orig, (list, tuple)) else context_orig  # type: ignore
-        add_mask(v_pad, v_pad, v_orig, v_orig)
-        add_mask(v_pad, c_pad, v_orig, c_orig)
-        
-    # ALWAYS set masks (even if empty) so stale masks from a previous forward
-    # pass (e.g. with-ref-audio → without-ref-audio) are cleared.
+    # ALWAYS set (even empty) so stale masks from a previous pass are cleared.
     transformer_options["usp_padding_masks"] = usp_padding_masks
     # Important: pad pixel_coords before slicing to ensure consistent chunking
     pixel_coords_padded, _ = pad_group_to_world_size(pixel_coords, dim=2) # (B, 1, T, 3) -> dim 2 is seq
