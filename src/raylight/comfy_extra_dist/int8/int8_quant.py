@@ -123,10 +123,14 @@ def int8_forward_dynamic_per_row(
 # INT8 LoRA Adapters
 # ---------------------------------------------------------------------------
 try:
-    from comfy.weight_adapter.lora import LoRAAdapter
+    from raylight.comfy_dist.weight_adapter.lora import LoRAAdapter
     _LORA_ADAPTER_AVAILABLE = True
 except ImportError:
-    _LORA_ADAPTER_AVAILABLE = False
+    try:
+        from comfy.weight_adapter.lora import LoRAAdapter
+        _LORA_ADAPTER_AVAILABLE = True
+    except ImportError:
+        _LORA_ADAPTER_AVAILABLE = False
 
 
 def _get_effective_scale(weight_scale, delta_f, offset):
@@ -155,6 +159,7 @@ if _LORA_ADAPTER_AVAILABLE:
         def calculate_weight(
             self, weight, key, strength, strength_model, offset, function,
             intermediate_dtype=torch.float32, original_weight=None,
+            device_mesh=None,
         ):
             v = self.weights
             up, down, alpha = v[0], v[1], v[2]
@@ -201,6 +206,7 @@ if _LORA_ADAPTER_AVAILABLE:
         def calculate_weight(
             self, weight, key, strength, strength_model, offset, function,
             intermediate_dtype=torch.float32, original_weight=None,
+            device_mesh=None,
         ):
             device = weight.device
             comp_device = torch.device("cuda") if torch.cuda.is_available() else device
