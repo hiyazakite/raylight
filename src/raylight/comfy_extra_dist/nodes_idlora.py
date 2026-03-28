@@ -47,8 +47,8 @@ class RayIDLoraKSampler:
             },
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("av_latent",)
+    RETURN_TYPES = ("LATENT", "LATENT")
+    RETURN_NAMES = ("output", "denoised_output")
     FUNCTION = "sample"
     CATEGORY = "Raylight"
 
@@ -201,14 +201,15 @@ class RayIDLoraKSampler:
             ]
 
             results = cancellable_get(futures)
-            video_out, audio_out = results[0]  # both on CPU
+            (video_out, audio_out), (video_denoised, audio_denoised) = results[0]  # all on CPU
 
             output = {"samples": comfy.nested_tensor.NestedTensor((video_out, audio_out))}
+            denoised_output = {"samples": comfy.nested_tensor.NestedTensor((video_denoised, audio_denoised))}
 
             gc.collect()
             torch.cuda.empty_cache()
 
-            return (output,)
+            return (output, denoised_output)
 
         except Exception as e:
             clear_ray_cluster(ray_actors, reason=f"sampling error in RayIDLoraKSampler: {type(e).__name__}")

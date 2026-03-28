@@ -200,6 +200,29 @@ def _ensure_runtime_workdir(module_dir: Path) -> Path:
     return runtime_dir
 
 
+def _parse_gpu_indices(gpu_indices: str, world_size: int | None = None) -> list[int]:
+    entries = [entry.strip() for entry in gpu_indices.split(",") if entry.strip()]
+    if not entries:
+        return []
+
+    try:
+        parsed_indices = [int(entry) for entry in entries]
+    except ValueError as exc:
+        raise ValueError(
+            "gpu_indices must be a comma-separated list of integers, e.g. '0,1'"
+        ) from exc
+
+    if len(set(parsed_indices)) != len(parsed_indices):
+        raise ValueError("gpu_indices must not contain duplicate GPU ids")
+
+    if world_size is not None and len(parsed_indices) < world_size:
+        raise ValueError(
+            f"gpu_indices contains {len(parsed_indices)} GPUs, but {world_size} (GPU input) were requested."
+        )
+
+    return parsed_indices
+
+
 def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir: Path):
     # For local clusters, avoid py_modules and working_dir entirely.
     # py_modules triggers zipping/uploading the module (~5-10s),
@@ -411,6 +434,8 @@ class RayInitializer:
         mmap_cache_size: int = 4,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
+            parsed_gpu_indices = _parse_gpu_indices(gpu_indices, world_size=GPU)
+
             # THIS IS PYTORCH DIST ADDRESS
             # (TODO) Change so it can be use in cluster of nodes. but it is long waaaaay down in the priority list
             # os.environ['TORCH_CUDA_ARCH_LIST'] = ""
@@ -483,7 +508,7 @@ class RayInitializer:
                 ),
                 device=DeviceConfig(
                     world_size=GPU,
-                    gpu_indices=[int(x.strip()) for x in gpu_indices.split(",") if x.strip()],
+                    gpu_indices=parsed_gpu_indices,
                     vram_limit_gb=vram_limit_gb,
                     use_mmap=use_mmap,
                     mmap_cache_size=mmap_cache_size,
@@ -524,13 +549,8 @@ class RayInitializer:
             # GPU Pinning Logic
             original_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
             try:
-                if gpu_indices.strip():
-                    # Validate and set
-                    indices = [x.strip() for x in gpu_indices.split(",") if x.strip()]
-                    if len(indices) < world_size:
-                         raise ValueError(f"gpu_indices contains {len(indices)} GPUs, but {world_size} (GPU input) were requested.")
-                    
-                    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(indices)
+                if parsed_gpu_indices:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in parsed_gpu_indices)
                     print(f"[Raylight] Pinning Ray Cluster to GPUs: {os.environ['CUDA_VISIBLE_DEVICES']}")
 
                 # ===== OPTIMIZATION: Cluster Reuse =====
@@ -582,7 +602,7 @@ class RayInitializer:
             # Restore original environment to avoid affecting other nodes
             if original_visible_devices is not None:
                 os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
-            elif "CUDA_VISIBLE_DEVICES" in os.environ and gpu_indices.strip():
+            elif "CUDA_VISIBLE_DEVICES" in os.environ and parsed_gpu_indices:
                  del os.environ["CUDA_VISIBLE_DEVICES"]
 
             # ===== OPTIMIZATION: Skip NCCL Test =====
@@ -597,8 +617,8 @@ class RayInitializer:
             ray_actors = ray_actor_fn()
             
             # Store GPU indices for later use in samplers (for partial offload matching)
-            if gpu_indices.strip():
-                ray_actors["gpu_indices"] = [int(x.strip()) for x in gpu_indices.split(",") if x.strip()]
+            if parsed_gpu_indices:
+                ray_actors["gpu_indices"] = parsed_gpu_indices.copy()
             else:
                 # Default: 0, 1, 2, ...
                 ray_actors["gpu_indices"] = list(range(world_size))
@@ -708,13 +728,6 @@ class RayInitializerAdvanced(RayInitializer):
                     "min": 1,
                     "max": 10,
                     "tooltip": "LRU cache size for mmap'd model state dicts."
-                }),
-                "vram_limit_gb": ("FLOAT", {
-                    "default": 0.0,
-                    "min": 0.0,
-                    "max": 128.0,
-                    "step": 0.5,
-                    "tooltip": "Max VRAM (GB) per GPU for model weights. 0 = auto (use all available). Useful for sharing VRAM with other tasks or forcing CPU offload for large models."
                 }),
             }
         }
@@ -969,7 +982,8 @@ class XFuserKSamplerAdvanced:
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = ("LATENT", "LATENT")
+    RETURN_NAMES = ("output", "denoised_output")
     FUNCTION = "ray_sample"
 
     CATEGORY = "Raylight"
@@ -1034,7 +1048,7 @@ class XFuserKSamplerAdvanced:
             results: Any = cancellable_get(futures)
             if results is None:
                  raise RuntimeError("Raylight: Sampling failed or was cancelled.")
-            return (results[0][0],)
+            return (results[0][0], results[0][1])
         except Exception as e:
             clear_ray_cluster(ray_actors, reason=f"sampling error in XFuserKSamplerAdvanced: {type(e).__name__}")
             raise
@@ -1073,8 +1087,9 @@ class DPKSamplerAdvanced:
             }
         }
 
-    RETURN_TYPES = ("LATENT",)
-    OUTPUT_IS_LIST = (True,)
+    RETURN_TYPES = ("LATENT", "LATENT")
+    RETURN_NAMES = ("output", "denoised_output")
+    OUTPUT_IS_LIST = (True, True)
     INPUT_IS_LIST = True
     FUNCTION = "ray_sample"
 
@@ -1163,18 +1178,23 @@ class DPKSamplerAdvanced:
                  raise RuntimeError("Raylight: Sampling failed or was cancelled.")
             
             if parallel_dict is not None and parallel_dict.get("is_xdit"):
-                 return (results[0][0],)
+                  return (results[0][0], results[0][1])
 
             # Standard mode: concat shards
             out: Any = latent_image[0]
             out = out.copy()
+            denoised_out: Any = latent_image[0]
+            denoised_out = denoised_out.copy()
             samples = []
+            denoised_samples = []
             for res in results:
                  if res is not None:
                       samples.append(res[0]["samples"])
+                      denoised_samples.append(res[1]["samples"])
         
             out["samples"] = torch.cat(samples, dim=0)
-            return (out,)
+            denoised_out["samples"] = torch.cat(denoised_samples, dim=0)
+            return (out, denoised_out)
         except Exception as e:
             clear_ray_cluster(ray_actors, reason=f"sampling error in DPKSamplerAdvanced: {type(e).__name__}")
             raise

@@ -243,8 +243,8 @@ class XFuserSamplerCustom:
             },
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("output",)
+    RETURN_TYPES = ("LATENT", "LATENT")
+    RETURN_NAMES = ("output", "denoised_output")
 
     FUNCTION = "ray_sample"
 
@@ -295,7 +295,7 @@ class XFuserSamplerCustom:
             ]
             results = ray.get(futures)
             out = results[0]
-            return (out,)
+            return (out[0], out[1])
         except Exception as e:
             clear_ray_cluster(ray_actors, reason=f"sampling error in XFuserSamplerCustom: {type(e).__name__}")
             raise
@@ -327,9 +327,9 @@ class DPSamplerCustom:
             },
         }
 
-    RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = ("LATENT", "LATENT")
     RETURN_NAMES = ("output", "denoised_output")
-    OUTPUT_IS_LIST = (True,)
+    OUTPUT_IS_LIST = (True, True)
     INPUT_IS_LIST = True
     FUNCTION = "ray_sample"
     CATEGORY = "Raylight/extra/custom_sampling/samplers"
@@ -386,7 +386,9 @@ class DPSamplerCustom:
                 for i, actor in enumerate(gpu_actors)
             ]
             out = ray.get(futures)
-            return (out,)
+            output = [res[0] for res in out]
+            denoised_output = [res[1] for res in out]
+            return (output, denoised_output)
         except Exception as e:
             clear_ray_cluster(ray_actors, reason=f"sampling error in DPSamplerCustom: {type(e).__name__}")
             raise

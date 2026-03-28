@@ -145,7 +145,7 @@ class SamplerManager:
         latent_image,
         state_dict: Optional[dict] = None
     ):
-        # Returns: (Out Latent, boolean flag if model was modified/baked)
+        # Returns: ((Out Latent, Denoised Out Latent), boolean flag if model was modified/baked)
         
         with self.sampling_context(model, config, latent_image, state_dict, name="custom_sampler") as ctx:
              work_model, final_samples, noise_mask, disable_pbar, work_latent, model_modified = ctx
@@ -183,9 +183,10 @@ class SamplerManager:
 
                  # Stats + Compact Callback
                  last_step_time = time.perf_counter()
-                 
+                 last_denoised = None
+
                  def sampling_callback(step, x0, x, total_steps):
-                    nonlocal last_step_time
+                    nonlocal last_step_time, last_denoised
                     current_time = time.perf_counter()
 
                     last_step_time = current_time
@@ -199,6 +200,10 @@ class SamplerManager:
                         compact_set_step(step)
                     except (ImportError, NameError, AttributeError):
                         pass
+
+                    # Keep the final x0 estimate so nodes can expose denoised_output.
+                    if x0 is not None and (step + 1) >= total_steps:
+                        last_denoised = x0.detach().clone()
                         
                  profile_enabled = config.raylight_config.debug.profile_sampler
                  with CProfileContext(enabled=profile_enabled, sort_by='cumulative', top_k=5, name="custom_ksampler (Comfy)"):
@@ -216,11 +221,16 @@ class SamplerManager:
                           seed=noise_seed,
                           callback=sampling_callback,
                       )
+                 samples_cpu = samples.to("cpu")
+                 denoised_cpu = last_denoised.to("cpu") if last_denoised is not None else samples_cpu
+
                  out = work_latent.copy()
-                 out["samples"] = samples.to("cpu")
+                 out["samples"] = samples_cpu
+                 denoised_out = work_latent.copy()
+                 denoised_out["samples"] = denoised_cpu
                  del samples # Drop GPU reference immediately
 
-        return out, model_modified
+        return (out, denoised_out), model_modified
 
     @patch_temp_fix_ck_ops
     @patch_ray_tqdm
@@ -244,7 +254,7 @@ class SamplerManager:
         sigmas=None,
         state_dict: Optional[dict] = None
     ):
-        # Returns: ((Out Latent,), boolean flag if model was modified/baked)
+        # Returns: ((Out Latent, Denoised Out Latent), boolean flag if model was modified/baked)
 
         with self.sampling_context(model, config, latent, state_dict, name="common_ksampler") as ctx:
             work_model, final_samples, noise_mask, disable_pbar, work_latent, model_modified = ctx
@@ -282,9 +292,10 @@ class SamplerManager:
                 
                 # Stats + Compact Callback
                 last_step_time = time.perf_counter()
+                last_denoised = None
 
                 def sampling_callback(step, x0, x, total_steps):
-                    nonlocal last_step_time
+                    nonlocal last_step_time, last_denoised
                     current_time = time.perf_counter()
 
                     last_step_time = current_time
@@ -297,6 +308,10 @@ class SamplerManager:
                         compact_set_step(step)
                     except (ImportError, NameError, AttributeError):
                         pass
+
+                    # Keep the final x0 estimate so nodes can expose denoised_output.
+                    if x0 is not None and (step + 1) >= total_steps:
+                        last_denoised = x0.detach().clone()
 
                 profile_enabled = config.raylight_config.debug.profile_sampler
                 with CProfileContext(enabled=profile_enabled, sort_by='cumulative', top_k=5, name="common_ksampler (Comfy)"):
@@ -337,8 +352,13 @@ class SamplerManager:
                                 callback=sampling_callback,
                             )
                 
+            samples_cpu = samples.to("cpu")
+            denoised_cpu = last_denoised.to("cpu") if last_denoised is not None else samples_cpu
+
             out = work_latent.copy()
-            out["samples"] = samples.to("cpu")
+            out["samples"] = samples_cpu
+            denoised_out = work_latent.copy()
+            denoised_out["samples"] = denoised_cpu
             del samples # Drop GPU reference immediately
 
-        return (out,), model_modified
+        return (out, denoised_out), model_modified

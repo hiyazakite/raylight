@@ -144,7 +144,9 @@ class IDLoraManager:
             a_clean: Clean audio latent (B,C,T,freq) for post_process blending.
 
         Returns:
-            (video_out_cpu, audio_out_cpu) — (B,C,F,H,W) and (B,C,T,freq) on CPU.
+            ((video_out_cpu, audio_out_cpu), (video_denoised_cpu, audio_denoised_cpu))
+            where the first tuple is the final sampled latent and the second
+            tuple is the final-step denoised x0 estimate.
         """
         if denoise_config is None:
             denoise_config = IDLoraDenoiseConfig()
@@ -311,6 +313,8 @@ class IDLoraManager:
             # Euler denoising loop
             # ------------------------------------------------------------------
             with torch.no_grad(), torch.autocast(device_type=device.type, dtype=dtype):
+                v_x0_last = v_noisy
+                a_x0_last = a_noisy
                 for step_idx in range(total_steps):
                     sigma = sigmas[step_idx]
                     sigma_next = sigmas[step_idx + 1]
@@ -431,6 +435,10 @@ class IDLoraManager:
                     if a_clean is not None and a_mask is not None:
                         a_x0 = a_x0 * a_mask + a_clean * (1.0 - a_mask)
 
+                    # Keep the final denoised x0 estimate for denoised_output.
+                    v_x0_last = v_x0
+                    a_x0_last = a_x0
+
                     # ---- Euler step ----
                     # velocity = (x_t - x0) / sigma
                     # x_{t-1} = x_t + velocity * (sigma_next - sigma)
@@ -441,4 +449,7 @@ class IDLoraManager:
                     # Repack for next step
                     packed, _ = comfy.utils.pack_latents([v_noisy, a_noisy])
 
-            return v_noisy.cpu(), a_noisy.cpu()
+            return (
+                (v_noisy.cpu(), a_noisy.cpu()),
+                (v_x0_last.cpu(), a_x0_last.cpu()),
+            )
