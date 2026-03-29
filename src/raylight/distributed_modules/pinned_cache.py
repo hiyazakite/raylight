@@ -38,10 +38,12 @@ import hashlib
 import logging
 import time
 from abc import ABC, abstractmethod
-from multiprocessing.shared_memory import SharedMemory
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from raylight.ipc.posix_shm import PosixShmBackend
 
 log = logging.getLogger(__name__)
 
@@ -663,6 +665,8 @@ class SharedPinnedParamCache(BasePinnedCache):
         is_writer: bool = False,
         local_rank: int = 0,
         world_size: int = 1,
+        *,
+        shm_backend: Optional["PosixShmBackend"] = None,
     ) -> None:
         super().__init__(tag="SharedPinnedParamCache")
         self._cache_id = cache_id
@@ -671,7 +675,8 @@ class SharedPinnedParamCache(BasePinnedCache):
         self._world_size = world_size
 
         self._shm_name = f"raylight_pc_{cache_id}"
-        self._shm: Optional[SharedMemory] = None
+        self._shm_backend = shm_backend
+        self._shm_metadata: Optional[object] = None  # HostIpcArtifactMetadata
         self._registered_ptr: Optional[int] = None
         self._total_bytes: int = 0
 
@@ -700,45 +705,42 @@ class SharedPinnedParamCache(BasePinnedCache):
         import torch.distributed as dist
         t_start = time.perf_counter()
 
-        # ── Step 1: Rank 0 creates /dev/shm segment ────────────────────
-        if self._is_writer:
-            try:
-                old = SharedMemory(name=self._shm_name, create=False)
-                old.close(); old.unlink()
-            except FileNotFoundError:
-                pass
-            self._shm = SharedMemory(
-                name=self._shm_name, create=True, size=total_bytes,
+        backend = self._shm_backend
+        if backend is None:
+            raise RuntimeError(
+                f"[{self._tag}] shm_backend is required for SharedPinnedParamCache"
             )
+
+        # ── Step 1: Rank 0 creates shared segment ──────────────────────
+        if self._is_writer:
+            from raylight.ipc.types import HostIpcBufferSpec
+            spec = HostIpcBufferSpec(
+                prefix="raylight_pc",
+                logical_name=self._cache_id,
+                owner_scope=f"rank_{self._local_rank}",
+                size_bytes=total_bytes,
+            )
+            self._shm_metadata = backend.create_artifact(spec)
 
         # ── Step 2: Barrier — wait for creation, then all attach ───────
         if dist.is_initialized():
             dist.barrier()
 
         if not self._is_writer:
-            for attempt in range(50):
-                try:
-                    self._shm = SharedMemory(
-                        name=self._shm_name, create=False,
-                    )
-                    break
-                except FileNotFoundError:
-                    if attempt < 49:
-                        time.sleep(0.2)
-            else:
-                raise RuntimeError(
-                    f"[{self._tag}] Rank {self._local_rank} timed out "
-                    f"waiting for shared memory '{self._shm_name}' (10s)."
-                )
+            self._shm_metadata = backend.attach_with_retry(self._shm_name)
 
-            if self._shm.size < total_bytes:
+            shm = backend.get_handle(self._shm_name)
+            if shm is not None and shm.size < total_bytes:
                 raise RuntimeError(
                     f"[{self._tag}] Size mismatch: expected {total_bytes}, "
-                    f"got {self._shm.size}."
+                    f"got {shm.size}."
                 )
 
+        shm = backend.get_handle(self._shm_name)
+        assert shm is not None, f"SharedMemory handle not found for {self._shm_name}"
+
         # All ranks: pin the pages for async CUDA DMA
-        self._register_shm(total_bytes)
+        self._register_shm_buf(shm.buf, total_bytes)
 
         # ── Step 3: Build ownership sets + create views ────────────────
         #   Round-robin: param at sorted-index *i* is owned by rank
@@ -749,7 +751,7 @@ class SharedPinnedParamCache(BasePinnedCache):
 
         for i, (name, off, nb, shape, dtype) in enumerate(param_layout):
             view = torch.frombuffer(
-                memoryview(self._shm.buf)[off:off + nb], dtype=dtype, # type: ignore
+                memoryview(shm.buf)[off:off + nb], dtype=dtype,
             ).reshape(shape)
             self._cpu_params[name] = view
             if i % self._world_size == self._local_rank:
@@ -766,7 +768,7 @@ class SharedPinnedParamCache(BasePinnedCache):
         # Buffers are tiny; rank 0 copies them all.
         for i, (name, off, nb, shape, dtype) in enumerate(buffer_layout):
             view = torch.frombuffer(
-                memoryview(self._shm.buf)[off:off + nb], dtype=dtype, # type: ignore
+                memoryview(shm.buf)[off:off + nb], dtype=dtype,
             ).reshape(shape)
             self._cpu_buffers[name] = view
             if i % self._world_size == self._local_rank:
@@ -799,9 +801,8 @@ class SharedPinnedParamCache(BasePinnedCache):
             f"+ {my_bufs} buffers ({dt_ms:.0f} ms, shm={self._shm_name})"
         )
 
-    def _register_shm(self, total_bytes: int) -> None:
-        assert self._shm is not None
-        ptr = ctypes.addressof(ctypes.c_char.from_buffer(self._shm.buf))
+    def _register_shm_buf(self, buf: memoryview, total_bytes: int) -> None:
+        ptr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
         ok = _cuda_host_register(ptr, total_bytes)
         self._registered_ptr = ptr
         if not ok:
@@ -927,18 +928,15 @@ class SharedPinnedParamCache(BasePinnedCache):
             _cuda_host_unregister(self._registered_ptr)
             self._registered_ptr = None
 
-        # 3. Close / unlink shm now that no tensors reference it.
-        if self._shm is not None:
+        # 3. Release via backend (handles close + unlink for writer).
+        if self._shm_backend is not None and self._shm_metadata is not None:
             try:
-                self._shm.close()
+                self._shm_backend.release_artifact(
+                    self._shm_metadata, unlink=self._is_writer,
+                )
             except Exception:
-                pass  # may already be closed
-            if self._is_writer:
-                try:
-                    self._shm.unlink()
-                except FileNotFoundError:
-                    pass
-            self._shm = None
+                pass
+            self._shm_metadata = None
 
         super().cleanup()
         if gb > 0:

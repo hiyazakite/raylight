@@ -7,8 +7,6 @@ import os
 import torch
 
 from ._base import ModelContext, ModelState, _compute_vram_budget, _ops_for_model_options
-from raylight.utils.cache import CachedState
-from raylight.utils.checksum import verify_model_checksum
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
 
 if TYPE_CHECKING:
@@ -55,6 +53,7 @@ class LazyTensorContext(ModelContext):
             from raylight.distributed_modules.pinned_cache import (
                 SharedPinnedParamCache, make_cache_id,
             )
+            from raylight.ipc.resolver import build_posix_shm_backend
             cache_id = make_cache_id(model_path)
             is_writer = config.local_rank == 0
             print(
@@ -66,6 +65,7 @@ class LazyTensorContext(ModelContext):
                 is_writer=is_writer,
                 local_rank=config.local_rank,
                 world_size=config.global_world_size,
+                shm_backend=build_posix_shm_backend(),
             )
         else:
             from raylight.distributed_modules.pinned_cache import PinnedParamCache
@@ -278,7 +278,7 @@ class LazyTensorContext(ModelContext):
     # ─── Hot load ────────────────────────────────────────────
 
     def hot_load(self, model: Any, device: torch.device,
-                 reload_params: Dict[str, Any], state_cache: Any) -> None:
+                 reload_params: Dict[str, Any]) -> None:
         """Hot reload: restore from pinned RAM (fast) or mmap (legacy)."""
         pinned_cache = getattr(model, "pinned_param_cache", None)
         diffusion_model = getattr(model, "model", None)
@@ -294,12 +294,6 @@ class LazyTensorContext(ModelContext):
                 pinned_cache.build(diffusion_model)
                 if hasattr(model, "mmap_cache"):
                     del model.mmap_cache
-                if state_cache is not None:
-                    unet_path = getattr(model, "unet_path", None)
-                    if unet_path:
-                        cached = state_cache.get(unet_path)
-                        if cached is not None and hasattr(cached, "state_dict"):
-                            cached.state_dict = None
             except Exception as e:
                 print(f"[LazyTensorContext] Eager cache build failed: {e}")
 
@@ -363,16 +357,6 @@ class LazyTensorContext(ModelContext):
 
         # --- Legacy fallback: mmap streaming ---
         print(f"[LazyTensorContext] Hot reload to {device} (mmap)...")
-
-        unet_path = getattr(model, "unet_path", None)
-        if unet_path and unet_path in state_cache:
-            cached = state_cache.get(unet_path)
-            if isinstance(cached, CachedState) and cached.checksum:
-                if isinstance(getattr(model, "mmap_cache", None), dict):
-                    verify_model_checksum(
-                        model.mmap_cache, cached.checksum, cached.metadata,
-                        context_tag="LazyTensorContext",
-                    )
 
         if model is not None and hasattr(model, "load"):
             model.load(device)

@@ -7,8 +7,6 @@ import torch
 
 from .lazy_tensor import LazyTensorContext
 from ._base import ModelState
-from raylight.utils.cache import CachedState
-from raylight.utils.checksum import verify_model_checksum
 
 if TYPE_CHECKING:
     from raylight.types import LoraManagerLike, WorkerConfigLike
@@ -66,19 +64,9 @@ class VAEContext(LazyTensorContext):
     # ─── Hot load ────────────────────────────────────────────
 
     def hot_load(self, model: Any, device: torch.device,
-                 reload_params: Dict[str, Any], state_cache: Any) -> None:
+                 reload_params: Dict[str, Any]) -> None:
         """Hot reload VAE using stream_vae_to_device logic."""
         print(f"[VAEContext] Hot-loading VAE to {device} via mmap stream...")
-
-        unet_path = getattr(model, "unet_path", None)
-        if unet_path and unet_path in state_cache:
-            cached = state_cache.get(unet_path)
-            if isinstance(cached, CachedState) and cached.checksum:
-                if isinstance(model.mmap_cache, dict):
-                    verify_model_checksum(
-                        model.mmap_cache, cached.checksum, cached.metadata,
-                        context_tag="VAEContext",
-                    )
 
         self.stream_vae_to_device(model, device)
 

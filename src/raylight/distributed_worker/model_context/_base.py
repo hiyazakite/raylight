@@ -12,8 +12,6 @@ import os
 
 import torch
 
-from raylight.utils.checksum import compute_model_checksum, verify_model_checksum
-from raylight.utils.cache import CachedState
 from raylight.utils.memory import MemoryPolicy, NULL_POLICY
 
 if TYPE_CHECKING:
@@ -144,9 +142,8 @@ class ModelContext(ABC):
     format-specific part to ``_do_offload()``.
     """
 
-    def __init__(self, use_mmap: bool = True, cache_in_ram: bool = True):
+    def __init__(self, use_mmap: bool = True):
         self.use_mmap = use_mmap
-        self.cache_in_ram = cache_in_ram
 
     # ─── Abstract Methods (format-specific) ──────────────────
 
@@ -168,7 +165,7 @@ class ModelContext(ABC):
 
     @abstractmethod
     def hot_load(self, model: Any, device: torch.device,
-                 reload_params: Dict[str, Any], state_cache: Any) -> None:
+                 reload_params: Dict[str, Any]) -> None:
         """Fast VRAM transfer for soft-reloaded models."""
         ...
 
@@ -351,79 +348,53 @@ class ModelContext(ABC):
     def load(self, state: ModelState, config: "WorkerConfigLike", state_cache: Any) -> Any:
         """Unified model loading logic.
 
-        1. Check cache for existing state dict.
-        2. If not in cache, load from disk (mmap or standard).
-        3. Prepare state dict (e.g., strip prefixes).
-        4. Instantiate model.
-        5. Perform post-load setup.
+        1. Load state dict from disk (mmap or standard).
+        2. Prepare state dict (e.g., strip prefixes).
+        3. Instantiate model.
+        4. Post-load setup.
         """
         sd = None
         metadata: Dict[str, Any] = {}
 
-        # 1. Check cache
-        if self.cache_in_ram:
-            cached = state_cache.get(state.cache_key)
-            if cached is not None:
-                print(f"[ModelContext] Cache Hit: {os.path.basename(state.cache_key)}")
-                if isinstance(cached, CachedState):
-                    sd = cached.state_dict
-                    metadata = cached.metadata
-                    if cached.checksum:
-                        verify_model_checksum(sd, cached.checksum, metadata, context_tag="ModelContext")
-                else:
-                    print(f"[ModelContext] Warning: Invalid cache entry type: {type(cached)}")
-                    return None, {}
-
-        if sd is None:
-            # 2. Disk load
-            if self.use_mmap:
-                print(f"[ModelContext] Mmap Load: {os.path.basename(state.cache_key)}")
-                res = self.load_state_dict_mmap(state, config)
-                if isinstance(res, tuple) and len(res) == 2:
-                    sd, metadata = res
-                else:
-                    sd = res
-
-                checksum = compute_model_checksum(sd, metadata)
-                if self.cache_in_ram:
-                    state_cache.put(
-                        state.cache_key,
-                        CachedState(state_dict=sd, metadata=metadata, checksum=checksum),
-                    )
-                    print(f"[ModelContext] Cached model with checksum: {checksum}")
-                else:
-                    print("[ModelContext] Skipping RAM Cache (cache_in_ram=False)")
+        # 1. Disk load (always — OS page cache handles re-read speed)
+        if self.use_mmap:
+            print(f"[ModelContext] Mmap Load: {os.path.basename(state.cache_key)}")
+            res = self.load_state_dict_mmap(state, config)
+            if isinstance(res, tuple) and len(res) == 2:
+                sd, metadata = res
             else:
-                print(f"[ModelContext] Standard Load: {os.path.basename(state.cache_key)}")
-                res = self.load_state_dict_standard(state, config)
-                if isinstance(res, tuple) and len(res) == 2:
-                    sd, metadata = res
-                else:
-                    sd = res
+                sd = res
+        else:
+            print(f"[ModelContext] Standard Load: {os.path.basename(state.cache_key)}")
+            res = self.load_state_dict_standard(state, config)
+            if isinstance(res, tuple) and len(res) == 2:
+                sd, metadata = res
+            else:
+                sd = res
 
         if sd is None:
             raise RuntimeError(f"Failed to load state dict for {state.unet_path}")
         if not isinstance(sd, dict):
             raise RuntimeError(f"State dict must be a dict, got {type(sd)} for {state.unet_path}")
 
-        # 3. Prepare
+        # 2. Prepare
         sd_to_use = self.prepare_state_dict(sd, config)
 
-        # 4. Instantiate
+        # 3. Instantiate
         model = self.instantiate_model(sd_to_use, state, config, metadata=metadata)
 
-        # 5. Post-load setup
+        # 4. Post-load setup
         if model is not None:
             model.unet_path = state.unet_path
             model.load_config = state
-            if self.use_mmap and self.cache_in_ram:
+            if self.use_mmap:
                 model.mmap_cache = sd
 
         return model
 
     def reload_if_needed(
         self, model: Any, target_device: torch.device,
-        config: "WorkerConfigLike", state_cache: Any,
+        config: "WorkerConfigLike",
     ) -> Any:
         """Check device and trigger appropriate reload."""
         current = getattr(model, "current_device", None) if model else None
@@ -435,7 +406,7 @@ class ModelContext(ABC):
         if model is not None:
             print(f"[ModelContext] Hot-loading to {target_device}...")
             reload_params = model.load_config.to_dict() if hasattr(model, "load_config") else {}
-            self.hot_load(model, target_device, reload_params, state_cache)
+            self.hot_load(model, target_device, reload_params)
             return model
         else:
             raise RuntimeError("Cannot reload model: Model is None (Lost context).")

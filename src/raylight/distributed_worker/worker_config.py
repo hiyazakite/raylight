@@ -37,10 +37,6 @@ class WorkerConfig:
         return self.raylight_config.device.use_mmap
 
     @property
-    def mmap_cache_size(self) -> int:
-        return self.raylight_config.device.mmap_cache_size
-    
-    @property
     def vram_limit_gb(self) -> float:
         return self.raylight_config.device.vram_limit_gb
 
@@ -48,3 +44,11 @@ class WorkerConfig:
     def vram_limit_bytes(self) -> int:
         gb = self.vram_limit_gb
         return int(gb * (1024 ** 3)) if gb > 0 else 0
+
+    @property
+    def host_ipc_mode(self) -> str:
+        return self.raylight_config.system.host_ipc_mode
+
+    @property
+    def host_ipc_path(self) -> Optional[str]:
+        return self.raylight_config.system.host_ipc_path

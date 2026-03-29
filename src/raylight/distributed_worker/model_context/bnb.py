@@ -48,6 +48,6 @@ class BNBContext(ModelContext):
             return bnb_load_diffusion_model(unet_path)
 
     def hot_load(self, model: Any, device: torch.device,
-                 reload_params: Dict[str, Any], state_cache: Any) -> None:
+                 reload_params: Dict[str, Any]) -> None:
         # BNB models are difficult to hot-load due to 4-bit/CPU offload config
         pass

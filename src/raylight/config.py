@@ -142,7 +142,6 @@ class DeviceConfig:
     gpu_indices: List[int] = field(default_factory=list)
     vram_limit_gb: float = 0.0
     use_mmap: bool = True
-    mmap_cache_size: int = 4
 
 @dataclass(frozen=True)
 class DebugConfig:
@@ -193,6 +192,8 @@ class SystemConfig:
     python_gil: bool = True
     master_addr: str = "127.0.0.1"
     master_port: str = "29500"
+    host_ipc_mode: str = "auto"
+    host_ipc_path: Optional[str] = None
 
 @dataclass
 class RuntimeMetadata:
@@ -359,7 +360,6 @@ class RaylightConfig:
             "delta_compression": self.compact.delta_compression.name,
             "compact_warmup_steps": self.compact.warmup_steps,
             "use_mmap": self.device.use_mmap,
-            "mmap_cache_size": self.device.mmap_cache_size,
             "fsdp_parallel_load": self.strategy.fsdp_parallel_load,
             "enable_kitchen": self.debug.enable_kitchen,
             "global_world_size": self.device.world_size,

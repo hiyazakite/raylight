@@ -196,19 +196,69 @@ def get_vram_gb(device=None):
     except Exception:
         return (0, 0)
 
-def get_shm_usage_gb():
-    """Returns total size of Raylight cache files in /dev/shm in GB."""
-    total_bytes = 0
+
+def get_shm_usage_stats() -> dict[str, int]:
+    """Return shared-memory usage telemetry by source.
+
+    Keys:
+      - file_mmap_bytes, file_mmap_count
+    - pinned_shm_bytes, pinned_shm_count
+    - gguf_shm_bytes, gguf_shm_count
+      - legacy_pt_bytes, legacy_pt_count
+      - total_bytes, total_count
+    """
+    file_mmap_bytes = 0
+    file_mmap_count = 0
+    pinned_shm_bytes = 0
+    pinned_shm_count = 0
+    gguf_shm_bytes = 0
+    gguf_shm_count = 0
+    legacy_pt_bytes = 0
+    legacy_pt_count = 0
+
     try:
-        files = glob.glob("/dev/shm/raylight_*.pt")
-        for f in files:
-            try:
-                total_bytes += os.path.getsize(f)
-            except OSError:
-                pass
+        from raylight.ipc.memory_stats import collect_all_stats
+        from raylight.ipc.resolver import build_default_host_ipc_service
+
+        stats = collect_all_stats(build_default_host_ipc_service())
+        for src in stats:
+            if src.kind_name == "file_mmap":
+                file_mmap_bytes = src.artifact_bytes
+                file_mmap_count = src.artifact_count
+            elif src.kind_name == "pinned_shm":
+                pinned_shm_bytes = src.artifact_bytes
+                pinned_shm_count = src.artifact_count
+            elif src.kind_name == "gguf_dequant_shm":
+                gguf_shm_bytes = src.artifact_bytes
+                gguf_shm_count = src.artifact_count
+            elif src.kind_name == "legacy_pt":
+                legacy_pt_bytes = src.artifact_bytes
+                legacy_pt_count = src.artifact_count
     except Exception:
+        # Keep memory reporting best-effort and non-fatal.
         pass
-    return total_bytes / 1024**3
+
+    total_bytes = file_mmap_bytes + pinned_shm_bytes + gguf_shm_bytes + legacy_pt_bytes
+    total_count = file_mmap_count + pinned_shm_count + gguf_shm_count + legacy_pt_count
+
+    return {
+        "file_mmap_bytes": file_mmap_bytes,
+        "file_mmap_count": file_mmap_count,
+        "pinned_shm_bytes": pinned_shm_bytes,
+        "pinned_shm_count": pinned_shm_count,
+        "gguf_shm_bytes": gguf_shm_bytes,
+        "gguf_shm_count": gguf_shm_count,
+        "legacy_pt_bytes": legacy_pt_bytes,
+        "legacy_pt_count": legacy_pt_count,
+        "total_bytes": total_bytes,
+        "total_count": total_count,
+    }
+
+
+def get_shm_usage_gb():
+    """Returns total size of Raylight shared-memory artifacts in GB."""
+
+    return get_shm_usage_stats()["total_bytes"] / 1024**3
 
 def get_gguf_mmap_gb():
     """Returns total size of .gguf files mapped in /proc/self/maps in GB."""
@@ -236,7 +286,8 @@ def log_memory_stats(tag="Memory", device=None):
     sys_used, sys_total, sys_avail, sys_cached = get_system_ram_gb()
     rss = get_process_rss_gb()
     vram_alloc, vram_res = get_vram_gb(device)
-    shm = get_shm_usage_gb()
+    shm_stats = get_shm_usage_stats()
+    shm = shm_stats["total_bytes"] / 1024**3
     mmap = get_gguf_mmap_gb()
     
     # Formatting
@@ -257,7 +308,25 @@ def log_memory_stats(tag="Memory", device=None):
         
     # Shared Resources
     if shm > 0:
-        print(f"Shared Mem : {shm:5.2f} GB (Raylight /dev/shm cache)")
+        print(f"Shared Mem : {shm:5.2f} GB (Raylight Host IPC + shared memory)")
+        ipc_gb = shm_stats["file_mmap_bytes"] / 1024**3
+        pinned_gb = shm_stats["pinned_shm_bytes"] / 1024**3
+        gguf_shm_gb = shm_stats["gguf_shm_bytes"] / 1024**3
+        legacy_gb = shm_stats["legacy_pt_bytes"] / 1024**3
+        print(
+            "           : "
+            f"ipc_files={shm_stats['file_mmap_count']} | "
+            f"pinned={shm_stats['pinned_shm_count']} | "
+            f"gguf_shm={shm_stats['gguf_shm_count']} | "
+            f"legacy_pt={shm_stats['legacy_pt_count']}"
+        )
+        print(
+            "           : "
+            f"ipc_gb={ipc_gb:.2f} | "
+            f"pinned_gb={pinned_gb:.2f} | "
+            f"gguf_shm_gb={gguf_shm_gb:.2f} | "
+            f"legacy_pt_gb={legacy_gb:.2f}"
+        )
     
     if mmap > 0:
         print(f"GGUF Mmap  : {mmap:5.2f} GB (Mapped into this process)")

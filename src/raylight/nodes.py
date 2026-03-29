@@ -36,6 +36,8 @@ from .config import (
     RaylightAttnType, 
     CompactCompressType
 )
+from .ipc import build_default_host_ipc_service, begin_vae_decode_job, release_vae_decode_job
+from .ipc.cleanup import cleanup_all_stale as _ipc_cleanup_all_stale
 
 
 try:
@@ -46,7 +48,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Global worker tracking + pinned-cache lifecycle
 # ---------------------------------------------------------------------------
-# The pinned RAM cache lives in host memory (/dev/shm or private pinned pages)
+# The pinned RAM cache lives in host memory (RAM-backed artifacts)
 # and is designed to survive VRAM unloads so that models can be hot-reloaded in
 # milliseconds.  Internal Raylight callers (samplers) use the original
 # ``_orig_unload_all_models`` to free main-process VRAM without disturbing
@@ -58,7 +60,7 @@ except ImportError:
 #
 # Pinned caches are also released when:
 #   1. Workers are being replaced (model change → ensure_fresh_actors).
-#   2. Workers crash (dead-actor detection + /dev/shm cleanup).
+#   2. Workers crash (dead-actor detection + host-memory cleanup).
 # ---------------------------------------------------------------------------
 _active_workers: list = []  # Current Ray actor handles (set by loader nodes)
 
@@ -73,11 +75,11 @@ def release_all_pinned_caches():
     """Tell every live Ray worker to free its pinned RAM cache + VRAM.
 
     Handles dead/crashed workers gracefully: unreachable actors are pruned
-    and orphaned /dev/shm segments are cleaned up.
+    and orphaned host-memory artifacts are cleaned up.
     """
     global _active_workers
     if not _active_workers:
-        # No workers tracked — just clean up any orphaned shm segments.
+        # No workers tracked — just clean up any orphaned host-memory artifacts.
         _cleanup_stale_shm()
         return
 
@@ -99,28 +101,31 @@ def release_all_pinned_caches():
     # Prune dead actors from the tracked list
     _active_workers = live_actors
 
-    # Always clean up /dev/shm — dead actors may have left orphaned segments.
+    # Always run stale cleanup — dead actors may have left orphaned artifacts.
     _cleanup_stale_shm()
     print("[Raylight] release_all_pinned_caches: cleanup complete.")
 
 
 def _cleanup_stale_shm():
-    """Remove orphaned /dev/shm segments from previous Raylight sessions.
-
-    Safe to call at startup or after releasing caches — removes ALL
-    raylight shm segments that are not actively mmap'd.
-    """
-    import glob
-    for pattern in ("/dev/shm/raylight_pc_*", "/dev/shm/raylight_vae_*"):
-        for f in glob.glob(pattern):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+    """Remove orphaned host-memory artifacts from previous Raylight sessions."""
+    try:
+        _ipc_cleanup_all_stale()
+    except Exception as e:
+        print(f"[Raylight] Host memory stale cleanup warning: {e}")
 
 
 # Run stale-shm cleanup once at import time (before any workers exist).
 _cleanup_stale_shm()
+
+# Lazy IPC service singleton — resolved once on first VAE decode call.
+_host_ipc_service = None
+
+
+def _get_host_ipc_service():
+    global _host_ipc_service
+    if _host_ipc_service is None:
+        _host_ipc_service = build_default_host_ipc_service()
+    return _host_ipc_service
 
 # ---------------------------------------------------------------------------
 # Monkey-patch unload_all_models so ComfyUI buttons release worker caches
@@ -131,7 +136,7 @@ _orig_unload_all_models = comfy.model_management.unload_all_models
 
 
 def _patched_unload_all_models():
-    """Drop-in replacement that cleans orphaned /dev/shm on full unload.
+    """Drop-in replacement that runs host-memory stale cleanup on full unload.
 
     ComfyUI calls ``unload_all_models`` from multiple sites:
 
@@ -149,7 +154,7 @@ def _patched_unload_all_models():
     * ``release_all_pinned_caches`` — can still be invoked directly by
       custom nodes that need a hard reset.
 
-    Orphaned /dev/shm segments from dead actors are cleaned up below.
+    Orphaned host-memory artifacts from dead actors are cleaned up below.
     """
     _orig_unload_all_models()
     _cleanup_stale_shm()
@@ -386,12 +391,6 @@ class RayInitializer:
                     "default": True,
                     "tooltip": "Use memory-mapped (zero-copy) model loading."
                 }),
-                "mmap_cache_size": ("INT", {
-                    "default": 4,
-                    "min": 1,
-                    "max": 100,
-                    "tooltip": "Number of models to keep in mmap cache."
-                }),
             }
         }
 
@@ -431,9 +430,14 @@ class RayInitializer:
         gpu_indices: str = "",
         skip_comm_test: bool = True,
         use_mmap: bool = True,
-        mmap_cache_size: int = 4,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
+            # Release pinned caches on any previously tracked workers and
+            # clean up orphaned host-memory artifacts before spawning new
+            # actors.  Without this, switching models (or restarting
+            # actors) leaves stale shm segments in /dev/shm.
+            release_all_pinned_caches()
+
             parsed_gpu_indices = _parse_gpu_indices(gpu_indices, world_size=GPU)
 
             # THIS IS PYTORCH DIST ADDRESS
@@ -511,7 +515,6 @@ class RayInitializer:
                     gpu_indices=parsed_gpu_indices,
                     vram_limit_gb=vram_limit_gb,
                     use_mmap=use_mmap,
-                    mmap_cache_size=mmap_cache_size,
                 ),
                 debug=DebugConfig(
                     skip_comm_test=skip_comm_test,
@@ -722,12 +725,6 @@ class RayInitializerAdvanced(RayInitializer):
                 "use_mmap": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Use memory-mapped (zero-copy) model loading. Enabled: parallel loading with OS page cache sharing. Disabled: sequential leader-follower loading."
-                }),
-                "mmap_cache_size": ("INT", {
-                    "default": 2,
-                    "min": 1,
-                    "max": 10,
-                    "tooltip": "LRU cache size for mmap'd model state dicts."
                 }),
             }
         }
@@ -1334,22 +1331,21 @@ class RayVAEDecodeDistributed:
         # Final shape: (Batch, TotalFrames, Height, Width, 3)
         master_shape = (latents.shape[0], total_output_frames, H_out, W_out, 3)
         
-        # 3. Create Shared Memory File (Pre-allocation)
-        mmap_path = f"/dev/shm/raylight_vae_out_{uuid.uuid4().hex}.bin"
+        # 3. Allocate RAM-backed shared output buffer via Host IPC service
+        _ipc_svc = _get_host_ipc_service()
         num_elements = 1
-        for dim in master_shape: num_elements *= dim
-        file_size_bytes = num_elements * 4 # float32 = 4 bytes
-        
+        for dim in master_shape:
+            num_elements *= dim
+        file_size_bytes = num_elements * 4  # float32 = 4 bytes
+        _vae_artifact = begin_vae_decode_job(_ipc_svc, master_shape)
+        mmap_path = _vae_artifact.path
+
         print(f"[RayVAEDecode] Pre-allocating shared output buffer: {mmap_path} ({file_size_bytes/1024**3:.2f} GB)")
         print(f"[RayVAEDecode] Output Shape: {master_shape}")
-        
-        full_image = None # Initialize outside try block for finally access
+
+        full_image = None  # Initialize outside try block for finally access
         try:
-            with open(mmap_path, "wb") as f:
-                f.seek(file_size_bytes - 1)
-                f.write(b"\0")
-                
-            # Create the tensor wrapper immediately
+            # File is already pre-allocated by the IPC service; map it directly.
             full_image = torch.from_file(mmap_path, shared=True, size=num_elements, dtype=torch.float32).reshape(master_shape)
             
             # === DYNAMIC WORK-STEALING VAE DISPATCH ===
@@ -1487,11 +1483,8 @@ class RayVAEDecodeDistributed:
             # Release the shared latent tensor from Ray object store
             del latent_ref
 
-            try:
-                os.unlink(mmap_path)
-                print(f"[RayVAEDecode] Unlinked temp mmap file: {mmap_path}")
-            except Exception as e:
-                print(f"[RayVAEDecode] Warning: Could not unlink mmap file: {e}")
+            release_vae_decode_job(_ipc_svc, _vae_artifact)
+            print(f"[RayVAEDecode] Released IPC artifact: {mmap_path}")
 
             # 7. Release VAE from workers to free RAM for downstream operations (e.g., AudioVAE)
             if release_vae:
@@ -1514,10 +1507,7 @@ class RayVAEDecodeDistributed:
             
         except Exception as e:
             # Cleanup on failure
-            if os.path.exists(mmap_path):
-                try: 
-                    os.unlink(mmap_path) 
-                except: pass
+            release_vae_decode_job(_ipc_svc, _vae_artifact)
             raise e
 
 

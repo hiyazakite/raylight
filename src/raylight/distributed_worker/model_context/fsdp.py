@@ -33,9 +33,6 @@ class FSDPContext(ModelContext):
         """Override load to implement prefetch optimization for Safetensors."""
         is_safetensors = state.unet_path.lower().endswith(".safetensors")
 
-        if self.cache_in_ram and state_cache.get(state.cache_key) is not None:
-            return super().load(state, config, state_cache)
-
         if is_safetensors and not self.use_mmap:
             print(f"[FSDPContext] Prefetch Optimization Active for {os.path.basename(state.unet_path)}")
 
@@ -186,7 +183,7 @@ class FSDPContext(ModelContext):
     # ─── Hot load ────────────────────────────────────────────
 
     def hot_load(self, model: Any, device: torch.device,
-                 reload_params: Dict[str, Any], state_cache: Any) -> None:
+                 reload_params: Dict[str, Any]) -> None:
         """Restore FSDP local shards from pinned CPU RAM back to CUDA."""
         shard_cache = getattr(model, "fsdp_shard_cache", None)
         if shard_cache is not None and shard_cache.built:

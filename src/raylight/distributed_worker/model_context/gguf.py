@@ -1,16 +1,43 @@
 """GGUF model context — mmap + pinned-RAM caching for quantised models."""
 from __future__ import annotations
 
+import weakref
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
-import os
 
 import torch
 
 from ._base import ModelContext, ModelState, _compute_vram_budget
-from raylight.utils.cache import CachedState
 
 if TYPE_CHECKING:
     from raylight.types import LoraManagerLike, WorkerConfigLike
+
+
+def _weak_cleanup_gguf_pinned(
+    registered_ptr: Optional[int],
+    shm_name: Optional[str],
+    backend: Any,
+    is_writer: bool,
+) -> None:
+    """weakref.finalize callback — unregisters CUDA host pages and releases shm."""
+    from raylight.distributed_modules.pinned_cache import _cuda_host_unregister
+
+    if registered_ptr is not None:
+        _cuda_host_unregister(registered_ptr)
+    if backend is not None and shm_name is not None:
+        try:
+            from raylight.ipc.types import HostIpcArtifactMetadata, HostIpcBackendKind, HostIpcLifecycleState
+            stub = HostIpcArtifactMetadata(
+                artifact_id=shm_name,
+                backend_name=backend.info.name,
+                backend_kind=HostIpcBackendKind.NAMED_SHARED_MEMORY,
+                owner_scope="cleanup",
+                state=HostIpcLifecycleState.WRITABLE,
+                size_bytes=0,
+                shared_name=shm_name,
+            )
+            backend.release_artifact(stub, unlink=is_writer)
+        except Exception:
+            pass
 
 
 class GGUFContext(ModelContext):
@@ -37,14 +64,19 @@ class GGUFContext(ModelContext):
             )
             if pinned is not None:
                 model.mmap_cache = pinned
-                # Keep SharedMemory alive as long as model lives
+                # Keep SharedMemory alive as long as model lives.
+                # shm_handle is (SharedMemory, registered_ptr, backend)
+                # for multi-GPU, or None for single-GPU.
                 if shm_handle is not None:
-                    model._pinned_shm = shm_handle
-                # Replace mmap-backed sd in state_cache with the pinned
-                # dict so the OS can unmap the GGUF file.
-                cached = state_cache.get(state.cache_key)
-                if isinstance(cached, CachedState):
-                    cached.state_dict = pinned
+                    shm, registered_ptr, backend = shm_handle
+                    model._pinned_shm = shm
+                    is_writer = getattr(config, "local_rank", 0) == 0
+                    shm_name = shm.name if shm is not None else None
+                    # Safety net: unregister CUDA pages + release shm on GC.
+                    weakref.finalize(
+                        model, _weak_cleanup_gguf_pinned,
+                        registered_ptr, shm_name, backend, is_writer,
+                    )
                 # Replace model's own nn.Parameters with pinned copies.
                 self._swap_params_to_pinned(model, pinned)
                 print("[GGUFContext] mmap_cache swapped to pinned RAM.")
@@ -153,23 +185,23 @@ class GGUFContext(ModelContext):
         config: "WorkerConfigLike",
         model_path: str,
     ) -> Tuple[Dict[str, torch.Tensor], Any]:
-        """Multi-GPU shared: one ``/dev/shm`` buffer + ``cudaHostRegister``."""
+        """Multi-GPU shared: one shared buffer + ``cudaHostRegister``."""
         import ctypes
-        import hashlib
-        import time
-        from multiprocessing.shared_memory import SharedMemory
         import torch.distributed as dist
         from raylight.expansion.comfyui_gguf.ops import GGMLTensor
         from raylight.distributed_modules.pinned_cache import (
-            _align_up, _cuda_host_register, _ALIGNMENT,
+            _align_up, _cuda_host_register, _cuda_host_unregister,
+            make_cache_id,
         )
+        from raylight.ipc.resolver import build_posix_shm_backend
+        from raylight.ipc.types import HostIpcBufferSpec
 
+        backend = build_posix_shm_backend()
         is_writer = config.local_rank == 0
         local_rank = config.local_rank
         world_size = config.global_world_size
-        cache_id = hashlib.md5(model_path.encode()).hexdigest()[:16]
+        cache_id = make_cache_id(model_path)
         shm_name = f"raylight_gguf_{cache_id}"
-        shm: Any = None
 
         # --- deterministic layout from sorted keys -----------------------
         layout = []
@@ -200,40 +232,34 @@ class GGUFContext(ModelContext):
             pinned_out: Dict[str, torch.Tensor] = dict(zero_byte_keys)
             return pinned_out if pinned_out else mmap_cache, None
 
-        # --- Step 1: Rank 0 creates /dev/shm segment ---
+        # --- Step 1: Rank 0 creates shared segment ---
         if is_writer:
-            try:
-                old = SharedMemory(name=shm_name, create=False)
-                old.close(); old.unlink()
-            except FileNotFoundError:
-                pass
-            shm = SharedMemory(name=shm_name, create=True, size=total_bytes)
+            spec = HostIpcBufferSpec(
+                prefix="raylight_gguf",
+                logical_name=cache_id,
+                owner_scope=f"rank_{local_rank}",
+                size_bytes=total_bytes,
+            )
+            backend.create_artifact(spec)
 
         # --- Step 2: Barrier — all ranks attach + register ---
         if dist.is_initialized():
             dist.barrier()
 
         if not is_writer:
-            retries = 50
-            for i in range(retries):
-                try:
-                    shm = SharedMemory(name=shm_name, create=False)
-                    break
-                except FileNotFoundError:
-                    if i < retries - 1:
-                        time.sleep(0.2)
-            else:
-                raise RuntimeError(
-                    f"[GGUFContext] Rank {local_rank} timed out waiting for "
-                    f"shm '{shm_name}'"
-                )
-            if shm.size < total_bytes:
+            backend.attach_with_retry(shm_name)
+            shm = backend.get_handle(shm_name)
+            if shm is not None and shm.size < total_bytes:
                 raise RuntimeError(
                     f"[GGUFContext] shm size mismatch: need {total_bytes}, got {shm.size}"
                 )
 
-        ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf)) # type: ignore
+        shm = backend.get_handle(shm_name)
+        assert shm is not None, f"SharedMemory handle not found for {shm_name}"
+
+        ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
         ok = _cuda_host_register(ptr, total_bytes)
+        registered_ptr = ptr if ok else None
         if not ok and is_writer:
             print("[GGUFContext] WARNING: cudaHostRegister failed (DMA will use staging buffer).")
 
@@ -244,7 +270,7 @@ class GGUFContext(ModelContext):
                 src = mmap_cache[key]
                 raw = src.as_subclass(torch.Tensor) if isinstance(src, GGMLTensor) else src
                 dst = torch.frombuffer(
-                    memoryview(shm.buf)[off:off + nb], dtype=dtype, # type: ignore
+                    memoryview(shm.buf)[off:off + nb], dtype=dtype,
                 ).reshape(s_shape)
                 dst.copy_(raw)
                 my_count += 1
@@ -257,7 +283,7 @@ class GGUFContext(ModelContext):
         pinned: Dict[str, torch.Tensor] = {}
         for key, off, nb, s_shape, dtype, tt, ts in layout:
             view = torch.frombuffer(
-                memoryview(shm.buf)[off:off + nb], dtype=dtype, # type: ignore
+                memoryview(shm.buf)[off:off + nb], dtype=dtype,
             ).reshape(s_shape)
             if tt is not None:
                 pinned[key] = GGMLTensor(view, tensor_type=tt, tensor_shape=ts)
@@ -272,7 +298,9 @@ class GGUFContext(ModelContext):
             f"{len(pinned)} tensors, {total_bytes / 1e9:.2f} GB — "
             f"copied {my_count} (shm={shm_name})"
         )
-        return pinned, shm # type: ignore
+        # Return (shm_handle, registered_ptr, backend) so the caller can
+        # clean up CUDA host registration and the IPC backend on model release.
+        return pinned, (shm, registered_ptr, backend)
 
     # ─── Disk loading ────────────────────────────────────────
 
@@ -398,7 +426,7 @@ class GGUFContext(ModelContext):
     # ─── Hot load ────────────────────────────────────────────
 
     def hot_load(self, model: Any, device: torch.device,
-                 reload_params: Dict[str, Any], state_cache: Any) -> None:
+                 reload_params: Dict[str, Any]) -> None:
         """GGUF Hot-Reload: budget-aware fast path."""
         if model is None:
             return
@@ -414,15 +442,6 @@ class GGUFContext(ModelContext):
                     reload_params.get("dequant_dtype"),
                     reload_params.get("patch_dtype"),
                 )
-
-        # Re-hydrate mmap_cache if lost
-        if not getattr(model, "mmap_cache", None):
-            unet_path = getattr(model, "unet_path", None)
-            if unet_path and unet_path in state_cache:
-                cached = state_cache.get(unet_path)
-                if isinstance(cached, CachedState):
-                    print("[GGUFContext] Re-hydrating mmap_cache from cache")
-                    model.mmap_cache = cached.state_dict
 
         inner = getattr(model, "model", None)
         if inner is None:

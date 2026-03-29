@@ -23,6 +23,7 @@ from raylight.utils.memory import monitor_memory, MemoryPolicy
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 from raylight.comfy_dist.utils import cancellable_get
 from ray.exceptions import RayActorError
+from raylight.ipc.cleanup import cleanup_all_stale as _ipc_cleanup_all_stale
 
 from raylight.distributed_worker.managers.lora_manager import LoraManager
 from raylight.distributed_worker.managers.vae_manager import VaeManager
@@ -83,17 +84,10 @@ class RayWorker:
         
 
         
-        # LRU cache for mmap'd state dicts (replaces worker_mmap_cache)
-        from raylight.utils.cache import LRUStateCache
-        cache_size = self.raylight_config.device.mmap_cache_size
-        if cache_size < 3:
-            print(f"[RayWorker {self.local_rank}] WARNING: mmap_cache_size={cache_size} is too small for UNET+VAE. Forcing to 4.")
-            cache_size = 4
-        print(f"[RayWorker {self.local_rank}] Initialized LRU State Cache with size={cache_size}")
-        self.state_cache = LRUStateCache(max_size=cache_size)
-        
-        # Legacy alias for backward compatibility
-        self.worker_mmap_cache = self.state_cache
+        # Stub for state_cache parameter (LRU cache removed — OS page cache
+        # handles mmap re-reads; pinned-cache / shm handle their own lifecycle).
+        self.state_cache = None
+        self.worker_mmap_cache = None
 
         # CRITICAL: Apply LowVramPatch monkey-patch early to ensure ALL model types
         # (GGUF, standard, FSDP) use Raylight's LoRA-compatible patch handler.
@@ -168,10 +162,16 @@ class RayWorker:
                 for b in diff_model.buffers():
                     b.data = torch.empty(0, dtype=b.dtype, device="cpu")
         self._teardown_pinned_cache()
+        # Drop the model reference so any weakref.finalize handlers (e.g.
+        # GGUF shm cleanup) fire promptly instead of waiting for process
+        # exit.  This is critical for freeing /dev/shm segments that are
+        # managed via weakref finalizers rather than pinned_param_cache.
+        self.model = None
         # Mark the model as NOT loaded so the next run does a full disk reload
         # instead of trying to hot-load from the (now-empty) parameters.
         self.is_model_loaded = False
         self.memory.teardown()
+        import gc; gc.collect()
         print(f"[RayWorker {self.local_rank}] Pinned cache released via remote call.")
 
     # ------------------------------------------------------------------ init (continued)
@@ -695,25 +695,24 @@ class RayWorker:
         target_device = load_device if load_device is not None else self.device
         
         if self.model is not None:
-             # Use attached config to get context
-             config_state = getattr(self.model, "load_config", None)
-             path = config_state.unet_path if config_state else getattr(self.model, "unet_path", "unknown")
-             opts = config_state.model_options if config_state else None
-             
-             ctx = get_context(path, self.config, model_options=opts)
-             
-             # Context checks if migration is needed
-             self.model = ctx.reload_if_needed(
-                 self.model, 
-                 target_device, 
-                 self.config, 
-                 self.state_cache
-             )
+            # Use attached config to get context
+            config_state = getattr(self.model, "load_config", None)
+            path = config_state.unet_path if config_state else getattr(self.model, "unet_path", "unknown")
+            opts = config_state.model_options if config_state else None
+
+            ctx = get_context(path, self.config, model_options=opts)
+
+            # Context checks if migration is needed
+            self.model = ctx.reload_if_needed(
+                self.model,
+                target_device,
+                self.config,
+            )
 
         elif hasattr(self, 'base_sd_ref') and self.base_sd_ref is not None:
-             # Fallback for state_dict based loading
-             print(f"[RayWorker] Reloading from base_sd_ref...")
-             self.load_unet_from_state_dict(self.base_sd_ref, model_options={})
+            # Fallback for state_dict based loading
+            print(f"[RayWorker] Reloading from base_sd_ref...")
+            self.load_unet_from_state_dict(self.base_sd_ref, model_options={})
         else:
             # No model loaded
             pass
@@ -1083,14 +1082,11 @@ def ensure_fresh_actors(ray_actors_init: Union[List[Any], Tuple[Any, ...]]) -> T
             except Exception:
                 pass
 
-        # Clean up any orphaned /dev/shm segments that survived the kill
-        import glob
-        for pattern in ("/dev/shm/raylight_pc_*", "/dev/shm/raylight_vae_*"):
-            for f in glob.glob(pattern):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
+        # Clean up orphaned host-memory artifacts.
+        try:
+            _ipc_cleanup_all_stale()
+        except Exception:
+            pass
         
         # Re-initialize using the factory function (which closure-captures the config)
         ray_actors = cast(Dict[str, Any], ray_actor_fn())

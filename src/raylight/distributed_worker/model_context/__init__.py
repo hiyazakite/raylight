@@ -48,7 +48,7 @@ def get_context(
                 "GGUF quantization is incompatible with FSDP sharding. "
                 "Please use a standard Safetensors model or disable FSDP/Context Parallel to use GGUF."
             )
-        return FSDPContext(use_mmap=use_mmap, cache_in_ram=False)
+        return FSDPContext(use_mmap=use_mmap)
 
     if path.lower().endswith(".gguf"):
         return GGUFContext(use_mmap=use_mmap)
