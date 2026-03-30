@@ -31,8 +31,11 @@ def _weak_unlink_shm(name: str) -> None:
     """weakref.finalize callback — best-effort unlink of a POSIX shm segment."""
     try:
         shm = SharedMemory(name=name, create=False)
-        shm.close()
         shm.unlink()
+        try:
+            shm.close()
+        except BufferError:
+            pass
     except Exception:
         pass
 
@@ -191,7 +194,13 @@ class PosixShmBackend:
             return
         shm = self._handles.pop(name, None)
         if shm is not None:
-            shm.close()
+            try:
+                shm.close()
+            except BufferError:
+                # Exported pointers (e.g. torch tensors via frombuffer)
+                # still reference the mmap — suppress and let __del__
+                # retry once those references are freed.
+                pass
             if unlink:
                 try:
                     shm.unlink()

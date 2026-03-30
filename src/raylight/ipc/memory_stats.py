@@ -11,8 +11,8 @@ import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from .backend import HostIpcBackend
-from .service import HostIpcService
+from .backends.backend import HostIpcBackend
+from .services import HostIpcService
 
 
 @dataclass(frozen=True)

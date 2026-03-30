@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from .backends.backend import HostIpcBackend
-from .types import HostIpcArtifactMetadata, HostIpcBackendInfo, HostIpcBufferSpec, HostIpcCleanupPattern
+from ..backends.backend import HostIpcBackend
+from ..types import HostIpcArtifactMetadata, HostIpcBackendInfo, HostIpcBufferSpec, HostIpcCleanupPattern
 
 
 class DefaultHostIpcService:

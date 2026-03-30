@@ -8,7 +8,7 @@ import os
 import time
 from collections.abc import Iterable
 
-from .backend import HostIpcBackend
+from .backends.backend import HostIpcBackend
 
 log = logging.getLogger(__name__)
 

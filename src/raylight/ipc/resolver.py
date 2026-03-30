@@ -6,9 +6,9 @@ from pathlib import Path
 import platform
 
 from .errors import HostIpcBackendUnavailableError, HostIpcBackendValidationError
-from .file_mmap import FileMmapHostIpcBackend
-from .posix_shm import PosixShmBackend
-from .service_impl import DefaultHostIpcService
+from .backends.file_mmap import FileMmapHostIpcBackend
+from .backends.posix_shm import PosixShmBackend
+from .services import DefaultHostIpcService
 
 _LINUX_RAM_BACKED_FS_TYPES = {"tmpfs", "ramfs", "hugetlbfs"}
 

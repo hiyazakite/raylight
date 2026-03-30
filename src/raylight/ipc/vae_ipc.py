@@ -7,7 +7,7 @@ HostIpcBufferSpec details.
 
 from __future__ import annotations
 
-from .service import HostIpcService
+from .services import HostIpcService
 from .types import HostIpcAccessMode, HostIpcArtifactMetadata, HostIpcBufferSpec
 
 VAE_OUT_PREFIX = "raylight_vae_out"

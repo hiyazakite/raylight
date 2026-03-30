@@ -5,7 +5,7 @@ Phase 1 concrete: FileMmapHostIpcBackend, resolver, DefaultHostIpcService,
   config plumbing, and VAE decode artifact lifecycle wired in nodes.py.
 """
 
-from .backend import HostIpcBackend
+from .backends.backend import HostIpcBackend
 from .errors import (
     HostIpcArtifactAttachTimeoutError,
     HostIpcArtifactLifecycleError,
@@ -23,7 +23,7 @@ from .memory_stats import (
     collect_ipc_artifact_stats,
     collect_legacy_pt_stats,
 )
-from .posix_shm import PosixShmBackend
+from .backends.posix_shm import PosixShmBackend
 from .resolver import (
     build_default_host_ipc_service,
     build_file_mmap_backend,
@@ -31,8 +31,7 @@ from .resolver import (
     is_ram_backed_path,
     resolve_file_mmap_root,
 )
-from .service import HostIpcService
-from .service_impl import DefaultHostIpcService
+from .services import HostIpcService, DefaultHostIpcService
 from .types import (
     HostIpcAccessMode,
     HostIpcArtifactMetadata,

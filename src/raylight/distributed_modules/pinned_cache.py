@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 if TYPE_CHECKING:
-    from raylight.ipc.posix_shm import PosixShmBackend
+    from raylight.ipc.backends.posix_shm import PosixShmBackend
 
 log = logging.getLogger(__name__)
 
@@ -922,6 +922,12 @@ class SharedPinnedParamCache(BasePinnedCache):
         self._cpu_buffers.clear()
         self._freed_storages = []
         self._total_bytes = 0
+
+        # 1b. Force GC so tensor objects (and their memoryview refs into
+        #     shm.buf) are destroyed BEFORE we close the SharedMemory
+        #     handle.  Without this, lingering buffer exports cause
+        #     "BufferError: cannot close exported pointers exist".
+        import gc; gc.collect()
 
         # 2. Unregister CUDA host pinning.
         if self._registered_ptr is not None:
