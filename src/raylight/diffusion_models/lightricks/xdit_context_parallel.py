@@ -94,7 +94,7 @@ def sp_gather_group(group, orig_sizes, dim):
 def process_usp_timestep(timestep, sp_rank, sp_world_size):
     """
     Optimized timestep processing for Sequence Parallel.
-    Avoids materializing the full expanded timestep tensor on every worker.
+    Avoids materializing the full expanded timestep tensor on every actor.
     """
     if isinstance(timestep, (list, tuple)):
         return type(timestep)(
@@ -250,7 +250,7 @@ def usp_dit_forward(
     pixel_coords_chunk = sp_chunk_group(pixel_coords_padded, sp_world_size, sp_rank, dim=2)
     timestep = process_usp_timestep(timestep, sp_rank, sp_world_size)
 
-    # 3. Generate Positional Embeddings only for this worker's chunk
+    # 3. Generate Positional Embeddings only for this actor's chunk
     # This avoids the massive peak memory of generating full PE (e.g. 50GB for 900 frames)
     # PEs are cached across timesteps since coords and frame_rate don't change during generation
     pe = prepare_pe_cached(self, pixel_coords_chunk, frame_rate, input_dtype)
@@ -259,7 +259,7 @@ def usp_dit_forward(
             pc_shape = [tuple(p.shape) for p in pixel_coords_chunk]
         else:
             pc_shape = tuple(pixel_coords_chunk.shape)
-        logger.info("[RayWorker %d] PE Generated for chunk: %s. VRAM: %.1fMB", sp_rank, pc_shape, torch.cuda.memory_allocated()/1024**2)
+        logger.info("[RayActor %d] PE Generated for chunk: %s. VRAM: %.1fMB", sp_rank, pc_shape, torch.cuda.memory_allocated()/1024**2)
     # ======================== ADD SEQUENCE PARALLEL ========================= #
 
     # Process transformer blocks
@@ -267,7 +267,7 @@ def usp_dit_forward(
         x, context, attention_mask, timestep, pe, transformer_options=transformer_options, self_attention_mask=self_attention_mask, **merged_args
     )
     if RAYLIGHT_DEBUG:
-        logger.info("[RayWorker %d] Blocks complete. Peak VRAM: %.1fMB", sp_rank, torch.cuda.max_memory_allocated()/1024**2)
+        logger.info("[RayActor %d] Blocks complete. Peak VRAM: %.1fMB", sp_rank, torch.cuda.max_memory_allocated()/1024**2)
     
     x = sp_gather_group(x, x_orig, dim=1)
     

@@ -35,17 +35,17 @@ def _get_torch_compiler_disable_decorator():
 _torch_compiler_disable = _get_torch_compiler_disable_decorator()
 
 
-def clear_ray_cluster(ray_actors=None, reason=None):
-    """Best-effort cleanup of Ray workers after a fatal workflow error."""
+def clear_ray_cluster(actors=None, reason=None):
+    """Best-effort cleanup of Ray actors after a fatal workflow error."""
     global _RAY_CLUSTER_EPOCH
     if reason:
         print(f"[Raylight] Clearing Ray cluster after failure: {reason}")
 
-    workers = []
-    if isinstance(ray_actors, dict):
-        workers = ray_actors.get("workers", []) or []
+    actors = []
+    if isinstance(actors, dict):
+        actors = actors.get("actors", []) or []
 
-    for actor in workers:
+    for actor in actors:
         try:
             ray.kill(actor, no_restart=True)
         except Exception:

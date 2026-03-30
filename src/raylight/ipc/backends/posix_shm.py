@@ -144,7 +144,7 @@ class PosixShmBackend:
         """Attach to an existing POSIX shm segment by name only.
 
         Convenience wrapper for non-creators that know only the segment
-        name (e.g. pinned-cache workers, GGUF readers).  Constructs
+        name (e.g. pinned-cache actors, GGUF readers).  Constructs
         minimal metadata internally and delegates to :meth:`attach_artifact`.
         """
         stub = HostIpcArtifactMetadata(

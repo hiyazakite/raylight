@@ -689,7 +689,7 @@ class RayEasyCacheNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "reuse_threshold": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 3.0, "step": 0.01}),
                 "start_percent": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "end_percent": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -702,7 +702,7 @@ class RayEasyCacheNode:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -744,7 +744,7 @@ class RayTeaCacheNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 5.0, "step": 0.01}),
                 "warmup_percent": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.5, "step": 0.01}),
                 "retention_interval": ("INT", {"default": 8, "min": 1, "max": 64}),
@@ -759,7 +759,7 @@ class RayTeaCacheNode:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 

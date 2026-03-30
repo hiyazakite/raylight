@@ -1,6 +1,6 @@
 """model_context package — public API re-exports.
 
-All existing ``from raylight.distributed_worker.model_context import X``
+All existing ``from raylight.distributed_actor.model_context import X``
 statements continue to work unchanged.
 """
 from ._base import (                  # noqa: F401

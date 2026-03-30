@@ -16,10 +16,10 @@ from raylight.utils.common import Noise_EmptyNoise, Noise_RandomNoise
 
 class RayBasicScheduler:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "scheduler": (comfy.samplers.SCHEDULER_NAMES,),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                 "denoise": (
@@ -51,10 +51,10 @@ class RayBasicScheduler:
 
 class RayBetaSamplingScheduler:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
                 "alpha": (
                     "FLOAT",
@@ -97,7 +97,7 @@ class RaySamplingPercentToSigma:
     def INPUT_TYPES(cls) -> InputTypeDict:
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "sampling_percent": (
                     IO.FLOAT,
                     {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.0001},
@@ -135,7 +135,7 @@ class RaySamplerSASolver(ComfyNodeABC):
     def INPUT_TYPES(cls) -> InputTypeDict:
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "eta": (
                     IO.FLOAT,
                     {
@@ -211,10 +211,10 @@ class RaySamplerSASolver(ComfyNodeABC):
 
 class XFuserSamplerCustom:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "add_noise": ("BOOLEAN", {"default": True}),
                 "noise_seed": (
                     "INT",
@@ -252,7 +252,7 @@ class XFuserSamplerCustom:
 
     def ray_sample(
         self,
-        ray_actors,
+        actors,
         add_noise,
         noise_seed,
         cfg,
@@ -265,20 +265,20 @@ class XFuserSamplerCustom:
         try:
             gc.collect()
             # Use the ORIGINAL unload (not the monkey-patched one) to free
-            # main-process VRAM without destroying worker pinned caches.
+            # main-process VRAM without destroying actor pinned caches.
             from raylight.nodes import _orig_unload_all_models
             _orig_unload_all_models()
             comfy.model_management.soft_empty_cache()
             comfy.model_management.soft_empty_cache()
-            gpu_actors = ray_actors["workers"]
+            # Always sync LoRA state so missing hash also triggers reset on actors.
+            lora_config_hash = actors.get("lora_config_hash")
+            actors = actors["actors"]
 
             # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
-            ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+            ray.get([actor.reload_model_if_needed.remote() for actor in actors])
 
-            # Always sync LoRA state so missing hash also triggers reset on workers.
-            lora_config_hash = ray_actors.get("lora_config_hash")
             print(f"[XFuserSamplerCustom] Syncing LoRA state (config_hash={lora_config_hash})...")
-            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
+            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in actors])
 
             futures = [
                 actor.custom_sampler.remote(
@@ -291,22 +291,22 @@ class XFuserSamplerCustom:
                     sigmas,
                     latent_image,
                 )
-                for i, actor in enumerate(gpu_actors)
+                for i, actor in enumerate(actors)
             ]
             results = ray.get(futures)
             out = results[0]
             return (out[0], out[1])
         except Exception as e:
-            clear_ray_cluster(ray_actors, reason=f"sampling error in XFuserSamplerCustom: {type(e).__name__}")
+            clear_ray_cluster(actors, reason=f"sampling error in XFuserSamplerCustom: {type(e).__name__}")
             raise
 
 
 class DPSamplerCustom:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "add_noise": ("BOOLEAN", {"default": True}),
                 "noise_list": ("NOISE",),
                 "cfg": (
@@ -336,7 +336,7 @@ class DPSamplerCustom:
 
     def ray_sample(
         self,
-        ray_actors,
+        actors,
         add_noise,
         noise_list,
         cfg,
@@ -346,7 +346,7 @@ class DPSamplerCustom:
         sigmas,
         latent_image,
     ):
-        ray_actors = ray_actors[0]
+        actors = actors[0]
         try:
             add_noise = add_noise[0]
             cfg = cfg[0]
@@ -358,19 +358,19 @@ class DPSamplerCustom:
 
             gc.collect()
             # Use the ORIGINAL unload (not the monkey-patched one) to free
-            # main-process VRAM without destroying worker pinned caches.
+            # main-process VRAM without destroying actor pinned caches.
             from raylight.nodes import _orig_unload_all_models
             _orig_unload_all_models()
             comfy.model_management.soft_empty_cache()
-            gpu_actors = ray_actors["workers"]
+            # Always sync LoRA state so missing hash also triggers reset on actors.
+            lora_config_hash = actors.get("lora_config_hash")
+            actors = actors["actors"]
 
             # Ensure model is loaded before sampling (triggers /dev/shm hot reload if needed)
-            ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+            ray.get([actor.reload_model_if_needed.remote() for actor in actors])
 
-            # Always sync LoRA state so missing hash also triggers reset on workers.
-            lora_config_hash = ray_actors.get("lora_config_hash")
             print(f"[DPSamplerCustom] Syncing LoRA state (config_hash={lora_config_hash})...")
-            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
+            ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in actors])
 
             futures = [
                 actor.custom_sampler.remote(
@@ -383,20 +383,20 @@ class DPSamplerCustom:
                     sigmas,
                     latent_image,
                 )
-                for i, actor in enumerate(gpu_actors)
+                for i, actor in enumerate(actors)
             ]
             out = ray.get(futures)
             output = [res[0] for res in out]
             denoised_output = [res[1] for res in out]
             return (output, denoised_output)
         except Exception as e:
-            clear_ray_cluster(ray_actors, reason=f"sampling error in DPSamplerCustom: {type(e).__name__}")
+            clear_ray_cluster(actors, reason=f"sampling error in DPSamplerCustom: {type(e).__name__}")
             raise
 
 
 class RayAddNoise:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "noise_seed": ("INT", {
@@ -406,7 +406,7 @@ class RayAddNoise:
                     "control_after_generate": True,
                 }),
                 "force_empty_noise": ("BOOLEAN", ),
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "sigmas": ("SIGMAS",),
                 "latent_image": ("LATENT",),
             }

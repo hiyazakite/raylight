@@ -15,13 +15,13 @@ from raylight.utils.profiler import CProfileContext
 
 
 if TYPE_CHECKING:
-    from raylight.distributed_worker.worker_config import WorkerConfig
+    from raylight.distributed_actor.actor_config import ActorConfig
 
 
 class SamplerManager:
     """
     Stateless manager for sampling operations.
-    Dependencies are injected at method call time via WorkerConfig and arguments.
+    Dependencies are injected at method call time via ActorConfig and arguments.
     """
     def __init__(self):
         pass
@@ -32,13 +32,13 @@ class SamplerManager:
     def prepare_for_sampling(
         self, 
         model, 
-        config: WorkerConfig, 
+        config: ActorConfig, 
         latent: dict, 
         state_dict: Optional[dict] = None
     ) -> Tuple[Any, Any, Any, bool, bool]:
         """Common setup for sampling methods."""
         if model is None:
-             raise RuntimeError(f"[RayWorker {config.local_rank}] Model not loaded! Please use a Load node first.")
+             raise RuntimeError(f"[RayActor {config.local_rank}] Model not loaded! Please use a Load node first.")
         
         work_model = model
         model_was_modified = False
@@ -64,7 +64,7 @@ class SamplerManager:
         # if getattr(work_model, "gguf_metadata", None):
         #      ops = work_model.model_options.get("custom_operations")
         #      if ops and hasattr(ops, "Linear"):
-        #           print(f"[RayWorker {config.local_rank}] SAMPLING START | GGUF Config verified: Dequant={getattr(ops.Linear, 'dequant_dtype', 'None')}, Patch={getattr(ops.Linear, 'patch_dtype', 'None')}")
+        #           print(f"[RayActor {config.local_rank}] SAMPLING START | GGUF Config verified: Dequant={getattr(ops.Linear, 'dequant_dtype', 'None')}, Patch={getattr(ops.Linear, 'patch_dtype', 'None')}")
 
         return work_model, latent_image, noise_mask, disable_pbar, model_was_modified
     
@@ -72,13 +72,13 @@ class SamplerManager:
     def sampling_context(
         self, 
         model, 
-        config: WorkerConfig,
+        config: ActorConfig,
         latent: dict, 
         state_dict: Optional[dict] = None,
         name: str = "sampler"
     ):
         """Context manager for sampling operations to ensure cleanup."""
-        with monitor_memory(f"RayWorker {config.local_rank} - {name}", device=config.device):
+        with monitor_memory(f"RayActor {config.local_rank} - {name}", device=config.device):
             # 1. Common Setup (FSDP, Pbar, Device, Latent Fix)
             # We need a copy of latent because _prepare modifies it
             # The caller passes the original dict, we copy it here
@@ -134,7 +134,7 @@ class SamplerManager:
     def custom_sampler(
         self,
         model,
-        config: WorkerConfig,
+        config: ActorConfig,
         add_noise,
         noise_seed,
         cfg,
@@ -167,7 +167,7 @@ class SamplerManager:
              # 3. Sampling
              # Use utility for consistent memory logging
              # if hasattr(model, "mmap_cache"):
-             #     print(f"[RayWorker {config.local_rank}] Mmap Cache Len: {len(model.mmap_cache) if model.mmap_cache else 0}")
+             #     print(f"[RayActor {config.local_rank}] Mmap Cache Len: {len(model.mmap_cache) if model.mmap_cache else 0}")
              
              with torch.no_grad():
                  # Correctly initialize CompactFusion step counter and clear indices
@@ -237,7 +237,7 @@ class SamplerManager:
     def common_ksampler(
         self,
         model,
-        config: WorkerConfig,
+        config: ActorConfig,
         seed,
         steps,
         cfg,

@@ -18,7 +18,7 @@ class RayIDLoraKSampler:
 
     Accepts a combined AV latent from LTXVConcatAVLatent plus standard
     positive/negative CONDITIONING.  All patchification, noise scheduling, and
-    audio/video separation happen inside the workers via model.apply_model —
+    audio/video separation happen inside the actors via model.apply_model —
     no ltx_core dependency required.
 
     Output LATENT is a NestedTensor compatible with LTXVSeparateAVLatent.
@@ -28,7 +28,7 @@ class RayIDLoraKSampler:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS", {"tooltip": "Ray cluster with LTXAV model loaded"}),
+                "actors": ("RAY_ACTORS", {"tooltip": "Ray cluster with LTXAV model loaded"}),
                 "add_noise": ("BOOLEAN", {"default": True}),
                 "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
                 "positive": ("CONDITIONING",),
@@ -54,7 +54,7 @@ class RayIDLoraKSampler:
 
     def sample(
         self,
-        ray_actors,
+        actors,
         add_noise,
         noise_seed,
         positive,
@@ -69,21 +69,22 @@ class RayIDLoraKSampler:
         stg_blocks="",
         av_bimodal_scale=0.0,
     ):
-        from raylight.distributed_worker.managers.idlora_manager import IDLoraDenoiseConfig
+        from raylight.distributed_actor.managers.idlora_manager import IDLoraDenoiseConfig
         from raylight.comfy_dist.utils import clear_ray_cluster
 
         try:
-            # Free main-process VRAM so workers can access pinned caches
+            # Free main-process VRAM so actors can access pinned caches
             gc.collect()
             from raylight.nodes import _orig_unload_all_models
             _orig_unload_all_models()
             comfy.model_management.soft_empty_cache()
             comfy.model_management.soft_empty_cache()
 
-            gpu_actors = ray_actors["workers"]
+            lora_config_hash = actors.get("lora_config_hash")
+            actors = actors["actors"]
             dtype = torch.bfloat16
 
-            ray.get([actor.reload_model_if_needed.remote() for actor in gpu_actors])
+            ray.get([actor.reload_model_if_needed.remote() for actor in actors])
 
             # ----------------------------------------------------------------
             # 1. Split the combined AV NestedTensor
@@ -187,9 +188,8 @@ class RayIDLoraKSampler:
             )
             config_ref = ray.put(denoise_config)
 
-            lora_config_hash = ray_actors.get("lora_config_hash")
             if lora_config_hash is not None:
-                ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in gpu_actors])
+                ray.get([actor.reapply_loras_for_config.remote(lora_config_hash) for actor in actors])
 
             futures = [
                 actor.idlora_sample.remote(
@@ -197,7 +197,7 @@ class RayIDLoraKSampler:
                     sigmas_ref, ref_audio=ref_audio_ref, denoise_config=config_ref,
                     v_clean=v_clean_ref, a_clean=a_clean_ref,
                 )
-                for actor in gpu_actors
+                for actor in actors
             ]
 
             results = cancellable_get(futures)
@@ -212,5 +212,5 @@ class RayIDLoraKSampler:
             return (output, denoised_output)
 
         except Exception as e:
-            clear_ray_cluster(ray_actors, reason=f"sampling error in RayIDLoraKSampler: {type(e).__name__}")
+            clear_ray_cluster(actors, reason=f"sampling error in RayIDLoraKSampler: {type(e).__name__}")
             raise

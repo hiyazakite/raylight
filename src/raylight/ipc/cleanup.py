@@ -45,7 +45,7 @@ def cleanup_all_stale(*, older_than_s: float | None = None) -> None:
 
     Builds the file-mmap and POSIX shm backends, skipping any that are
     unavailable on the current platform.  Safe to call at startup (before
-    workers exist) or during actor teardown.
+    actors exist) or during actor teardown.
     """
     from .resolver import build_file_mmap_backend, build_posix_shm_backend
     from .vae_ipc import VAE_CLEANUP_PREFIXES

@@ -133,7 +133,7 @@ class DeviceConfig:
     Hardware and memory allocation settings.
     
     Attributes:
-        world_size: Total number of GPUs/workers in the cluster.
+        world_size: Total number of GPUs/actors in the cluster.
         gpu_indices: Specific CUDA device indices to use.
         vram_limit_gb: Soft memory limit to prevent OOM.
         use_mmap: Use memory-mapped files for model weights.
@@ -152,7 +152,7 @@ class DebugConfig:
         verbose_attn: Print detailed timing and shape info for every attention call.
         overlap_decomp: Overlap GPU decompression with compute.
         allow_deprecated: Enable legacy compression modes for testing.
-        dedup_logs: Prevent log spam from multiple Ray workers.
+        dedup_logs: Prevent log spam from multiple Ray actors.
     """
     verbose_attn: bool = False
     overlap_decomp: bool = True

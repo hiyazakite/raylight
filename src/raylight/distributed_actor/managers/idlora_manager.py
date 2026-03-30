@@ -15,7 +15,7 @@ import comfy.utils
 from raylight.utils.memory import monitor_memory
 
 if TYPE_CHECKING:
-    from raylight.distributed_worker.worker_config import WorkerConfig
+    from raylight.distributed_actor.actor_config import ActorConfig
 
 
 @dataclass(frozen=True)
@@ -51,10 +51,10 @@ class IDLoraManager:
     def __init__(self):
         pass
 
-    def _prepare_model(self, model, config: "WorkerConfig", state_dict=None):
+    def _prepare_model(self, model, config: "ActorConfig", state_dict=None):
         if model is None:
             raise RuntimeError(
-                f"[RayWorker {config.local_rank}] Model not loaded! Use a Load node first."
+                f"[RayActor {config.local_rank}] Model not loaded! Use a Load node first."
             )
         if config.is_fsdp:
             from raylight.comfy_dist.fsdp_utils import prepare_fsdp_model_for_sampling
@@ -64,8 +64,8 @@ class IDLoraManager:
         return model
 
     @contextmanager
-    def sampling_context(self, model, config: "WorkerConfig", state_dict=None, name="idlora_sampler"):
-        with monitor_memory(f"RayWorker {config.local_rank} - {name}", device=config.device):
+    def sampling_context(self, model, config: "ActorConfig", state_dict=None, name="idlora_sampler"):
+        with monitor_memory(f"RayActor {config.local_rank} - {name}", device=config.device):
             self._prepare_model(model, config, state_dict)
             try:
                 model.pre_run()
@@ -108,7 +108,7 @@ class IDLoraManager:
     def idlora_denoise(
         self,
         model,
-        config: "WorkerConfig",
+        config: "ActorConfig",
         video_dict: dict,
         audio_dict: dict,
         positive,
@@ -172,11 +172,11 @@ class IDLoraManager:
             if config.local_rank == 0:
                 pos_keys = sorted(positive[0][1].keys())
                 neg_keys = sorted(negative[0][1].keys())
-                print(f"[RayWorker 0] ID-LoRA cond keys | pos={pos_keys} neg={neg_keys}", flush=True)
+                print(f"[RayActor 0] ID-LoRA cond keys | pos={pos_keys} neg={neg_keys}", flush=True)
                 if "keyframe_idxs" in positive[0][1] and hasattr(positive[0][1]["keyframe_idxs"], "shape"):
-                    print(f"[RayWorker 0] ID-LoRA keyframe_idxs shape: {tuple(positive[0][1]['keyframe_idxs'].shape)}", flush=True)
+                    print(f"[RayActor 0] ID-LoRA keyframe_idxs shape: {tuple(positive[0][1]['keyframe_idxs'].shape)}", flush=True)
                 if "guide_attention_entries" in positive[0][1]:
-                    print(f"[RayWorker 0] ID-LoRA guide_attention_entries: {len(positive[0][1]['guide_attention_entries'])}", flush=True)
+                    print(f"[RayActor 0] ID-LoRA guide_attention_entries: {len(positive[0][1]['guide_attention_entries'])}", flush=True)
 
             # ------------------------------------------------------------------
             # Load tensors onto device
@@ -253,7 +253,7 @@ class IDLoraManager:
                 pos_model_cond_keys = sorted(processed_conds["positive"][0].get("model_conds", {}).keys())
                 neg_model_cond_keys = sorted(processed_conds["negative"][0].get("model_conds", {}).keys())
                 print(
-                    f"[RayWorker 0] ID-LoRA model_conds | pos={pos_model_cond_keys} neg={neg_model_cond_keys}",
+                    f"[RayActor 0] ID-LoRA model_conds | pos={pos_model_cond_keys} neg={neg_model_cond_keys}",
                     flush=True,
                 )
 
@@ -307,7 +307,7 @@ class IDLoraManager:
                             block.audio_attn1._orig_forward_stg = block.audio_attn1.forward
                             block.audio_attn1.forward = make_stg_wrapper(block.audio_attn1.forward, i)
                 except Exception as e:
-                    print(f"[RayWorker 0] Warning: Failed to attach STG wrappers: {e}", flush=True)
+                    print(f"[RayActor 0] Warning: Failed to attach STG wrappers: {e}", flush=True)
 
             # ------------------------------------------------------------------
             # Euler denoising loop
@@ -328,7 +328,7 @@ class IDLoraManager:
 
                     if config.local_rank == 0:
                         print(
-                            f"[RayWorker 0] ID-LoRA step {step_idx + 1}/{total_steps}"
+                            f"[RayActor 0] ID-LoRA step {step_idx + 1}/{total_steps}"
                             f"  σ={sigma.item():.4f} → {sigma_next.item():.4f}",
                             flush=True,
                         )

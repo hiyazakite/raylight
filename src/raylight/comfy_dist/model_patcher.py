@@ -115,7 +115,7 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
         vram_limit = getattr(self, "vram_limit_bytes", 0)
         if vram_limit > 0 and device_to is not None:
             try:
-                from raylight.distributed_worker.model_context import _compute_vram_budget
+                from raylight.distributed_actor.model_context import _compute_vram_budget
                 model_bytes = self.model_size()
                 budget = _compute_vram_budget(
                     device_to, model_bytes, vram_limit_bytes=vram_limit,

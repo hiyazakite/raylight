@@ -1,6 +1,6 @@
 """Protocol types for Raylight duck-typed interfaces.
 
-Centralises the structural contracts that the distributed worker layer
+Centralises the structural contracts that the distributed actor layer
 expects so that static type checkers (mypy / pyright) and readers can
 understand the API surface without chasing through dozens of ``getattr``
 calls.
@@ -84,12 +84,12 @@ class StateCacheLike(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Worker config
+# Actor config
 # ---------------------------------------------------------------------------
 
 @runtime_checkable
-class WorkerConfigLike(Protocol):
-    """Minimal shape expected from ``WorkerConfig``."""
+class ActorConfigLike(Protocol):
+    """Minimal shape expected from ``ActorConfig``."""
 
     local_rank: int
     device: torch.device

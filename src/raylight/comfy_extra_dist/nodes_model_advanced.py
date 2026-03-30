@@ -67,14 +67,14 @@ class RayModelSamplingDiscrete:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "sampling": (["eps", "v_prediction", "lcm", "x0", "img_to_img"],),
                 "zsnr": ("BOOLEAN", {"default": False}),
             }
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -109,7 +109,7 @@ class RayModelSamplingStableCascade:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "shift": (
                     "FLOAT",
                     {"default": 2.0, "min": 0.0, "max": 100.0, "step": 0.01},
@@ -118,7 +118,7 @@ class RayModelSamplingStableCascade:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -143,7 +143,7 @@ class RayModelSamplingSD3:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "shift": (
                     "FLOAT",
                     {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.01},
@@ -152,7 +152,7 @@ class RayModelSamplingSD3:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -177,7 +177,7 @@ class RayModelSamplingAuraFlow:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "shift": (
                     "FLOAT",
                     {"default": 1.73, "min": 0.0, "max": 100.0, "step": 0.01},
@@ -186,7 +186,7 @@ class RayModelSamplingAuraFlow:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch_aura"
     CATEGORY = "Raylight/extra"
 
@@ -211,7 +211,7 @@ class RayModelSamplingFlux:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "max_shift": (
                     "FLOAT",
                     {"default": 1.15, "min": 0.0, "max": 100.0, "step": 0.01},
@@ -242,7 +242,7 @@ class RayModelSamplingFlux:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -273,7 +273,7 @@ class RayModelSamplingContinuousEDM:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "sampling": (
                     [
                         "v_prediction",
@@ -307,7 +307,7 @@ class RayModelSamplingContinuousEDM:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -349,7 +349,7 @@ class RayModelSamplingContinuousV:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "sampling": (["v_prediction"],),
                 "sigma_max": (
                     "FLOAT",
@@ -375,7 +375,7 @@ class RayModelSamplingContinuousV:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -403,7 +403,7 @@ class RayRescaleCFG:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "multiplier": (
                     "FLOAT",
                     {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01},
@@ -412,7 +412,7 @@ class RayRescaleCFG:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -451,13 +451,13 @@ class RayModelComputeDtype:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "dtype": (["default", "fp32", "fp16", "bf16"],),
             }
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -487,12 +487,12 @@ class RayCFGZeroStar:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
             }
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 
@@ -520,7 +520,7 @@ class RayCFGNorm:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "strength": (
                     "FLOAT",
                     {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01},
@@ -529,7 +529,7 @@ class RayCFGNorm:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 

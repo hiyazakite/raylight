@@ -7,13 +7,13 @@ class RayTorchCompileModel:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "backend": (["inductor", "cudagraphs"],),
             }
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "patch"
     CATEGORY = "Raylight/extra"
 

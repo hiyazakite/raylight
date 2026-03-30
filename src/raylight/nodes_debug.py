@@ -6,11 +6,8 @@ import ray
 import torch
 from typing import Any
 
-from .distributed_worker.ray_worker import (
-    make_ray_actor_fn,
-    ensure_fresh_actors,
-    ray_nccl_tester
-)
+from .distributed_actor.actor_pool import ActorPool
+from .distributed_actor.comm_test import ray_nccl_tester
 from .config import RaylightConfig, ExecutionStrategy, DeviceConfig, DebugConfig
 
 
@@ -45,7 +42,7 @@ class RayInitializerDebug:
         }
 
     RETURN_TYPES = ("RAY_ACTORS_INIT",)
-    RETURN_NAMES = ("ray_actors_init",)
+    RETURN_NAMES = ("actors_init",)
 
     FUNCTION = "spawn_actor"
     CATEGORY = "Raylight"
@@ -125,9 +122,9 @@ class RayInitializerDebug:
             raise RuntimeError(f"Ray connection failed: {e}")
 
         ray_nccl_tester(world_size)
-        ray_actor_fn = make_ray_actor_fn(world_size, self.parallel_dict)
-        ray_actors = ray_actor_fn()
-        return ([ray_actors, ray_actor_fn],)
+        pool = ActorPool(world_size, self.parallel_dict, raylight_config=config)
+        actors = pool.create()
+        return ([actors, pool, config],)
 
 
 
@@ -138,7 +135,7 @@ class RayNF4Loader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("checkpoints"),),
-                "ray_actors_init": (
+                "actors_init": (
                     "RAY_ACTORS_INIT",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
@@ -146,17 +143,17 @@ class RayNF4Loader:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "load_ray_unet"
 
     CATEGORY = "Raylight"
 
     def load_ray_unet(
         self,
-        ray_actors_init,
+        actors_init,
         unet_name,
     ):
-        ray_actors, gpu_actors, config = ensure_fresh_actors(ray_actors_init)
+        actors, actors, config = ActorPool.ensure_fresh(actors_init)
 
         unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
@@ -164,7 +161,7 @@ class RayNF4Loader:
         patched_futures = []
 
         if config.strategy.fsdp_enabled is True:
-            worker0 = ray.get_actor("RayWorker:0")
+            worker0 = ray.get_actor("RayActor:0")
             ray.get(
                 worker0.load_bnb_unet.remote(
                     unet_path,
@@ -172,20 +169,20 @@ class RayNF4Loader:
             )
             meta_model = ray.get(worker0.get_meta_model.remote())
 
-            for actor in gpu_actors:
+            for actor in actors:
                 if actor != worker0:
                     loaded_futures.append(actor.set_meta_model.remote(meta_model))
 
             ray.get(loaded_futures)
             loaded_futures = []
 
-            for actor in gpu_actors:
+            for actor in actors:
                 loaded_futures.append(actor.set_state_dict.remote())
 
             ray.get(loaded_futures)
             loaded_futures = []
         else:
-            for actor in gpu_actors:
+            for actor in actors:
                 loaded_futures.append(
                     actor.load_bnb_unet.remote(
                         unet_path,
@@ -194,13 +191,13 @@ class RayNF4Loader:
             ray.get(loaded_futures)
             loaded_futures = []
 
-        for actor in gpu_actors:
+        for actor in actors:
             if config.meta.total_sp_degree > 1:
                 patched_futures.append(actor.patch_usp.remote())
 
         ray.get(patched_futures)
 
-        return (ray_actors,)
+        return ({"actors": actors},)
 
 
 NODE_CLASS_MAPPINGS = {

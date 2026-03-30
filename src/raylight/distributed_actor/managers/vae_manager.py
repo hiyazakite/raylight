@@ -4,7 +4,7 @@ from raylight.utils.memory import monitor_memory, MemoryPolicy, NULL_POLICY
 from raylight.utils.common import cleanup_memory, force_malloc_trim
 
 from typing import Optional, Any
-from raylight.distributed_worker.worker_config import WorkerConfig
+from raylight.distributed_actor.actor_config import ActorConfig
 
 # VAE debugging stats (formerly RAYLIGHT_DEBUG_VAE) enabled via config.debug.debug_vae
 
@@ -17,15 +17,15 @@ class VaeManager:
     def load_vae(
         self, 
         vae_path: str, 
-        config: WorkerConfig, 
+        config: ActorConfig, 
         state_cache: Any,
         memory: MemoryPolicy = NULL_POLICY,
     ) -> Optional[Any]:
-        from raylight.distributed_worker.model_context import get_context, ModelState
+        from raylight.distributed_actor.model_context import get_context, ModelState
         from raylight.comfy_dist.sd import decode_tiled_1d, decode_tiled_, decode_tiled_3d
         import types
 
-        print(f"[RayWorker {config.local_rank}] VAE Load via ModelContext: {vae_path}")
+        print(f"[RayActor {config.local_rank}] VAE Load via ModelContext: {vae_path}")
         
         # 1. Get Unified Context (VAEContext for VAE models)
         ctx = get_context(vae_path, config, model_type="vae")
@@ -45,7 +45,7 @@ class VaeManager:
         vae_model.decode_tiled_3d = types.MethodType(decode_tiled_3d, vae_model)
 
         # 6. Stream weights to GPU (handled by context, same pattern as UNET)
-        from raylight.distributed_worker.model_context import VAEContext
+        from raylight.distributed_actor.model_context import VAEContext
         assert isinstance(ctx, VAEContext)
         ctx.stream_vae_to_device(vae_model, config.device)
 
@@ -56,30 +56,30 @@ class VaeManager:
         return vae_model
 
 
-    def offload_vae_from_device(self, config: WorkerConfig, lora_manager: Optional[Any] = None, memory: MemoryPolicy = NULL_POLICY):
+    def offload_vae_from_device(self, config: ActorConfig, lora_manager: Optional[Any] = None, memory: MemoryPolicy = NULL_POLICY):
         """Explicitly offload VAE from VRAM back to CPU/mmap after work-stealing completes."""
         # Release per-job caches (mmap buffer, dtype decision)
         self._mmap_cache = None
         self._cached_dtype = None
         if self.vae_model is None:
             return
-        from raylight.distributed_worker.model_context import VAEContext
+        from raylight.distributed_actor.model_context import VAEContext
         vae_ctx = VAEContext(use_mmap=config.raylight_config.device.use_mmap)
         vae_ctx.offload(self.vae_model, lora_manager, {}, config, memory=memory)
-        print(f"[RayWorker {config.local_rank}] VAE offloaded from VRAM.")
+        print(f"[RayActor {config.local_rank}] VAE offloaded from VRAM.")
 
     def release_vae(self, local_rank: int, memory: MemoryPolicy = NULL_POLICY):
         """Explicitly release VAE model from memory to free RAM for other operations."""
         self._mmap_cache = None
         self._cached_dtype = None
         if self.vae_model is not None:
-            print(f"[RayWorker {local_rank}] Releasing VAE model from RAM...")
+            print(f"[RayActor {local_rank}] Releasing VAE model from RAM...")
             del self.vae_model
             self.vae_model = None
             
             memory.teardown()
             
-            print(f"[RayWorker {local_rank}] VAE released.")
+            print(f"[RayActor {local_rank}] VAE released.")
         return True
 
     def get_temporal_compression(self):
@@ -92,16 +92,16 @@ class VaeManager:
             return None
         return self.vae_model.spacial_compression_decode()
 
-    def check_health(self, samples, shard_index, config: WorkerConfig, overwrite_cast_dtype=None):
+    def check_health(self, samples, shard_index, config: ActorConfig, overwrite_cast_dtype=None):
         # Diagnostic: Check input latent statistics
         l_min, l_max, l_mean = samples["samples"].min().item(), samples["samples"].max().item(), samples["samples"].mean().item()
-        print(f"[RayWorker {config.local_rank}] Input Latent Stats (shard {shard_index}): min={l_min:.4f}, max={l_max:.4f}, mean={l_mean:.4f}")
+        print(f"[RayActor {config.local_rank}] Input Latent Stats (shard {shard_index}): min={l_min:.4f}, max={l_max:.4f}, mean={l_mean:.4f}")
         if torch.isnan(samples["samples"]).any():
-            print(f"[RayWorker {config.local_rank}] CRITICAL: Input latents for shard {shard_index} contain NaNs!")
+            print(f"[RayActor {config.local_rank}] CRITICAL: Input latents for shard {shard_index} contain NaNs!")
         
         # Check if overwrite_cast_dtype is set (from patch_temp_fix_ck_ops)
         if overwrite_cast_dtype is not None:
-             print(f"[RayWorker {config.local_rank}] Debug: overwrite_cast_dtype is set to {overwrite_cast_dtype}")
+             print(f"[RayActor {config.local_rank}] Debug: overwrite_cast_dtype is set to {overwrite_cast_dtype}")
         
         # Check VAE weights for NaNs BEFORE decoding
         if self.vae_model is not None:
@@ -110,9 +110,9 @@ class VaeManager:
                 if torch.isnan(p).any():
                     nan_params.append(name)
             if nan_params:
-                print(f"[RayWorker {config.local_rank}] CRITICAL: VAE parameters contain NaNs: {nan_params[:5]}...")
+                print(f"[RayActor {config.local_rank}] CRITICAL: VAE parameters contain NaNs: {nan_params[:5]}...")
             else:
-                print(f"[RayWorker {config.local_rank}] VAE parameters verified healthy (no NaNs).")
+                print(f"[RayActor {config.local_rank}] VAE parameters verified healthy (no NaNs).")
 
     def decode(
         self,
@@ -127,7 +127,7 @@ class VaeManager:
         mmap_path=None,
         mmap_shape=None,
         output_offset=0,
-        config: Optional[WorkerConfig] = None,
+        config: Optional[ActorConfig] = None,
         lora_manager: Optional[Any] = None,
         state_cache: Optional[Any] = None,
         latent_ref=None,
@@ -136,12 +136,12 @@ class VaeManager:
         skip_offload=False,
     ):
         if config is None:
-             raise ValueError("WorkerConfig must be passed to decode")
+             raise ValueError("ActorConfig must be passed to decode")
 
         # NOTE: Removed eager gc.collect() + torch.cuda.empty_cache() that blocked CPU/GPU
         # for hundreds of ms at the start of every decode call. Cleanup happens in the
         # finally block after decode completes.
-        print(f"[RayWorker {config.local_rank}] Entering ray_vae_decode for shard {shard_index}")
+        print(f"[RayActor {config.local_rank}] Entering ray_vae_decode for shard {shard_index}")
         
         if tile_size < overlap * 4:
             overlap = tile_size // 4
@@ -181,7 +181,7 @@ class VaeManager:
             # Use non_blocking=True to overlap PCIe transfer with CPU setup work
             latents_to_decode = shard_latents.to(config.device, dtype=dtype, non_blocking=True)
             del shard_latents
-            print(f"[RayWorker {config.local_rank}] latents shape: {latents_to_decode.shape}, tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
+            print(f"[RayActor {config.local_rank}] latents shape: {latents_to_decode.shape}, tiling: tile_t={temporal_size}, overlap_t={temporal_overlap}")
     
             # Sync the non_blocking transfer before decode begins
             torch.cuda.current_stream(config.device).synchronize()
@@ -196,7 +196,7 @@ class VaeManager:
                 tile_t=temporal_size,
                 overlap_t=temporal_overlap,
             )
-            print(f"[RayWorker {config.local_rank}] decode_tiled complete. Shape: {images.shape}")
+            print(f"[RayActor {config.local_rank}] decode_tiled complete. Shape: {images.shape}")
             
             # Post-processing: discard warmup
             # 4. Post-Process (Shape Fix + Warmup Discard)
@@ -217,10 +217,10 @@ class VaeManager:
             # so we keep the VAE on GPU to avoid the costly re-stream.
             # The master calls release_vae (or explicit offload) after all chunks complete.
             if not skip_offload:
-                from raylight.distributed_worker.model_context import VAEContext
+                from raylight.distributed_actor.model_context import VAEContext
                 vae_ctx = VAEContext(use_mmap=config.raylight_config.device.use_mmap)
                 vae_ctx.offload(self.vae_model, lora_manager, {}, config)
-                print(f"[RayWorker {config.local_rank}] VAE Offload in finally block complete.")
+                print(f"[RayActor {config.local_rank}] VAE Offload in finally block complete.")
                 force_malloc_trim()
 
     def _select_dtype(self, preference, local_rank):
@@ -231,32 +231,32 @@ class VaeManager:
 
         if preference == "auto":
             if torch.cuda.is_bf16_supported():
-                print(f"[RayWorker {local_rank}] Using bfloat16 VAE (auto: bf16 supported)")
+                print(f"[RayActor {local_rank}] Using bfloat16 VAE (auto: bf16 supported)")
                 dtype = torch.bfloat16
             else:
-                print(f"[RayWorker {local_rank}] Using float32 VAE (auto: bf16 not supported)")
+                print(f"[RayActor {local_rank}] Using float32 VAE (auto: bf16 not supported)")
                 dtype = torch.float32
         elif preference == "bf16":
-            print(f"[RayWorker {local_rank}] Using bfloat16 VAE (user selected)")
+            print(f"[RayActor {local_rank}] Using bfloat16 VAE (user selected)")
             dtype = torch.bfloat16
         elif preference == "fp16":
-            print(f"[RayWorker {local_rank}] Using float16 VAE (user selected - may cause NaN on some models)")
+            print(f"[RayActor {local_rank}] Using float16 VAE (user selected - may cause NaN on some models)")
             dtype = torch.float16
         else:  # fp32
-            print(f"[RayWorker {local_rank}] Using float32 VAE (user selected - stable but 2x memory)")
+            print(f"[RayActor {local_rank}] Using float32 VAE (user selected - stable but 2x memory)")
             dtype = torch.float32
 
         self._cached_dtype = (preference, dtype)
         return dtype
 
-    def _post_process_images(self, images, discard_latent_frames, local_rank, config: WorkerConfig, shard_index=None):
+    def _post_process_images(self, images, discard_latent_frames, local_rank, config: ActorConfig, shard_index=None):
         """Normalizes image shape and handles warmup frame discarding."""
         # Debug stats (disabled by default — each .item() forces a GPU→CPU sync stall)
         if config.raylight_config.debug.debug_vae:
             raw_min, raw_max, raw_mean = images.min().item(), images.max().item(), images.mean().item()
-            print(f"[RayWorker {local_rank}] RAW decode stats: min={raw_min:.4f}, max={raw_max:.4f}, mean={raw_mean:.4f}")
+            print(f"[RayActor {local_rank}] RAW decode stats: min={raw_min:.4f}, max={raw_max:.4f}, mean={raw_mean:.4f}")
             if torch.isnan(images).any():
-                print(f"[RayWorker {local_rank}] CRITICAL: VAE output STILL contains NaNs even in float32!")
+                print(f"[RayActor {local_rank}] CRITICAL: VAE output STILL contains NaNs even in float32!")
         
         # Shape normalization: ensure [Batch, Time, Height, Width, Channels]
         # input is typically [B, H, W, C] or [B, T, H, W, C] (after movedim)
@@ -271,26 +271,26 @@ class VaeManager:
             discard_video_frames = discard_latent_frames * temporal_compression
             
             if images.shape[1] > discard_video_frames:
-                print(f"[RayWorker {local_rank}] Discarding {discard_video_frames} redundant warmup frames per batch element")
+                print(f"[RayActor {local_rank}] Discarding {discard_video_frames} redundant warmup frames per batch element")
                 images = images[:, discard_video_frames:]
             else:
                 # This can happen if we are at the very beginning of a 2D batch shard and context was requested?
                 # Or for LTX if shard_frames was 1 and discard was 1.
-                print(f"[RayWorker {local_rank}] WARNING: discard_video_frames ({discard_video_frames}) >= T ({images.shape[1]}).")
+                print(f"[RayActor {local_rank}] WARNING: discard_video_frames ({discard_video_frames}) >= T ({images.shape[1]}).")
             
         return images
 
-    def _handle_output(self, images, shard_index, mmap_path, mmap_shape, output_offset, local_rank, config: WorkerConfig):
+    def _handle_output(self, images, shard_index, mmap_path, mmap_shape, output_offset, local_rank, config: ActorConfig):
         """Handles output transport: direct mmap write or CPU serialization."""
         
         # Debug stats (disabled by default — each .item() forces a GPU→CPU sync stall)
         if config.raylight_config.debug.debug_vae:
             stats_min, stats_max, stats_mean = images.min().item(), images.max().item(), images.mean().item()
-            print(f"[RayWorker {local_rank}] Shard {shard_index} statistics: min={stats_min:.4f}, max={stats_max:.4f}, mean={stats_mean:.4f}")
+            print(f"[RayActor {local_rank}] Shard {shard_index} statistics: min={stats_min:.4f}, max={stats_max:.4f}, mean={stats_mean:.4f}")
         
         if mmap_path and mmap_shape:
             # Fast Path: Direct write to shared memory
-            print(f"[RayWorker {local_rank}] Writing directly to shared mmap: {mmap_path} (offset={output_offset}, shape={images.shape})...")
+            print(f"[RayActor {local_rank}] Writing directly to shared mmap: {mmap_path} (offset={output_offset}, shape={images.shape})...")
             
             # Reuse mmap buffer across work-stealing chunks (avoids re-mapping syscall per chunk)
             mmap_shape_t = tuple(mmap_shape) if not isinstance(mmap_shape, tuple) else mmap_shape
@@ -341,7 +341,7 @@ class VaeManager:
         else:
             # Fast Path 2: Ray Object Store Transfer
             # Fallback path if mmap not available
-            print(f"[RayWorker {local_rank}] Moving to CPU and converting to float16 for transport...")
+            print(f"[RayActor {local_rank}] Moving to CPU and converting to float16 for transport...")
             
             # Optimization: Cast on GPU first to reduce PCIe bandwidth (FP32 -> FP16 = 50% data)
             images_cpu = images.to(torch.float16).cpu()
@@ -350,5 +350,5 @@ class VaeManager:
         # Clean up original GPU tensor
         del images
         
-        print(f"[RayWorker {local_rank}] Shard {shard_index} output handling complete.")
+        print(f"[RayActor {local_rank}] Shard {shard_index} output handling complete.")
         return (shard_index, result_payload)

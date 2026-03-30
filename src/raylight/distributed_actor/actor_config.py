@@ -4,9 +4,9 @@ import torch
 from raylight.config import RaylightConfig
 
 @dataclass
-class WorkerConfig:
+class ActorConfig:
     """
-    Immutable configuration for the RayWorker.
+    Immutable configuration for the RayActor.
     Pass this to Managers instead of the full worker instance to reduce coupling.
     """
     local_rank: int

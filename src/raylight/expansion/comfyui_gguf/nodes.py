@@ -15,7 +15,7 @@ import folder_paths
 from .ops import move_patch_to_device
 from .dequant import is_quantized
 
-from raylight.distributed_worker.ray_worker import ensure_fresh_actors
+from raylight.distributed_actor.actor_pool import ActorPool
 from raylight.comfy_dist.lora import calculate_weight as ray_calculate_weight
 
 
@@ -304,7 +304,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         device_to = args[0] if args else kwargs.get("device_to")
         if vram_limit > 0 and device_to is not None:
             try:
-                from raylight.distributed_worker.model_context import _compute_vram_budget
+                from raylight.distributed_actor.model_context import _compute_vram_budget
                 model_bytes = self.model_size()
                 budget = _compute_vram_budget(
                     device_to, model_bytes, vram_limit_bytes=vram_limit,
@@ -370,7 +370,7 @@ class RayGGUFLoader:
                     ["default", "target", "float32", "float16", "bfloat16"],
                     {"default": "default"},
                 ),
-                "ray_actors_init": (
+                "actors_init": (
                     "RAY_ACTORS_INIT",
                     {"tooltip": "Ray Actor to submit the model into"},
                 ),
@@ -387,14 +387,14 @@ class RayGGUFLoader:
         }
 
     RETURN_TYPES = ("RAY_ACTORS",)
-    RETURN_NAMES = ("ray_actors",)
+    RETURN_NAMES = ("actors",)
     FUNCTION = "load_ray_unet"
 
     CATEGORY = "Raylight"
 
     def load_ray_unet(
         self,
-        ray_actors_init,
+        actors_init,
         unet_name,
         dequant_dtype,
         patch_dtype,
@@ -402,7 +402,7 @@ class RayGGUFLoader:
         torch_compile="disabled",
         torch_compile_dynamic="auto",
     ):
-        ray_actors, gpu_actors, config = ensure_fresh_actors(ray_actors_init)
+        actors, actors, config = ActorPool.ensure_fresh(actors_init)
         
         model_options = {
             "dequant_dtype": dequant_dtype,
@@ -416,18 +416,18 @@ class RayGGUFLoader:
         patched_futures = []
 
         if config.strategy.fsdp_enabled:
-            worker0 = ray.get_actor("RayWorker:0")
+            worker0 = ray.get_actor("RayActor:0")
             ray.get(worker0.load_unet.remote(unet_path, model_options=model_options))
             meta_model = ray.get(worker0.get_meta_model.remote())
 
-            for actor in gpu_actors:
+            for actor in actors:
                 if actor != worker0:
                     loaded_futures.append(actor.set_meta_model.remote(meta_model))
 
             ray.get(loaded_futures)
             loaded_futures = []
 
-            for actor in gpu_actors:
+            for actor in actors:
                 loaded_futures.append(actor.set_state_dict.remote())
 
             ray.get(loaded_futures)
@@ -439,9 +439,9 @@ class RayGGUFLoader:
             use_mmap = config.device.use_mmap
             
             if use_mmap:
-                # PARALLEL: All workers load simultaneously via mmap
+                # PARALLEL: All actors load simultaneously via mmap
                 load_futures = []
-                for actor in gpu_actors:
+                for actor in actors:
                     load_futures.append(
                         actor.load_unet.remote(
                             unet_path,
@@ -452,8 +452,8 @@ class RayGGUFLoader:
             else:
                 # SEQUENTIAL: Leader-follower to avoid RAM spikes
                 
-                # 1. Leader (Worker 0) Load
-                worker0 = ray.get_actor("RayWorker:0")
+                # 1. Leader (Actor 0) Load
+                worker0 = ray.get_actor("RayActor:0")
                 ray.get(
                     worker0.load_unet.remote(
                         unet_path,
@@ -474,7 +474,7 @@ class RayGGUFLoader:
                 }
 
                 # 3. Follower Hydration
-                for actor in gpu_actors:
+                for actor in actors:
                     if actor != worker0:
                         loaded_futures.append(
                             actor.init_gguf_from_ref.remote(
@@ -486,7 +486,7 @@ class RayGGUFLoader:
                 ray.get(loaded_futures)
                 loaded_futures = []
 
-        for actor in gpu_actors:
+        for actor in actors:
             if config.meta.total_sp_degree > 1:
                 patched_futures.append(actor.patch_usp.remote())
 
@@ -516,14 +516,14 @@ class RayGGUFLoader:
                     keys = _gguf_discover_compile_keys(diffusion_model)
                     set_torch_compile_wrapper(model=m, backend="inductor", mode=mode, dynamic=dynamic, keys=keys)
                     return m
-                compile_futures = [actor.model_function_runner.remote(_apply_compile, compile_mode, compile_dynamic) for actor in gpu_actors]
+                compile_futures = [actor.model_function_runner.remote(_apply_compile, compile_mode, compile_dynamic) for actor in actors]
                 ray.get(compile_futures)
                 parts = ["transformer blocks"]
                 if compile_mode: parts.append(f"mode={compile_mode}")
                 if torch_compile_dynamic != "auto": parts.append(f"dynamic={torch_compile_dynamic}")
-                print(f"[Raylight] torch.compile (inductor, {', '.join(parts)}) applied to all GGUF workers")
+                print(f"[Raylight] torch.compile (inductor, {', '.join(parts)}) applied to all GGUF actors")
 
-        return (ray_actors,)
+        return ({"actors": actors},)
 
 
 NODE_CLASS_MAPPINGS = {

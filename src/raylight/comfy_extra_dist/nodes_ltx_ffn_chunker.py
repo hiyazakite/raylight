@@ -26,7 +26,7 @@ def patch_ffn_forward(module, num_chunks, verbose=True):
         batch, seq_len, dim = x.shape
         # Debug print once per inference start for large sequences (video)
         if seq_len > 1000 and not hasattr(self, "_ffn_logged"):
-            print(f"[RayWorker] Video FFN Chunking Active: seq_len={seq_len}, chunks={num_chunks}")
+            print(f"[RayActor] Video FFN Chunking Active: seq_len={seq_len}, chunks={num_chunks}")
             self._ffn_logged = True
 
         if seq_len < num_chunks:
@@ -106,7 +106,7 @@ class RayLTXFFNChunker:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "ffn_chunks": ("INT", {"default": 8, "min": 1, "max": 64}),
             }
         }
@@ -115,14 +115,14 @@ class RayLTXFFNChunker:
     FUNCTION = "apply_chunking"
     CATEGORY = "Raylight/extra"
 
-    def apply_chunking(self, ray_actors, ffn_chunks):
+    def apply_chunking(self, actors, ffn_chunks):
         import ray
-        gpu_actors = ray_actors["workers"]
+        actor_list = actors["actors"]
         
-        # Apply to all workers
-        ray.get([actor.apply_ffn_chunking.remote(ffn_chunks) for actor in gpu_actors])
+        # Apply to all actors
+        ray.get([actor.apply_ffn_chunking.remote(ffn_chunks) for actor in actor_list])
         
-        return (ray_actors,)
+        return (actors,)
 
 NODE_CLASS_MAPPINGS = {
     "RayLTXFFNChunker": RayLTXFFNChunker,

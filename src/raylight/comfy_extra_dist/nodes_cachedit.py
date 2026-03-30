@@ -17,7 +17,7 @@ Two ComfyUI nodes are exported:
                               (no Ray required).  Auto-detects inference steps
                               from sigmas via the OUTER_SAMPLE hook.
   RayDistributedCacheDiT    — RAY_ACTORS-in / RAY_ACTORS-out.  Pushes the
-                              lightweight cache config to every Ray worker.
+                              lightweight cache config to every Ray actor.
 """
 
 from __future__ import annotations
@@ -281,7 +281,7 @@ class CacheDiTConfig:
         self.first_step_done = False
 
     def to_worker_dict(self) -> dict:
-        """Serialisable dict for shipping over Ray to workers."""
+        """Serialisable dict for shipping over Ray to actors."""
         return {
             "model_type": self.model_type,
             "warmup_steps": self.warmup_steps,
@@ -922,10 +922,10 @@ class RayCacheDiTAccelerator:
 
 class RayDistributedCacheDiT:
     """
-    Push CacheDiT lightweight cache configuration to all Ray worker processes.
+    Push CacheDiT lightweight cache configuration to all Ray actor processes.
 
-    Each worker patches its local transformer.forward directly — no ComfyUI
-    model patcher hooks are needed on the worker side.
+    Each actor patches its local transformer.forward directly — no ComfyUI
+    model patcher hooks are needed on the actor side.
     """
 
     @classmethod
@@ -933,7 +933,7 @@ class RayDistributedCacheDiT:
         preset_names = ["Auto"] + list(MODEL_PRESETS.keys())
         return {
             "required": {
-                "ray_actors": ("RAY_ACTORS",),
+                "actors": ("RAY_ACTORS",),
                 "enable": ("BOOLEAN", {"default": True}),
                 "model_type": (preset_names, {"default": "Auto"}),
                 "warmup_steps": ("INT", {
@@ -955,16 +955,16 @@ class RayDistributedCacheDiT:
     FUNCTION = "apply"
     CATEGORY = "Raylight/extra"
 
-    def apply(self, ray_actors, enable, model_type, warmup_steps, skip_interval, noise_scale):
+    def apply(self, actors, enable, model_type, warmup_steps, skip_interval, noise_scale):
         import ray  # type: ignore[import]
 
-        gpu_actors = ray_actors["workers"]
+        actor_list = actors["actors"]
 
         if not enable:
-            ray.get([actor.apply_cachedit.remote({"enabled": False}) for actor in gpu_actors])
-            return (ray_actors,)
+            ray.get([actor.apply_cachedit.remote({"enabled": False}) for actor in actor_list])
+            return (actors,)
 
-        # We don't have the transformer here to auto-detect, so workers will
+        # We don't have the transformer here to auto-detect, so actors will
         # do their own detection when model_type == "Auto".
         config_dict = {
             "enabled": True,
@@ -974,8 +974,8 @@ class RayDistributedCacheDiT:
             "noise_scale": noise_scale,
         }
 
-        ray.get([actor.apply_cachedit.remote(config_dict) for actor in gpu_actors])
-        return (ray_actors,)
+        ray.get([actor.apply_cachedit.remote(config_dict) for actor in actor_list])
+        return (actors,)
 
 
 # =============================================================================

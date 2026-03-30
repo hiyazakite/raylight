@@ -9,7 +9,7 @@ import torch
 from ._base import ModelContext, ModelState, _compute_vram_budget
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, WorkerConfigLike
+    from raylight.types import LoraManagerLike, ActorConfigLike
 
 
 def _weak_cleanup_gguf_pinned(
@@ -45,7 +45,7 @@ class GGUFContext(ModelContext):
 
     # ─── Pinned mmap_cache swap ──────────────────────────────
 
-    def load(self, state: ModelState, config: "WorkerConfigLike", state_cache: Any) -> Any:
+    def load(self, state: ModelState, config: "ActorConfigLike", state_cache: Any) -> Any:
         """Override base load to pin mmap_cache for DMA-speed reloads.
 
         After the base class sets ``model.mmap_cache = sd`` (mmap-backed),
@@ -114,7 +114,7 @@ class GGUFContext(ModelContext):
     @staticmethod
     def _pin_mmap_cache(
         mmap_cache: Dict[str, torch.Tensor],
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
         model_path: str,
     ) -> Tuple[Optional[Dict[str, torch.Tensor]], Any]:
         """Replace mmap-backed tensors with pinned-RAM copies.
@@ -182,7 +182,7 @@ class GGUFContext(ModelContext):
     @staticmethod
     def _pin_mmap_shared(
         mmap_cache: Dict[str, torch.Tensor],
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
         model_path: str,
     ) -> Tuple[Dict[str, torch.Tensor], Any]:
         """Multi-GPU shared: one shared buffer + ``cudaHostRegister``."""
@@ -304,20 +304,20 @@ class GGUFContext(ModelContext):
 
     # ─── Disk loading ────────────────────────────────────────
 
-    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_mmap(self, state: ModelState, config: "ActorConfigLike") -> Any:
         from raylight.expansion.comfyui_gguf.loader import gguf_sd_loader
         sd, extra = gguf_sd_loader(state.unet_path)
         metadata = extra.get("metadata", {})
         return sd, metadata
 
-    def prepare_state_dict(self, sd: Dict[str, torch.Tensor], config: "WorkerConfigLike") -> Dict[str, torch.Tensor]:
+    def prepare_state_dict(self, sd: Dict[str, torch.Tensor], config: "ActorConfigLike") -> Dict[str, torch.Tensor]:
         """GGUF: pass-through (ComfyUI handles prefix stripping)."""
         return sd
 
-    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_standard(self, state: ModelState, config: "ActorConfigLike") -> Any:
         return self.load_state_dict_mmap(state, config)
 
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfigLike",
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "ActorConfigLike",
                           metadata: Any = None, **kwargs) -> Any:
         from raylight.expansion.comfyui_gguf.ops import GGMLOps
         from raylight.expansion.comfyui_gguf.nodes import GGUFModelPatcher
@@ -399,7 +399,7 @@ class GGUFContext(ModelContext):
         model: Any,
         lora_manager: Optional["LoraManagerLike"],
         worker_mmap_cache: Any,
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
     ) -> bool:
         """GGUF Soft-Offload via pointer swap.
 

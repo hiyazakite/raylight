@@ -8,19 +8,19 @@ import torch
 from ._base import ModelContext, ModelState
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, WorkerConfigLike
+    from raylight.types import LoraManagerLike, ActorConfigLike
 
 
 class BNBContext(ModelContext):
     """Context for BitsAndBytes (4-bit) model loading."""
 
-    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_standard(self, state: ModelState, config: "ActorConfigLike") -> Any:
         return {"__bnb_internal__": True}
 
-    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_mmap(self, state: ModelState, config: "ActorConfigLike") -> Any:
         return self.load_state_dict_standard(state, config)
 
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfigLike",
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "ActorConfigLike",
                           metadata: Any = None, **kwargs) -> Any:
         unet_path = state.unet_path
 

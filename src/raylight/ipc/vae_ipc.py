@@ -28,7 +28,7 @@ def begin_vae_decode_job(
     """Allocate a shared RAM-backed float32 output buffer for one VAE decode job.
 
     The returned metadata carries ``metadata.path`` which callers pass as
-    ``mmap_path`` to worker actors and to ``torch.from_file``.
+    ``mmap_path`` to actor actors and to ``torch.from_file``.
     """
     num_elements = 1
     for d in master_shape:

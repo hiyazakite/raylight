@@ -11,7 +11,7 @@ from ._base import ModelContext, ModelState, _ops_for_model_options
 from raylight.distributed_modules.fsdp_utils import prefetch_state_dict
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, WorkerConfigLike
+    from raylight.types import LoraManagerLike, ActorConfigLike
 
 
 class FSDPContext(ModelContext):
@@ -19,17 +19,17 @@ class FSDPContext(ModelContext):
 
     # ─── Disk loading ────────────────────────────────────────
 
-    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_mmap(self, state: ModelState, config: "ActorConfigLike") -> Any:
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path, return_metadata=True)
 
-    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_standard(self, state: ModelState, config: "ActorConfigLike") -> Any:
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path, return_metadata=True)
 
     # ─── Load (with prefetch optimisation) ───────────────────
 
-    def load(self, state: ModelState, config: "WorkerConfigLike", state_cache: Any) -> Any:
+    def load(self, state: ModelState, config: "ActorConfigLike", state_cache: Any) -> Any:
         """Override load to implement prefetch optimization for Safetensors."""
         is_safetensors = state.unet_path.lower().endswith(".safetensors")
 
@@ -91,7 +91,7 @@ class FSDPContext(ModelContext):
 
     # ─── Instantiation ───────────────────────────────────────
 
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfigLike",
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "ActorConfigLike",
                           metadata: Any = None, load_weights: bool = True, **kwargs) -> Any:
         from raylight.comfy_dist.sd import fsdp_load_diffusion_model_stat_dict
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import wrap_state_dict_lazy
@@ -140,7 +140,7 @@ class FSDPContext(ModelContext):
         model: Any,
         lora_manager: Optional["LoraManagerLike"],
         worker_mmap_cache: Any,
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
     ) -> bool:
         """FSDP soft offload: shards → pinned CPU RAM, or hard offload if no cache."""
         shard_cache = getattr(model, "fsdp_shard_cache", None) if model is not None else None

@@ -10,7 +10,7 @@ from ._base import ModelContext, ModelState, _compute_vram_budget, _ops_for_mode
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, WorkerConfigLike
+    from raylight.types import LoraManagerLike, ActorConfigLike
 
 
 class LazyTensorContext(ModelContext):
@@ -28,7 +28,7 @@ class LazyTensorContext(ModelContext):
 
     # ─── Disk loading ────────────────────────────────────────
 
-    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_mmap(self, state: ModelState, config: "ActorConfigLike") -> Any:
         import safetensors.torch
         import safetensors
         sd = safetensors.torch.load_file(state.unet_path, device="cpu")
@@ -39,14 +39,14 @@ class LazyTensorContext(ModelContext):
             metadata = {}
         return sd, metadata
 
-    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_standard(self, state: ModelState, config: "ActorConfigLike") -> Any:
         import comfy.utils
         return comfy.utils.load_torch_file(state.unet_path, return_metadata=True)
 
     # ─── Pinned cache factory ────────────────────────────────
 
     @staticmethod
-    def _make_pinned_cache(config: "WorkerConfigLike", model_path: str):
+    def _make_pinned_cache(config: "ActorConfigLike", model_path: str):
         """Select shared or private pinned cache based on worker topology."""
         is_shared = config.global_world_size > 1 and not config.is_fsdp
         if is_shared:
@@ -73,7 +73,7 @@ class LazyTensorContext(ModelContext):
 
     # ─── Instantiation ───────────────────────────────────────
 
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfigLike",
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "ActorConfigLike",
                           metadata: Any = None, **kwargs) -> Any:
         """Instantiate model with lazy state dict (zero-copy until load)."""
         import comfy.sd
@@ -104,7 +104,7 @@ class LazyTensorContext(ModelContext):
         return model
 
     def instantiate_model_with_fallback(self, sd: Dict, state: ModelState,
-                                        config: "WorkerConfigLike") -> Any:
+                                        config: "ActorConfigLike") -> Any:
         """Try streaming approach with fallback to full clone."""
         import comfy.sd
 
@@ -208,7 +208,7 @@ class LazyTensorContext(ModelContext):
         model: Any,
         lora_manager: Optional["LoraManagerLike"],
         worker_mmap_cache: Any,
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
     ) -> bool:
         """Fast pinned-RAM offload: cache CUDA params, free VRAM via storage resize."""
         from raylight.expansion.comfyui_lazytensors.lazy_tensor import swap_model_to_mmap

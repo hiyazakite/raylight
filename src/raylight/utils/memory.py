@@ -29,11 +29,11 @@ class MemoryPolicy:
     """Centralised memory cleanup / query controller.
 
     **Coupling contract** — this class depends *only* on PyTorch, the OS,
-    and stdlib.  It knows nothing about model formats, contexts, workers, or
+    and stdlib.  It knows nothing about model formats, contexts, actors, or
     Ray.  Callers declare **intent** (``after_offload``, ``after_reload``,
     ``before_inference``); the policy decides *what* to do and *when*.
 
-    Designed to be instantiated once per ``RayWorker`` (or per-process)
+    Designed to be instantiated once per ``RayActor`` (or per-process)
     and passed as a plain parameter wherever cleanup is needed.  Every
     public method is safe to call with ``policy=None`` via the module-level
     ``get_policy()`` / ``NullPolicy`` fallback — no sentinel checks needed

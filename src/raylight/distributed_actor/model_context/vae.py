@@ -9,21 +9,21 @@ from .lazy_tensor import LazyTensorContext
 from ._base import ModelState
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, WorkerConfigLike
+    from raylight.types import LoraManagerLike, ActorConfigLike
 
 
 class VAEContext(LazyTensorContext):
     """Context for VAE model loading with streaming mmap support."""
 
     def prepare_state_dict(
-        self, sd: Dict[str, torch.Tensor], config: "WorkerConfigLike"
+        self, sd: Dict[str, torch.Tensor], config: "ActorConfigLike"
     ) -> Dict[str, torch.Tensor]:
         """VAE: No prefix stripping needed."""
         return sd
 
     # ─── Instantiation ───────────────────────────────────────
 
-    def instantiate_model(self, sd: Dict, state: ModelState, config: "WorkerConfigLike",
+    def instantiate_model(self, sd: Dict, state: ModelState, config: "ActorConfigLike",
                           metadata: Any = None, **kwargs) -> Any:
         """Instantiate VAE model using comfy.sd.VAE."""
         import comfy.sd
@@ -105,7 +105,7 @@ class VAEContext(LazyTensorContext):
         model: Any,
         lora_manager: Optional["LoraManagerLike"],
         worker_mmap_cache: Any,
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
     ) -> bool:
         """Zero-copy soft-offload for VAE."""
         if model is None:

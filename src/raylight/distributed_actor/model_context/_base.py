@@ -15,7 +15,7 @@ import torch
 from raylight.utils.memory import MemoryPolicy, NULL_POLICY
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, ModelPatcherLike, StateCacheLike, WorkerConfigLike
+    from raylight.types import LoraManagerLike, ModelPatcherLike, StateCacheLike, ActorConfigLike
 
 
 # ---------------------------------------------------------------------------
@@ -148,18 +148,18 @@ class ModelContext(ABC):
     # ─── Abstract Methods (format-specific) ──────────────────
 
     @abstractmethod
-    def load_state_dict_mmap(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_mmap(self, state: ModelState, config: "ActorConfigLike") -> Any:
         """Load state dict with mmap (zero-copy where possible)."""
         ...
 
     @abstractmethod
-    def load_state_dict_standard(self, state: ModelState, config: "WorkerConfigLike") -> Any:
+    def load_state_dict_standard(self, state: ModelState, config: "ActorConfigLike") -> Any:
         """Load state dict without mmap (fallback)."""
         ...
 
     @abstractmethod
     def instantiate_model(self, sd: Dict[str, torch.Tensor], state: ModelState,
-                          config: "WorkerConfigLike", metadata: Any = None, **kwargs) -> Any:
+                          config: "ActorConfigLike", metadata: Any = None, **kwargs) -> Any:
         """Create ModelPatcher from state dict."""
         ...
 
@@ -176,7 +176,7 @@ class ModelContext(ABC):
         model: Any,
         lora_manager: Optional["LoraManagerLike"],
         worker_mmap_cache: Any,
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
         memory: MemoryPolicy = NULL_POLICY,
     ) -> bool:
         """Offload model from VRAM (Template Method).
@@ -208,7 +208,7 @@ class ModelContext(ABC):
         model: Any,
         lora_manager: Optional["LoraManagerLike"],
         worker_mmap_cache: Any,
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
     ) -> bool:
         """Format-specific offload hook (override in subclasses).
 
@@ -237,7 +237,7 @@ class ModelContext(ABC):
         self,
         model: Any,
         lora_manager: Optional["LoraManagerLike"],
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
         *,
         memory: MemoryPolicy = NULL_POLICY,
     ) -> None:
@@ -249,7 +249,7 @@ class ModelContext(ABC):
         """
         if lora_manager:
             lora_manager.clear_tracking()
-            print(f"[RayWorker {config.local_rank}] LoRA tracking cleared.")
+            print(f"[RayActor {config.local_rank}] LoRA tracking cleared.")
 
         if model is not None:
             diffusion_model = getattr(model, "model", None)
@@ -263,10 +263,10 @@ class ModelContext(ABC):
 
                 self._clear_cached_pe(diffusion_model)
 
-        memory.log_vram(f"RayWorker {config.local_rank} Post-Offload")
+        memory.log_vram(f"RayActor {config.local_rank} Post-Offload")
 
     def prepare_state_dict(
-        self, sd: Dict[str, torch.Tensor], config: "WorkerConfigLike"
+        self, sd: Dict[str, torch.Tensor], config: "ActorConfigLike"
     ) -> Dict[str, torch.Tensor]:
         """Optional pre-processing of state dict before instantiation."""
         return sd
@@ -345,7 +345,7 @@ class ModelContext(ABC):
 
     # ─── Shared Load Logic ───────────────────────────────────
 
-    def load(self, state: ModelState, config: "WorkerConfigLike", state_cache: Any) -> Any:
+    def load(self, state: ModelState, config: "ActorConfigLike", state_cache: Any) -> Any:
         """Unified model loading logic.
 
         1. Load state dict from disk (mmap or standard).
@@ -394,7 +394,7 @@ class ModelContext(ABC):
 
     def reload_if_needed(
         self, model: Any, target_device: torch.device,
-        config: "WorkerConfigLike",
+        config: "ActorConfigLike",
     ) -> Any:
         """Check device and trigger appropriate reload."""
         current = getattr(model, "current_device", None) if model else None

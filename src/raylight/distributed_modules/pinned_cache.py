@@ -9,7 +9,7 @@ Three cache variants share a common base that handles the
 
 ``SharedPinnedParamCache``
     Cross-process ``/dev/shm`` buffer + ``cudaHostRegister`` for
-    data-parallel workers that all hold identical weights.
+    data-parallel actors that all hold identical weights.
 
 ``FSDPShardPinnedCache``
     FSDP2 DTensor-aware cache that operates on per-rank local shards.
@@ -643,7 +643,7 @@ class PinnedParamCache(BasePinnedCache):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class SharedPinnedParamCache(BasePinnedCache):
-    """Cross-process shared pinned-RAM cache for data-parallel workers.
+    """Cross-process shared pinned-RAM cache for data-parallel actors.
 
     All ranks cooperate during build:
 
@@ -656,7 +656,7 @@ class SharedPinnedParamCache(BasePinnedCache):
     5. All ranks create views and swap ``param.data``.
 
     The result is identical to the old serial writer pattern but the
-    memcpy work is distributed across *N* workers.
+    memcpy work is distributed across *N* actors.
     """
 
     def __init__(
