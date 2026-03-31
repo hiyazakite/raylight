@@ -33,6 +33,11 @@ class MemoryPolicy:
     Ray.  Callers declare **intent** (``after_offload``, ``after_reload``,
     ``before_inference``); the policy decides *what* to do and *when*.
 
+    Optionally, a pinned-cache and module can be registered via
+    ``set_offload_target()`` to enable pressure-triggered partial offload
+    (aimdo-style watermark eviction).  This is a soft reference —
+    everything works without it.
+
     Designed to be instantiated once per ``RayActor`` (or per-process)
     and passed as a plain parameter wherever cleanup is needed.  Every
     public method is safe to call with ``policy=None`` via the module-level
@@ -44,10 +49,19 @@ class MemoryPolicy:
         self,
         device: Optional[torch.device] = None,
         debounce_sec: float = 0.5,
+        headroom_bytes: int = 256 * 1024**2,
     ):
         self._device = device
         self._debounce_sec = debounce_sec
+        self._headroom_bytes = headroom_bytes
         self._last_cleanup: float = 0.0
+        # Soft references for pressure-triggered partial offload (Phase 3/4).
+        # Registered via set_offload_target(); None until then.
+        self._pinned_cache = None
+        self._offload_module = None
+        # Guard: prevents watermark eviction while model weights are
+        # actively being read during a forward pass.
+        self._in_forward: bool = False
 
     # ─── Intent-based API ────────────────────────────────────
 
@@ -68,9 +82,20 @@ class MemoryPolicy:
         self._release_cuda_cache()
         self._malloc_trim()
 
-    def before_inference(self) -> None:
-        """Ensure GPU is quiesced before a forward pass."""
+    def before_inference(self, needed_bytes: int = 0) -> int:
+        """Ensure GPU is quiesced and has enough headroom before a forward pass.
+
+        If *needed_bytes* > 0, checks VRAM pressure and proactively frees
+        memory (PyTorch cache first, then watermark partial offload if a
+        pinned cache is registered).  Mirrors aimdo's stopgap
+        ``vbars_free(budget_deficit(0))`` at the top of every fault.
+
+        Returns bytes freed (0 if no pressure).
+        """
         self._sync()
+        if needed_bytes > 0:
+            return self.relieve_pressure(needed_bytes)
+        return 0
 
     def teardown(self) -> None:
         """Aggressive cleanup — final release, bypass debounce."""
@@ -91,6 +116,30 @@ class MemoryPolicy:
         except Exception:
             return 0.0
 
+    def vram_free_bytes(self) -> int:
+        """Actual free VRAM from CUDA driver (not PyTorch's cached view).
+
+        Uses ``torch.cuda.mem_get_info`` which queries ``cuMemGetInfo``
+        — the same source aimdo's ``cuda_budget_deficit()`` uses.
+        """
+        if not torch.cuda.is_available():
+            return 0
+        try:
+            free, _ = torch.cuda.mem_get_info(self._device)
+            return free
+        except Exception:
+            return 0
+
+    def vram_deficit(self, needed_bytes: int = 0) -> int:
+        """How many bytes we need freed to satisfy *needed_bytes* + headroom.
+
+        Returns 0 if we have enough room.  Mirrors aimdo's
+        ``budget_deficit()`` from ``plat.h``.
+        """
+        free = self.vram_free_bytes()
+        deficit = (needed_bytes + self._headroom_bytes) - free
+        return max(0, deficit)
+
     def snapshot(self) -> MemorySnapshot:
         """Point-in-time memory view for logging."""
         va, vr = get_vram_gb(self._device)
@@ -105,6 +154,56 @@ class MemoryPolicy:
     def log_vram(self, tag: str) -> None:
         """One-line VRAM log — replaces ad-hoc memory_allocated prints."""
         print(f"[{tag}] VRAM: {self.vram_allocated_gb():.2f} GB")
+
+    # ─── Pressure relief ─────────────────────────────────────
+
+    def set_offload_target(self, cache, module: torch.nn.Module) -> None:
+        """Register a pinned cache + module for pressure-triggered partial offload.
+
+        Soft reference — None-guarded everywhere.  ``MemoryPolicy`` remains
+        fully usable without this.
+        """
+        self._pinned_cache = cache
+        self._offload_module = module
+
+    def relieve_pressure(self, needed_bytes: int = 0) -> int:
+        """Try to free VRAM under pressure, ordered by cost.
+
+        1. ``empty_cache()`` — free PyTorch's cached (unused) blocks.
+        2. Watermark partial offload via pinned cache (if registered).
+
+        Returns actual bytes freed.  0 = no action needed.
+
+        **Safety**: if ``_in_forward`` is True (model is executing a forward
+        pass), step 2 is skipped — evicting weights that are being read
+        would crash or produce garbage.  Step 1 (empty_cache) is always safe
+        since it only frees *unused* cached blocks.
+        """
+        deficit = self.vram_deficit(needed_bytes)
+        if deficit <= 0:
+            return 0
+
+        # Step 1: Free PyTorch caching allocator's unused blocks
+        self._release_cuda_cache()
+        deficit = self.vram_deficit(needed_bytes)
+        if deficit <= 0:
+            return 0
+
+        # Step 2: Watermark partial offload (aimdo-style)
+        # BLOCKED during forward pass — can't evict weights being read.
+        if self._in_forward:
+            return 0
+
+        cache = self._pinned_cache
+        module = self._offload_module
+        if cache is not None and module is not None and getattr(cache, 'built', False):
+            try:
+                freed = cache.offload_by_pressure(module, deficit)
+                return freed
+            except Exception as e:
+                print(f"[MemoryPolicy] Pressure offload failed: {e}")
+
+        return 0
 
     # ─── Private ─────────────────────────────────────────────
 
@@ -149,9 +248,13 @@ class _NullPolicy(MemoryPolicy):
     def after_offload(self) -> None: ...
     def after_reload(self) -> None: ...
     def after_model_swap(self) -> None: ...
-    def before_inference(self) -> None: ...
+    def before_inference(self, needed_bytes: int = 0) -> int: return 0
     def teardown(self) -> None: ...
     def log_vram(self, tag: str) -> None: ...
+    def vram_free_bytes(self) -> int: return 2**63
+    def vram_deficit(self, needed_bytes: int = 0) -> int: return 0
+    def relieve_pressure(self, needed_bytes: int = 0) -> int: return 0
+    def set_offload_target(self, cache, module) -> None: ...
 
 
 #: Module-level null fallback — importers can use as default parameter.

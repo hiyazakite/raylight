@@ -152,6 +152,20 @@ class BasePinnedCache(ABC):
         # (UntypedStorage, original_nbytes) — collected during offload
         self._freed_storages: List[Tuple[torch.UntypedStorage, int]] = []
 
+        # ── Phase 2: Signature-based skip-upload ──
+        # Generation counter bumped on every offload.  If storages survive
+        # (nbytes still match) on reload, we skip the H2D copy entirely —
+        # equivalent to aimdo's vbar_signature_compare().
+        self._offload_generation: int = 0
+        self._force_next_reload: bool = False
+
+        # ── Phase 3: Watermark partial offload ──
+        # Load-order param names (populated on build).  offload_by_pressure()
+        # walks this in reverse to evict tail (deepest) layers first.
+        self._param_order: List[str] = []
+        self._watermark: int = 0  # 0 = nothing evicted, len = all evicted
+        self._partial_freed: Dict[str, Tuple[torch.UntypedStorage, int]] = {}
+
     # -------------------------------------------------------------- public
 
     @property
@@ -181,6 +195,8 @@ class BasePinnedCache(ABC):
             return
         self._do_build(module)
         self._built = True
+        # Record load-order for watermark partial offload (Phase 3).
+        self._param_order = [name for name, _ in module.named_parameters()]
         # Detect actual state: if ANY param is on CUDA, treat as on-CUDA.
         self._on_cuda = any(
             p.device.type == "cuda" for p in module.parameters()
@@ -212,8 +228,13 @@ class BasePinnedCache(ABC):
         self._pre_free_hook()
 
         # Free all unique CUDA storages
+        self._offload_generation += 1
         for s, _ in self._freed_storages:
             s.resize_(0)
+
+        # Clear any partial-offload state (full offload supersedes)
+        self._partial_freed.clear()
+        self._watermark = 0
 
         torch.cuda.empty_cache()
         self._on_cuda = False
@@ -260,8 +281,13 @@ class BasePinnedCache(ABC):
         self._pre_free_hook()
 
         # Free CUDA storages that were on GPU
+        self._offload_generation += 1
         for s, _ in self._freed_storages:
             s.resize_(0)
+
+        # Clear any partial-offload state (full offload supersedes)
+        self._partial_freed.clear()
+        self._watermark = 0
 
         torch.cuda.empty_cache()
         self._on_cuda = False
@@ -293,6 +319,11 @@ class BasePinnedCache(ABC):
             print(f"[{self._tag}] Not built — cannot reload to CPU.")
             return 0
 
+        # Drain any leftover partial-offload state (safety net: if
+        # reload_evicted() didn't run after offload_by_pressure()).
+        self._partial_freed.clear()
+        self._watermark = 0
+
         # Discard stale CUDA storage refs — model.load() will handle CUDA.
         self._freed_storages = []
 
@@ -315,6 +346,24 @@ class BasePinnedCache(ABC):
             print(f"[{self._tag}] Already on CUDA — skipping reload.")
             return 0
 
+        # ── Phase 2: Signature check — skip H2D if CUDA data survived ──
+        # If storages weren't actually freed (nbytes still match original),
+        # the GPU data is still valid.  Skip the entire resize+copy.
+        # Mirrors aimdo's vbar_signature_compare().
+        if (
+            not self._force_next_reload
+            and self._freed_storages
+            and all(s.nbytes() == expected for s, expected in self._freed_storages)
+        ):
+            self._freed_storages = []
+            self._on_cuda = True
+            print(
+                f"[{self._tag}] Signature match — CUDA data still valid, "
+                f"skipping H2D copy (gen={self._offload_generation})."
+            )
+            return 0
+        self._force_next_reload = False
+
         t_start = time.perf_counter()
 
         # NOTE: intentionally no empty_cache() here — the caching allocator
@@ -325,6 +374,16 @@ class BasePinnedCache(ABC):
         # Re-allocate all freed CUDA storages
         restored = 0
         alloc_bytes = 0
+
+        # Include any partially-freed storages from watermark offload
+        # (safety net: if reload_evicted() didn't run after
+        # offload_by_pressure(), e.g. exception during sampling).
+        if self._partial_freed:
+            for name, (s, nbytes) in self._partial_freed.items():
+                self._freed_storages.append((s, nbytes))
+            self._partial_freed.clear()
+            self._watermark = 0
+
         for s, nbytes in self._freed_storages:
             s.resize_(nbytes)
             alloc_bytes += nbytes
@@ -440,6 +499,123 @@ class BasePinnedCache(ABC):
 
     # ------------------------------------------------------------ cleanup
 
+    # ── Phase 2: Invalidation ─────────────────────────────────
+
+    def invalidate(self) -> None:
+        """Mark CUDA data as dirty — next reload always does a full H2D copy.
+
+        Call after in-place weight modification (e.g. LoRA baking) that
+        makes the pinned cache stale relative to CUDA.
+        """
+        self._force_next_reload = True
+
+    # ── Phase 3: Watermark partial offload ────────────────────
+
+    def _get_cpu_buf(self, name: str) -> Optional[torch.Tensor]:
+        """Return the pinned CPU tensor for *name*, or None.
+
+        Subclasses that use a dict named ``_cpu_params`` get this for free.
+        Override if the storage layout is different.
+        """
+        cpu_params = getattr(self, "_cpu_params", {})
+        return cpu_params.get(name)
+
+    def offload_by_pressure(
+        self,
+        module: torch.nn.Module,
+        target_bytes: int,
+        non_blocking: bool = True,
+    ) -> int:
+        """Free at least *target_bytes* of VRAM by offloading tail params.
+
+        Walks parameters in **reverse load-order** (deepest layers first).
+        Stops as soon as cumulative freed bytes >= target_bytes.  Mirrors
+        aimdo's watermark eviction that scans from the VBAR tail.
+
+        Does NOT set ``_on_cuda = False`` — the model is now **partially
+        resident** (some params on CUDA, some freed).
+
+        Returns actual bytes freed.
+        """
+        if not self._built or target_bytes <= 0:
+            return 0
+
+        freed = 0
+        param_dict = dict(module.named_parameters())
+
+        # Walk from tail (lowest priority → evict first)
+        for name in reversed(self._param_order):
+            if freed >= target_bytes:
+                break
+            param = param_dict.get(name)
+            if param is None or param.device.type != "cuda":
+                continue
+
+            # Snapshot to pinned cache before freeing
+            cpu_buf = self._get_cpu_buf(name)
+            if cpu_buf is not None:
+                cpu_buf.copy_(param.data, non_blocking=non_blocking)
+
+            # Free CUDA storage
+            s = param.data.untyped_storage()
+            nb = s.nbytes()
+            if nb > 0:
+                self._partial_freed[name] = (s, nb)
+                s.resize_(0)
+                freed += nb
+
+        if freed > 0:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._watermark = len(self._partial_freed)
+            print(
+                f"[{self._tag}] Watermark offload: freed {freed / 1e9:.2f} GB "
+                f"({self._watermark}/{len(self._param_order)} params evicted)"
+            )
+
+        return freed
+
+    def reload_evicted(
+        self,
+        module: torch.nn.Module,
+        non_blocking: bool = True,
+    ) -> int:
+        """Restore only the params freed by ``offload_by_pressure()``.
+
+        Equivalent to aimdo's re-fault after watermark reset via
+        ``vbar.prioritize()``.
+        """
+        if not self._partial_freed:
+            return 0
+
+        # Re-allocate CUDA storages
+        for name, (storage, nbytes) in self._partial_freed.items():
+            storage.resize_(nbytes)
+
+        # Copy pinned → CUDA
+        param_dict = dict(module.named_parameters())
+        restored = 0
+        for name in self._partial_freed:
+            cpu_buf = self._get_cpu_buf(name)
+            param = param_dict.get(name)
+            if cpu_buf is not None and param is not None:
+                param.data.copy_(cpu_buf, non_blocking=non_blocking)
+                restored += 1
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        freed_gb = sum(nb for _, nb in self._partial_freed.values()) / 1e9
+        self._partial_freed.clear()
+        self._watermark = 0
+        print(
+            f"[{self._tag}] Restored {restored} evicted params to CUDA "
+            f"({freed_gb:.2f} GB)."
+        )
+        return restored
+
+    # ------------------------------------------------------------ cleanup
+
     def cleanup(self) -> None:
         """Release all pinned RAM held by this cache.
 
@@ -447,6 +623,9 @@ class BasePinnedCache(ABC):
         and must call ``super().cleanup()``.
         """
         self._freed_storages = []
+        self._partial_freed.clear()
+        self._watermark = 0
+        self._param_order = []
         self._built = False
         self._on_cuda = False
 
@@ -1097,6 +1276,39 @@ class FSDPShardPinnedCache(BasePinnedCache):
         raise NotImplementedError(
             "FSDPShardPinnedCache does not support selective offload."
         )
+
+    # -- sync cuda → pinned (for bake caching) --
+
+    def sync_from_cuda(self, module: torch.nn.Module) -> int:
+        """Copy current CUDA shard data back to pinned CPU buffers.
+
+        Call after in-place weight modification (e.g. LoRA baking) to update
+        the pinned cache so that subsequent offload/reload and pressure
+        eviction preserves the baked state.
+
+        Returns:
+            Number of shards synced.
+        """
+        synced = 0
+        for name, param in module.named_parameters():
+            if not _is_fsdp_dtensor(param):
+                continue
+            local = _local_cuda(param)
+            if local is None:
+                continue
+            cpu_buf = self._cpu_shards.get(name)
+            if cpu_buf is None:
+                continue
+            cpu_buf.copy_(local, non_blocking=True)
+            synced += 1
+
+        if synced > 0 and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            # Clear the force-reload flag since pinned is now in sync
+            self._force_next_reload = False
+
+        print(f"[{self._tag}] Synced {synced} CUDA shards → pinned (baked state cached).")
+        return synced
 
     # -- info --
 

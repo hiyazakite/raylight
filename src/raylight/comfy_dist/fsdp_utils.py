@@ -63,3 +63,54 @@ def prepare_fsdp_model_for_sampling(work_model, config: "ActorConfig", state_dic
     work_model.patch_fsdp()
     
     return model_was_modified
+
+
+def bake_lora_hooks(work_model, local_rank: int = 0) -> int:
+    """Bake LowVramPatch hooks into FSDP weights in-place, then clear hooks.
+
+    After calling this, patched modules have no hooks and their weights
+    contain the LoRA-fused values.  Uses ``patch_weight_to_device()``
+    which is device_mesh-aware (correct for FSDP sharded params).
+
+    Args:
+        work_model: The FSDPModelPatcher instance.
+        local_rank: For logging.
+
+    Returns:
+        Number of weight keys baked.
+    """
+    patches = getattr(work_model, "patches", None)
+    if not patches:
+        return 0
+
+    patch_keys = list(patches.keys())
+    baked = 0
+
+    for key in patch_keys:
+        try:
+            work_model.patch_weight_to_device(key)
+            baked += 1
+        except Exception as e:
+            print(f"[RayActor {local_rank}] Failed to bake key {key}: {e}")
+
+    # Clear hooks on all modules now that weights are baked
+    diff_model = getattr(work_model, "model", None)
+    if diff_model is not None:
+        for m in diff_model.modules():
+            if hasattr(m, "weight_function") and m.weight_function:
+                m.weight_function = []
+            if hasattr(m, "bias_function") and m.bias_function:
+                m.bias_function = []
+
+    # Clear patches dict — prevents hooks from being re-installed on next load()
+    patches.clear()
+    if hasattr(work_model, "patches_uuid"):
+        work_model.patches_uuid = uuid.uuid4()
+
+    # Mark as baked
+    work_model.is_fsdp_baked = True
+
+    if baked > 0:
+        print(f"[RayActor {local_rank}] Baked {baked} LoRA patches into weights "
+              f"(hooks cleared, patches purged).")
+    return baked

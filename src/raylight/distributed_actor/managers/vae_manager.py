@@ -134,6 +134,7 @@ class VaeManager:
         latent_slice_start=None,
         latent_slice_end=None,
         skip_offload=False,
+        memory: MemoryPolicy = NULL_POLICY,
     ):
         if config is None:
              raise ValueError("ActorConfig must be passed to decode")
@@ -186,6 +187,15 @@ class VaeManager:
             # Sync the non_blocking transfer before decode begins
             torch.cuda.current_stream(config.device).synchronize()
     
+            # ── Reactive pressure check before decode activations allocate ──
+            # We can't predict decoder activation size (depends on tile/temporal
+            # config and model internals), so we just check if we're already
+            # tight and proactively free more UNET tail if needed.
+            freed = memory.relieve_pressure(needed_bytes=0)
+            if freed > 0:
+                print(f"[RayActor {config.local_rank}] Pre-decode pressure relief: "
+                      f"freed {freed/1e9:.2f} GB for VAE activations")
+
             # 3. Decode
             # ComfyUI's decode_tiled returns [B, T, H, W, C] for 3D or [B, H, W, C] for 2D
             images = self.vae_model.decode_tiled(

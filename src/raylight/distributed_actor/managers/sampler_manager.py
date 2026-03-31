@@ -6,7 +6,7 @@ import comfy.samplers
 import comfy.model_patcher
 from contextlib import contextmanager
 from typing import Optional, Tuple, Any, TYPE_CHECKING
-from raylight.utils.memory import monitor_memory
+from raylight.utils.memory import monitor_memory, MemoryPolicy, NULL_POLICY
 from raylight.utils.common import Noise_RandomNoise, patch_ray_tqdm
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
 import time
@@ -75,7 +75,8 @@ class SamplerManager:
         config: ActorConfig,
         latent: dict, 
         state_dict: Optional[dict] = None,
-        name: str = "sampler"
+        name: str = "sampler",
+        memory: MemoryPolicy = NULL_POLICY,
     ):
         """Context manager for sampling operations to ensure cleanup."""
         with monitor_memory(f"RayActor {config.local_rank} - {name}", device=config.device):
@@ -92,9 +93,30 @@ class SamplerManager:
             
             # We yield the setup results along with the work_latent dict 
             # so the caller can update it with samples
+            _needs_reload = False
             try:
+                # ── Phase 4: Pre-forward deficit check (aimdo stopgap) ──
+                # Estimate activation VRAM: latent × 4 (latent + noise + x + x0)
+                try:
+                    activation_estimate = latent_image.nbytes * 4
+                except (AttributeError, RuntimeError):
+                    # NestedTensor and some custom tensor types lack .nbytes
+                    try:
+                        activation_estimate = latent_image.nelement() * latent_image.element_size() * 4
+                    except Exception:
+                        activation_estimate = 0
+                freed = memory.before_inference(needed_bytes=activation_estimate)
+                if freed > 0:
+                    _needs_reload = True
+
+                # Guard: block C allocator callback from evicting weights
+                # during the active forward pass.  Only empty_cache (safe)
+                # can fire from the interceptor while this is set.
+                memory._in_forward = True
                 yield (work_model, latent_image, noise_mask, disable_pbar, work_latent, model_was_modified)
             finally:
+                # Unguard: forward pass is done, C callback can evict again.
+                memory._in_forward = False
                 # 2. Cleanup after sampling
                 import gc
                 gc.collect()
@@ -124,6 +146,16 @@ class SamplerManager:
                 except Exception:
                     pass
 
+                # ── Phase 4: Restore evicted params after inference ──
+                if _needs_reload:
+                    cache = getattr(memory, '_pinned_cache', None)
+                    diff_module = getattr(work_model, 'model', None)
+                    if cache is not None and diff_module is not None:
+                        try:
+                            cache.reload_evicted(diff_module)
+                        except Exception as e:
+                            print(f"[SamplerManager] Evicted param reload failed: {e}")
+
 
                 if config.is_fsdp:
                     pass
@@ -143,11 +175,12 @@ class SamplerManager:
         sampler,
         sigmas,
         latent_image,
-        state_dict: Optional[dict] = None
+        state_dict: Optional[dict] = None,
+        memory: MemoryPolicy = NULL_POLICY,
     ):
         # Returns: ((Out Latent, Denoised Out Latent), boolean flag if model was modified/baked)
         
-        with self.sampling_context(model, config, latent_image, state_dict, name="custom_sampler") as ctx:
+        with self.sampling_context(model, config, latent_image, state_dict, name="custom_sampler", memory=memory) as ctx:
              work_model, final_samples, noise_mask, disable_pbar, work_latent, model_modified = ctx
              
              # 2. Noise Generation
@@ -252,11 +285,12 @@ class SamplerManager:
         last_step=None,
         force_full_denoise=False,
         sigmas=None,
-        state_dict: Optional[dict] = None
+        state_dict: Optional[dict] = None,
+        memory: MemoryPolicy = NULL_POLICY,
     ):
         # Returns: ((Out Latent, Denoised Out Latent), boolean flag if model was modified/baked)
 
-        with self.sampling_context(model, config, latent, state_dict, name="common_ksampler") as ctx:
+        with self.sampling_context(model, config, latent, state_dict, name="common_ksampler", memory=memory) as ctx:
             work_model, final_samples, noise_mask, disable_pbar, work_latent, model_modified = ctx
 
             # 2. Noise Generation

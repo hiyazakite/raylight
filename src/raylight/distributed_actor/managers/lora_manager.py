@@ -16,6 +16,9 @@ class LoraManager:
         self._lora_configs: Dict[str, List[Tuple[str, float]]] = {} # config_hash -> [(lora_path, strength), ...]
         self._current_lora_config_hash: Optional[str] = None
         self._lora_seed: int = 318008
+        # Bake caching: when set, the pinned cache holds baked (base + LoRA)
+        # weights for this config — no hooks or re-baking needed on reruns.
+        self._baked_config_hash: Optional[str] = None
 
     def load_lora(
         self, 
@@ -86,6 +89,7 @@ class LoraManager:
         
         # Clear tracking
         self._applied_loras.clear()
+        self._baked_config_hash = None
         
         # FIX Bug #1: Clear the config hash so next LoRA application is seen as new
         self._current_lora_config_hash = None
@@ -129,6 +133,11 @@ class LoraManager:
         
         # Check if we already have the right config applied
         if self._current_lora_config_hash == config_hash and self._applied_loras:
+            # Extra check: if pinned cache is synced with baked state, we can
+            # skip entirely — weights already have LoRA fused in.
+            if self._baked_config_hash == config_hash:
+                print(f"[RayActor {config.local_rank}] Config {config_hash} baked and cached in pinned. Skipping re-apply.")
+                return True
             print(f"[RayActor {config.local_rank}] Config {config_hash} already applied. Skipping re-apply.")
             return True
         
@@ -230,7 +239,16 @@ class LoraManager:
             model.patches.clear()
             log(f"[RayActor] Cleared {patch_count} patches from patcher.")
 
+    def mark_baked(self, config_hash: str) -> None:
+        """Record that the pinned cache now holds baked state for this config."""
+        self._baked_config_hash = config_hash
+
+    def is_baked_for(self, config_hash: str) -> bool:
+        """Check if the pinned cache holds baked state for this config."""
+        return self._baked_config_hash == config_hash
+
     def clear_tracking(self):
         """Clears tracking state."""
         self._applied_loras.clear()
         self._current_lora_config_hash = None
+        self._baked_config_hash = None

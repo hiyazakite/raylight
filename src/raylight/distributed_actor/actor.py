@@ -542,6 +542,20 @@ class RayActor:
             "patch_dtype": patch_dtype,
         })
 
+        # ── Phase 4: Register pinned cache for pressure-triggered offload ──
+        cache = getattr(self.model, 'pinned_param_cache', None)
+        diff_model = getattr(self.model, 'model', None)
+        if cache is not None and diff_model is not None:
+            self.memory.set_offload_target(cache, diff_model)
+
+            # Install CUDA allocator interceptor — on-demand eviction when
+            # any cudaMalloc fails (handles unpredictable activation spikes).
+            try:
+                from raylight.lib.alloc_interceptor import install_interceptor
+                install_interceptor(self.memory, log_level=1)
+            except Exception as e:
+                print(f"[RayActor {self.local_rank}] Allocator interceptor not available: {e}")
+
     def load_unet(self, unet_path, model_options):
         """Unified entry point for all model types (FSDP, GGUF, Safetensors, BNB)."""
         with monitor_memory(f"RayActor {self.local_rank} - load_unet", device=self.device):
@@ -624,6 +638,62 @@ class RayActor:
             force_reload=True,
         )
         self.lora_manager.clear_tracking()
+
+    def _try_bake_and_sync(self) -> None:
+        """Post-sampling: bake FSDP LoRA hooks into weights + sync to shard cache.
+
+        Conditions to bake:
+          1. Model is FSDP
+          2. Model has active LoRA patches (hooks on modules)
+          3. LoRA config hasn't already been baked + cached
+
+        After baking:
+          - LowVramPatch hooks are cleared (zero per-forward overhead)
+          - Shard cache is updated with baked values (eviction+reload preserves baked state)
+          - lora_manager records this config as baked
+        """
+        if not self.config.is_fsdp or self.model is None:
+            return
+
+        config_hash = self.lora_manager._current_lora_config_hash
+        if config_hash is None:
+            return  # No LoRA active
+
+        if self.lora_manager.is_baked_for(config_hash):
+            return  # Already baked + synced for this config
+
+        patches = getattr(self.model, "patches", None)
+        if not patches:
+            # No patches = either no LoRA, or already baked.
+            # If model is marked baked but cache doesn't know, sync now.
+            if getattr(self.model, "is_fsdp_baked", False):
+                self._sync_shard_cache()
+                self.lora_manager.mark_baked(config_hash)
+            return
+
+        # ── Bake hooks ──
+        from raylight.comfy_dist.fsdp_utils import bake_lora_hooks
+        baked = bake_lora_hooks(self.model, local_rank=self.local_rank)
+        if baked == 0:
+            return
+
+        # ── Sync baked CUDA → pinned shard cache ──
+        self._sync_shard_cache()
+
+        # ── Mark as baked ──
+        self.lora_manager.mark_baked(config_hash)
+        print(f"[RayActor {self.local_rank}] LoRA config {config_hash} baked + cached in shard cache.")
+
+    def _sync_shard_cache(self) -> None:
+        """Sync current CUDA shard data → pinned CPU cache."""
+        shard_cache = getattr(self.model, "fsdp_shard_cache", None)
+        diff_model = getattr(self.model, "model", None)
+        if shard_cache is not None and diff_model is not None and shard_cache.built:
+            try:
+                dm = getattr(diff_model, "diffusion_model", diff_model)
+                shard_cache.sync_from_cuda(dm)
+            except Exception as e:
+                print(f"[RayActor {self.local_rank}] Shard cache sync failed: {e}")
 
     def reapply_loras_for_config(self, config_hash):
         # SAFETY: If model is baked (FSDP destructively modified weights), we cannot unbake.
@@ -763,6 +833,20 @@ class RayActor:
         ray.actor.exit_actor()
 
     def ray_vae_loader(self, vae_path):
+        # ── Pressure-aware VAE load: partially evict UNET tail instead of full offload ──
+        # Estimate VAE weight size from file (avoid loading just to measure).
+        import os
+        vae_file_bytes = 0
+        try:
+            vae_file_bytes = os.path.getsize(vae_path)
+        except Exception:
+            pass
+        if vae_file_bytes > 0:
+            freed = self.memory.relieve_pressure(needed_bytes=vae_file_bytes)
+            if freed > 0:
+                print(f"[RayActor {self.local_rank}] Pressure relief: freed {freed/1e9:.2f} GB "
+                      f"of UNET for VAE ({vae_file_bytes/1e9:.2f} GB)")
+
         self.vae_manager.load_vae(vae_path, self.config, self.state_cache, memory=self.memory)
         self.vae_model = self.vae_manager.vae_model
         # Return compression factors to avoid extra round-trips
@@ -774,6 +858,13 @@ class RayActor:
     def ray_vae_offload(self):
         """Offload VAE from VRAM after all work-stealing chunks complete."""
         self.vae_manager.offload_vae_from_device(self.config, self.lora_manager, memory=self.memory)
+
+        # ── Restore any UNET params evicted by pressure relief during VAE load ──
+        cache = getattr(self.model, 'pinned_param_cache', None) if self.model else None
+        diff_model = getattr(self.model, 'model', None) if self.model else None
+        if cache is not None and diff_model is not None and cache._partial_freed:
+            cache.reload_evicted(diff_model)
+            print(f"[RayActor {self.local_rank}] UNET tail restored after VAE offload.")
 
     def ray_vae_release(self):
         result = self.vae_manager.release_vae(self.local_rank, memory=self.memory)
@@ -826,6 +917,7 @@ class RayActor:
             latent_slice_start=latent_slice_start,
             latent_slice_end=latent_slice_end,
             skip_offload=skip_offload,
+            memory=self.memory,
         )
 
     def get_raylight_config(self) -> RaylightConfig:
@@ -852,14 +944,22 @@ class RayActor:
             self.model,
             self.config,
             add_noise, noise_seed, cfg, positive, negative, sampler, sigmas, latent_image,
-            state_dict=getattr(self, "state_dict", None)
+            state_dict=getattr(self, "state_dict", None),
+            memory=self.memory,
         )
 
         if model_modified:
             print(f"[RayActor {self.local_rank}] Model modified by SamplerManager (e.g. baked weights).")
-            # OPTIMIZATION: Do not clear reload_params blindly. 
-            # We now handle "Dirty Baked State" safety via is_fsdp_baked flag in reapply_loras_for_config.
-            # self.reload_params = None 
+            # Invalidate pinned cache signature — baked CUDA data diverged from pinned buffers.
+            cache = getattr(self.model, 'pinned_param_cache', None)
+            if cache is not None:
+                cache.invalidate()
+
+        # ── FSDP LoRA bake caching ──────────────────────────────────
+        # After the first run with LoRA hooks, bake them into weights and
+        # sync to the FSDP shard cache.  Subsequent reruns with the same
+        # LoRA config pay zero per-forward overhead.
+        self._try_bake_and_sync()
         return result
 
 
@@ -888,13 +988,17 @@ class RayActor:
             seed, steps, cfg, sampler_name, scheduler, positive, negative,
             latent, denoise, disable_noise, start_step, last_step,
             force_full_denoise, sigmas,
-             state_dict=getattr(self, "state_dict", None)
+             state_dict=getattr(self, "state_dict", None),
+             memory=self.memory,
         )
                  
         if model_modified:
              print(f"[RayActor {self.local_rank}] Model modified by SamplerManager (e.g. baked weights).")
-             # OPTIMIZATION: Do not clear reload_params blindly.
-             # self.reload_params = None
+             cache = getattr(self.model, 'pinned_param_cache', None)
+             if cache is not None:
+                 cache.invalidate()
+
+        self._try_bake_and_sync()
         return result
 
     @patch_temp_fix_ck_ops
