@@ -44,6 +44,7 @@ import torch
 
 if TYPE_CHECKING:
     from raylight.ipc.backends.posix_shm import PosixShmBackend
+    from raylight.ipc.types import HostIpcArtifactMetadata
 
 log = logging.getLogger(__name__)
 
@@ -384,15 +385,26 @@ class BasePinnedCache(ABC):
             self._partial_freed.clear()
             self._watermark = 0
 
-        for s, nbytes in self._freed_storages:
-            s.resize_(nbytes)
-            alloc_bytes += nbytes
-            restored += 1
-        self._freed_storages = []
+        # ── Cold start: cache built from CPU params, no prior offload ──
+        # _freed_storages is empty because no offload cycle has freed any
+        # CUDA storages yet.  Params are still pointing at CPU/pinned
+        # tensors.  We must allocate fresh CUDA tensors, copy pinned data
+        # there, and swap param.data to the new CUDA tensors.
+        if not self._freed_storages and self._offload_generation == 0:
+            reloaded, alloc_bytes = self._cold_start_to_cuda(
+                module, non_blocking,
+            )
+            t_alloc = t_copy = time.perf_counter()
+        else:
+            for s, nbytes in self._freed_storages:
+                s.resize_(nbytes)
+                alloc_bytes += nbytes
+                restored += 1
+            self._freed_storages = []
 
-        t_alloc = time.perf_counter()
+            t_alloc = time.perf_counter()
 
-        reloaded = self._copy_to_cuda(module, non_blocking)
+            reloaded = self._copy_to_cuda(module, non_blocking)
 
         t_copy = time.perf_counter()
 
@@ -415,6 +427,61 @@ class BasePinnedCache(ABC):
             f"{throughput:.1f} GB/s)."
         )
         return reloaded
+
+    def _cold_start_to_cuda(
+        self,
+        module: torch.nn.Module,
+        non_blocking: bool = True,
+    ) -> tuple:
+        """First-ever reload: allocate fresh CUDA tensors from pinned cache.
+
+        Unlike the normal reload path (resize freed storages + copy), this
+        allocates brand-new CUDA tensors and swaps ``param.data`` to point
+        at them.  The previous CPU/pinned data references are released.
+
+        Returns ``(reloaded_count, alloc_bytes)``.
+        """
+        reloaded = 0
+        alloc_bytes = 0
+        device = None
+
+        # Determine target CUDA device from first available GPU
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+        if device is None:
+            print(f"[{self._tag}] Cold start: no CUDA device available.")
+            return 0, 0
+
+        cpu_params = getattr(self, "_cpu_params", {})
+        cpu_buffers = getattr(self, "_cpu_buffers", {})
+
+        for name, param in module.named_parameters():
+            cpu_buf = cpu_params.get(name)
+            if cpu_buf is not None:
+                cuda_tensor = torch.empty_like(
+                    cpu_buf, device=device,
+                )
+                cuda_tensor.copy_(cpu_buf, non_blocking=non_blocking)
+                param.data = cuda_tensor
+                alloc_bytes += cuda_tensor.nbytes
+                reloaded += 1
+
+        for name, buf in module.named_buffers():
+            cpu_copy = cpu_buffers.get(name)
+            if cpu_copy is not None:
+                cuda_tensor = torch.empty_like(
+                    cpu_copy, device=device,
+                )
+                cuda_tensor.copy_(cpu_copy, non_blocking=non_blocking)
+                buf.data = cuda_tensor
+                alloc_bytes += cuda_tensor.nbytes
+
+        print(
+            f"[{self._tag}] Cold start: allocated {alloc_bytes / 1e9:.2f} GB "
+            f"of fresh CUDA tensors for {reloaded} params."
+        )
+        return reloaded, alloc_bytes
 
     @abstractmethod
     def param_count(self) -> int: ...
@@ -855,7 +922,7 @@ class SharedPinnedParamCache(BasePinnedCache):
 
         self._shm_name = f"raylight_pc_{cache_id}"
         self._shm_backend = shm_backend
-        self._shm_metadata: Optional[object] = None  # HostIpcArtifactMetadata
+        self._shm_metadata: Optional["HostIpcArtifactMetadata"] = None
         self._registered_ptr: Optional[int] = None
         self._total_bytes: int = 0
 

@@ -65,11 +65,6 @@ def compact_set_step(step):
     except (ImportError, AttributeError):
         pass
     context.compact_set_step(step)
-    # Flush dequant cache at step boundaries — the underlying quantized data
-    # is about to be overwritten by new compress/put calls, so stale dequant
-    # entries must be dropped.
-    if context._cache is not None and hasattr(context._cache, '_dequant_cache'):
-        context._cache._dequant_cache.clear()
 
 def compact_get_step():
     return context.compact_get_step()
@@ -170,3 +165,44 @@ from raylight.distributed_modules.attention.backends.fusion.ops import (
     compact_decompress,
     compact_all_gather,
 )
+
+
+def compact_evict_cuda_caches() -> int:
+    """Free CompactFusion CUDA caches under memory pressure.
+
+    Called by the CUDA malloc interceptor (via MemoryPolicy) when an
+    allocation fails.  Frees communication buffers and cached baselines
+    that can be cheaply rebuilt (the next attention call will fall back
+    to warmup / uncompressed behaviour for one step).
+
+    Returns approximate bytes freed.
+    """
+    import torch
+    freed = 0
+
+    # 1. AllGatherCache recv/send buffers
+    if context._allgather_cache is not None:
+        try:
+            freed += context._allgather_cache.tensors_size()
+            context._allgather_cache.clear()
+        except Exception:
+            pass
+
+    # 2. PatchPara static comm buffers
+    try:
+        for _key, buf_list in fwd_module._buffers.items():
+            if isinstance(buf_list, list):
+                for t in buf_list:
+                    if isinstance(t, torch.Tensor) and t.is_cuda:
+                        freed += t.nelement() * t.element_size()
+        fwd_module.clear_buffers()
+    except Exception:
+        pass
+
+    if freed > 0:
+        print(
+            f"[CompactFusion] Evicted {freed / 1024**2:.0f} MB "
+            f"of CUDA comm caches under memory pressure"
+        )
+
+    return freed

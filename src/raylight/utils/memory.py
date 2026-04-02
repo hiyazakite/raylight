@@ -59,6 +59,9 @@ class MemoryPolicy:
         # Registered via set_offload_target(); None until then.
         self._pinned_cache = None
         self._offload_module = None
+        # CompactFusion cache evictor — registered via set_compact_cache_evictor().
+        # Called BEFORE weight eviction (cheaper to rebuild).
+        self._compact_evictor = None
         # Guard: prevents watermark eviction while model weights are
         # actively being read during a forward pass.
         self._in_forward: bool = False
@@ -166,44 +169,69 @@ class MemoryPolicy:
         self._pinned_cache = cache
         self._offload_module = module
 
+    def set_compact_cache_evictor(self, evictor_fn) -> None:
+        """Register a callable that frees CompactFusion CUDA caches.
+
+        The callable should free as much as possible and return bytes freed.
+        It is called BEFORE weight eviction (cheaper to rebuild — comm
+        buffers are automatically recreated on the next attention call).
+        """
+        self._compact_evictor = evictor_fn
+
     def relieve_pressure(self, needed_bytes: int = 0) -> int:
         """Try to free VRAM under pressure, ordered by cost.
 
-        1. ``empty_cache()`` — free PyTorch's cached (unused) blocks.
-        2. Watermark partial offload via pinned cache (if registered).
+        Three-tier cascade:
+          1. ``empty_cache()`` — free PyTorch's cached (unused) blocks.
+          2. CompactFusion cache eviction — free comm buffers (cheap rebuild).
+          3. Watermark partial offload via pinned cache (expensive reload).
 
         Returns actual bytes freed.  0 = no action needed.
 
         **Safety**: if ``_in_forward`` is True (model is executing a forward
-        pass), step 2 is skipped — evicting weights that are being read
-        would crash or produce garbage.  Step 1 (empty_cache) is always safe
-        since it only frees *unused* cached blocks.
+        pass), step 3 is skipped — evicting weights that are being read
+        would crash or produce garbage.  Steps 1–2 are always safe.
         """
         deficit = self.vram_deficit(needed_bytes)
         if deficit <= 0:
             return 0
 
+        freed_total = 0
+
         # Step 1: Free PyTorch caching allocator's unused blocks
         self._release_cuda_cache()
         deficit = self.vram_deficit(needed_bytes)
         if deficit <= 0:
-            return 0
+            return freed_total
 
-        # Step 2: Watermark partial offload (aimdo-style)
+        # Step 2: Evict CompactFusion caches (cheap to rebuild)
+        evictor = self._compact_evictor
+        if evictor is not None:
+            try:
+                freed = evictor()
+                freed_total += freed
+                self._release_cuda_cache()  # make freed blocks visible
+                deficit = self.vram_deficit(needed_bytes)
+                if deficit <= 0:
+                    return freed_total
+            except Exception as e:
+                print(f"[MemoryPolicy] Compact cache eviction failed: {e}")
+
+        # Step 3: Watermark partial offload (aimdo-style) — last resort
         # BLOCKED during forward pass — can't evict weights being read.
         if self._in_forward:
-            return 0
+            return freed_total
 
         cache = self._pinned_cache
         module = self._offload_module
         if cache is not None and module is not None and getattr(cache, 'built', False):
             try:
                 freed = cache.offload_by_pressure(module, deficit)
-                return freed
+                freed_total += freed
             except Exception as e:
                 print(f"[MemoryPolicy] Pressure offload failed: {e}")
 
-        return 0
+        return freed_total
 
     # ─── Private ─────────────────────────────────────────────
 
@@ -255,6 +283,7 @@ class _NullPolicy(MemoryPolicy):
     def vram_deficit(self, needed_bytes: int = 0) -> int: return 0
     def relieve_pressure(self, needed_bytes: int = 0) -> int: return 0
     def set_offload_target(self, cache, module) -> None: ...
+    def set_compact_cache_evictor(self, evictor_fn) -> None: ...
 
 
 #: Module-level null fallback — importers can use as default parameter.

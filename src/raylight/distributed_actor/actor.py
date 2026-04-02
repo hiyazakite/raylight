@@ -556,6 +556,14 @@ class RayActor:
             except Exception as e:
                 print(f"[RayActor {self.local_rank}] Allocator interceptor not available: {e}")
 
+            # Register CompactFusion cache evictor — frees comm buffers
+            # when VRAM pressure is detected (cheaper than weight eviction).
+            try:
+                from raylight.distributed_modules.attention.backends.fusion.main import compact_evict_cuda_caches
+                self.memory.set_compact_cache_evictor(compact_evict_cuda_caches)
+            except Exception:
+                pass  # CompactFusion may not be available
+
     def load_unet(self, unet_path, model_options):
         """Unified entry point for all model types (FSDP, GGUF, Safetensors, BNB)."""
         with monitor_memory(f"RayActor {self.local_rank} - load_unet", device=self.device):
