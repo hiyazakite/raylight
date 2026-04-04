@@ -143,3 +143,33 @@ def prepare_ring_attn_kwargs(
             attn_kwargs["mask"] = mask
 
     return attn_kwargs
+
+def get_local_attn_fn(raylight_config: Optional['RaylightConfig'] = None) -> Callable:
+    """
+    Selects a local high-performance attention kernel (Sage, Flash, or xformers) 
+    without any Sequence Parallel / yunchang overhead.
+    """
+    from raylight.distributed_modules.attention import get_config
+    cfg = raylight_config or get_config()
+    attn_type_name = cfg.strategy.attention_type.name
+
+    # Select core kernel based on attn_type_name
+    if "SAGE" in attn_type_name:
+        try:
+            from sage_attention import sage_attn
+            return lambda q, k, v, heads, mask=None, **kwargs: sage_attn(q, k, v, is_causal=kwargs.get("causal", False))
+        except ImportError:
+            logger.warning("[Raylight] SageAttention requested but not installed. Falling back to ComfyUI.")
+
+    # Default fallback to ComfyUI's optimized attention kernels
+    import comfy.ldm.modules.attention as comfy_attn
+    
+    def _local_dispatch(q, k, v, heads, mask=None, **kwargs):
+        # We use ComfyUI's standard logic but ensure its backend selection 
+        # is influenced by the current context if possible.
+        if mask is None:
+            return comfy_attn.optimized_attention(q, k, v, heads, **kwargs)
+        else:
+            return comfy_attn.optimized_attention_masked(q, k, v, heads, mask, **kwargs)
+
+    return _local_dispatch

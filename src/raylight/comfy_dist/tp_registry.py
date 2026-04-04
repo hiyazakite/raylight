@@ -101,7 +101,5 @@ if hasattr(model_base, "WAN22"):
 if hasattr(model_base, "LTXAV"):
     @TPRegistry.register(model_base.LTXAV)
     def _tp_ltxav(comfy_model, tp_group=None):
-        raise NotImplementedError(
-            "LTXAV TP not yet implemented (Phase 2.3). "
-            "Set tensor_parallel_degree=1 for LTXAV models."
-        )
+        from ..diffusion_models.lightricks.tp import apply_tp_to_ltxav_model
+        apply_tp_to_ltxav_model(comfy_model.diffusion_model, tp_group=tp_group)

@@ -9,7 +9,7 @@ import torch
 from ._base import ModelContext, ModelState, _compute_vram_budget
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, ActorConfigLike
+    from raylight.raylight_types import LoraManagerLike, ActorConfigLike
 
 
 def _weak_cleanup_gguf_pinned(

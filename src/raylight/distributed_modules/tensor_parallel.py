@@ -498,13 +498,10 @@ class TPRMSNormAcrossHeads(nn.Module):
         local_sumsq = x.float().pow(2).sum(dim=-1, keepdim=True)
         dist.all_reduce(local_sumsq, op=dist.ReduceOp.SUM, group=self._resolved_group)
         var = local_sumsq / float(self.full_hidden_size)
-        x_normed = x.float() * torch.rsqrt(var + self.eps)
-        return (x_normed * self.weight.float()).to(x.dtype)
+        return (x.float() * torch.rsqrt(var + self.eps)).to(x.dtype) * self.weight
 
-    def weight_loader(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor
-    ) -> None:
-        """Load the full-size norm weight and extract this rank's shard."""
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        """Load and shard weights for the norm layer."""
         tp_rank = TensorParallelState.get_rank()
         shard = loaded_weight.narrow(
             0, tp_rank * self.local_hidden_size, self.local_hidden_size

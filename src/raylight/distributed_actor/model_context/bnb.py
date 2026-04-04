@@ -8,7 +8,7 @@ import torch
 from ._base import ModelContext, ModelState
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, ActorConfigLike
+    from raylight.raylight_types import LoraManagerLike, ActorConfigLike
 
 
 class BNBContext(ModelContext):

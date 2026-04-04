@@ -11,7 +11,7 @@ from ._base import ModelContext, ModelState, _ops_for_model_options
 from raylight.distributed_modules.fsdp_utils import prefetch_state_dict
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, ActorConfigLike
+    from raylight.raylight_types import LoraManagerLike, ActorConfigLike
 
 
 class FSDPContext(ModelContext):

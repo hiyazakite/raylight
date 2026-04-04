@@ -15,7 +15,7 @@ import torch
 from raylight.utils.memory import MemoryPolicy, NULL_POLICY
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, ModelPatcherLike, StateCacheLike, ActorConfigLike
+    from raylight.raylight_types import LoraManagerLike, ModelPatcherLike, StateCacheLike, ActorConfigLike
 
 
 # ---------------------------------------------------------------------------

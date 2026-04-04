@@ -9,7 +9,7 @@ from .lazy_tensor import LazyTensorContext
 from ._base import ModelState
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, ActorConfigLike
+    from raylight.raylight_types import LoraManagerLike, ActorConfigLike
 
 
 class VAEContext(LazyTensorContext):

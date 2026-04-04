@@ -10,7 +10,7 @@ from ._base import ModelContext, ModelState, _compute_vram_budget, _ops_for_mode
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
 
 if TYPE_CHECKING:
-    from raylight.types import LoraManagerLike, ActorConfigLike
+    from raylight.raylight_types import LoraManagerLike, ActorConfigLike
 
 
 class LazyTensorContext(ModelContext):
