@@ -29,6 +29,10 @@ class ActorConfig:
         return self.raylight_config.strategy.fsdp_cpu_offload
 
     @property
+    def is_tp(self) -> bool:
+        return self.raylight_config.strategy.is_tp
+
+    @property
     def is_xdit(self) -> bool:
         return self.raylight_config.meta.total_sp_degree > 1
 

@@ -13,6 +13,51 @@ from .base import (
 )
 
 
+def _tp_shard_lora_diff(lora_diff: torch.Tensor, weight_shape) -> torch.Tensor:
+    """Narrow a full-size LoRA delta to match a TP-sharded weight.
+
+    When tensor parallelism is active, model weights are sharded but LoRA
+    matrices are stored at full size.  The ``mm`` product has shape
+    ``[full_out, full_in_flat]`` while the model weight may be
+    ``[local_out, ...]`` (column-parallel) or ``[full_out, local_in]``
+    (row-parallel).  This function detects the sharded dimension and
+    extracts this rank's slice.
+
+    When TP is inactive or shapes already match, this is a plain reshape.
+    """
+    target_numel = 1
+    for s in weight_shape:
+        target_numel *= s
+
+    if lora_diff.numel() == target_numel:
+        return lora_diff.reshape(weight_shape)
+
+    # TP shard detected — diff is full-size, weight is sharded
+    try:
+        from raylight.distributed_modules.tensor_parallel import TensorParallelState
+        if not TensorParallelState.is_initialized():
+            return lora_diff.reshape(weight_shape)
+        tp_rank = TensorParallelState.get_rank()
+    except ImportError:
+        return lora_diff.reshape(weight_shape)
+
+    # Column-parallel: output dim (dim 0) is sharded
+    local_out = weight_shape[0]
+    full_out = lora_diff.shape[0]
+    if full_out != local_out and full_out % local_out == 0:
+        return lora_diff.narrow(0, tp_rank * local_out, local_out).reshape(weight_shape)
+
+    # Row-parallel: input dim (dim 1, flattened) is sharded
+    if lora_diff.ndim >= 2:
+        local_in_flat = target_numel // weight_shape[0]
+        full_in_flat = lora_diff.shape[1]
+        if full_in_flat != local_in_flat and full_in_flat % local_in_flat == 0:
+            return lora_diff.narrow(1, tp_rank * local_in_flat, local_in_flat).reshape(weight_shape)
+
+    # Fallback — let reshape raise if shapes are truly incompatible
+    return lora_diff.reshape(weight_shape)
+
+
 class LoraDiff(WeightAdapterTrainBase):
     def __init__(self, weights):
         super().__init__()
@@ -190,7 +235,8 @@ class LoRAAdapter(WeightAdapterBase):
         try:
             lora_diff = torch.mm(
                 mat1.flatten(start_dim=1), mat2.flatten(start_dim=1)
-            ).reshape(weight.shape)
+            )
+            lora_diff = _tp_shard_lora_diff(lora_diff, weight.shape)
             del mat1, mat2
             if dora_scale is not None:
                 weight = weight_decompose(

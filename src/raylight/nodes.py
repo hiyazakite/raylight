@@ -317,6 +317,12 @@ class RayInitializer:
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "cfg_degree": ("INT", {"default": 1}),
+                "tensor_parallel_degree": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 8,
+                    "tooltip": "Number of GPUs for Tensor Parallelism weight sharding (1 = disabled). Must divide GPU count evenly."
+                }),
                 "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
@@ -409,6 +415,7 @@ class RayInitializer:
         ulysses_degree: int = 1,
         ring_degree: int = 1,
         cfg_degree: int = 1,
+        tensor_parallel_degree: int = 1,
         sync_ulysses: bool = False,
         FSDP: bool = False,
         FSDP_CPU_OFFLOAD: bool = False,
@@ -486,6 +493,7 @@ class RayInitializer:
                     ulysses_degree=ulysses_degree,
                     ring_degree=ring_degree,
                     cfg_degree=cfg_degree,
+                    tensor_parallel_degree=tensor_parallel_degree,
                     sync_ulysses=sync_ulysses,
                     fsdp_enabled=FSDP,
                     fsdp_cpu_offload=FSDP_CPU_OFFLOAD,
@@ -642,6 +650,12 @@ class RayInitializerAdvanced(RayInitializer):
                 "ulysses_degree": ("INT", {"default": 2}),
                 "ring_degree": ("INT", {"default": 1}),
                 "cfg_degree": ("INT", {"default": 1}),
+                "tensor_parallel_degree": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 8,
+                    "tooltip": "Number of GPUs for Tensor Parallelism weight sharding (1 = disabled). Must divide GPU count evenly."
+                }),
                 "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),

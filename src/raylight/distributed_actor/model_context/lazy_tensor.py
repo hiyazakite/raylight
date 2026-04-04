@@ -47,8 +47,14 @@ class LazyTensorContext(ModelContext):
 
     @staticmethod
     def _make_pinned_cache(config: "ActorConfigLike", model_path: str):
-        """Select shared or private pinned cache based on worker topology."""
-        is_shared = config.global_world_size > 1 and not config.is_fsdp
+        """Select shared or private pinned cache based on worker topology.
+
+        TP ranks hold *different* weight shards, so they cannot share a
+        single pinned buffer (rank 0's shard differs from rank 1's).
+        Fall back to a private PinnedParamCache per rank for TP, same as
+        FSDP.
+        """
+        is_shared = config.global_world_size > 1 and not config.is_fsdp and not config.is_tp
         if is_shared:
             from raylight.distributed_modules.pinned_cache import (
                 SharedPinnedParamCache, make_cache_id,

@@ -56,6 +56,7 @@ class ExecutionStrategy:
     ulysses_degree: int = 1
     ring_degree: int = 1
     cfg_degree: int = 1
+    tensor_parallel_degree: int = 1
     
     # Flags
     sync_ulysses: bool = False
@@ -74,9 +75,24 @@ class ExecutionStrategy:
         return self.fsdp_enabled
 
     @property
+    def is_tp(self) -> bool:
+        """True when Tensor Parallelism is active."""
+        return self.tensor_parallel_degree > 1
+
+    @property
     def is_xdit(self) -> bool:
         """True when any sequence/CFG parallelism degree exceeds 1."""
         return self.ulysses_degree * self.ring_degree * self.cfg_degree > 1
+
+    @property
+    def total_parallel_degree(self) -> int:
+        """Total parallelism degree (product of all degrees)."""
+        return (
+            self.ulysses_degree
+            * self.ring_degree
+            * self.cfg_degree
+            * self.tensor_parallel_degree
+        )
 
     def __post_init__(self):
         """Cross-field validation for strategy consistency."""

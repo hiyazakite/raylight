@@ -1,6 +1,9 @@
 from typing import Optional, TYPE_CHECKING
 import uuid
 
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+
 if TYPE_CHECKING:
     from raylight.distributed_actor.actor_config import ActorConfig
 
@@ -114,3 +117,45 @@ def bake_lora_hooks(work_model, local_rank: int = 0) -> int:
         print(f"[RayActor {local_rank}] Baked {baked} LoRA patches into weights "
               f"(hooks cleared, patches purged).")
     return baked
+
+
+# ---------------------------------------------------------------------------
+# Hybrid FSDP + TP DeviceMesh helpers
+# ---------------------------------------------------------------------------
+
+
+def build_hybrid_mesh(fsdp_size: int, tp_size: int) -> DeviceMesh:
+    """Build a 2-D DeviceMesh with axes (fsdp, tp).
+
+    Example — 8 GPUs, fsdp_size=4, tp_size=2::
+
+        rank layout:  [[ 0,  1],   # FSDP-group 0, TP-ranks 0-1
+                       [ 2,  3],   # FSDP-group 1, TP-ranks 2-3
+                       [ 4,  5],   # FSDP-group 2, TP-ranks 4-5
+                       [ 6,  7]]   # FSDP-group 3, TP-ranks 6-7
+
+    FSDP2 shards along the first axis; TP communicates along the second.
+    """
+    world = dist.get_world_size()
+    assert world == fsdp_size * tp_size, (
+        f"world_size={world} != fsdp_size={fsdp_size} * tp_size={tp_size}"
+    )
+    return init_device_mesh(
+        "cuda", (fsdp_size, tp_size), mesh_dim_names=("fsdp", "tp")
+    )
+
+
+def initialize_tp_from_mesh(mesh_2d: DeviceMesh) -> None:
+    """Initialize TensorParallelState from the 'tp' dimension of a 2-D mesh."""
+    from raylight.distributed_modules.tensor_parallel import TensorParallelState
+
+    tp_mesh = mesh_2d["tp"]
+    TensorParallelState.initialize(tp_mesh.size(), pg=tp_mesh.get_group())
+
+
+def shard_model_fsdp2_with_mesh(model, mesh_2d: DeviceMesh, **kwargs):
+    """Wrap *model* with FSDP2 using the 'fsdp' dimension of a 2-D mesh."""
+    from torch.distributed.fsdp import fully_shard
+
+    fully_shard(model, mesh=mesh_2d["fsdp"], **kwargs)
+    return model

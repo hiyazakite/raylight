@@ -259,16 +259,52 @@ class RayActor:
             )
 
     def _init_device_mesh(self):
-        """Initialize Device Mesh for FSDP or Sequence Parallelism."""
-        if self.raylight_config.meta.is_distributed:
-            if self.raylight_config.strategy.fsdp_enabled or self.raylight_config.meta.total_sp_degree > 1:
-                self.device_mesh = dist.device_mesh.init_device_mesh("cuda", mesh_shape=(self.global_world_size,))
-                self.config.device_mesh = self.device_mesh
-            else:
-                print(f"Running Ray in normal separate sampler with: {self.global_world_size} number of workers")
+        """Initialize Device Mesh for FSDP, Sequence Parallelism, and/or TP."""
+        if not self.raylight_config.meta.is_distributed:
+            return
+
+        strategy = self.raylight_config.strategy
+        tp_degree = strategy.tensor_parallel_degree
+        needs_fsdp_or_sp = (
+            strategy.fsdp_enabled or self.raylight_config.meta.total_sp_degree > 1
+        )
+
+        if needs_fsdp_or_sp and tp_degree > 1:
+            # Hybrid FSDP/SP + TP: build a 2-D DeviceMesh so each
+            # parallelism uses its own mesh dimension.
+            from raylight.comfy_dist.fsdp_utils import build_hybrid_mesh
+
+            fsdp_size = self.global_world_size // tp_degree
+            self.device_mesh = build_hybrid_mesh(fsdp_size, tp_degree)
+            self.config.device_mesh = self.device_mesh
+            print(
+                f"[RayActor] 2-D DeviceMesh: fsdp={fsdp_size} x tp={tp_degree}"
+            )
+        elif needs_fsdp_or_sp:
+            # FSDP or SP only — flat 1-D mesh (existing behaviour).
+            self.device_mesh = dist.device_mesh.init_device_mesh(
+                "cuda", mesh_shape=(self.global_world_size,)
+            )
+            self.config.device_mesh = self.device_mesh
+        elif tp_degree > 1:
+            # Pure-TP: no FSDP mesh needed.  TP groups are created via
+            # dist.new_group in _init_tensor_parallel.
+            self.device_mesh = None
+        else:
+            print(
+                f"Running Ray in normal separate sampler with: "
+                f"{self.global_world_size} number of workers"
+            )
 
     def _init_xdit(self):
-        """Initialize XDiT environment for Sequence Parallelism. No-op if SP disabled."""
+        """Initialize XDiT environment for Sequence Parallelism and/or TP."""
+        strategy = self.raylight_config.strategy
+
+        # Initialize TP if enabled (must happen before SP so that the TP
+        # process groups are available when SP layers are constructed).
+        if strategy.tensor_parallel_degree > 1:
+            self._init_tensor_parallel()
+
         if self.raylight_config.meta.total_sp_degree <= 1:
             return
 
@@ -277,7 +313,6 @@ class RayActor:
             initialize_model_parallel,
         )
 
-        strategy = self.raylight_config.strategy
         self.ulysses_degree = strategy.ulysses_degree
         self.ring_degree = strategy.ring_degree
         self.cfg_degree = strategy.cfg_degree
@@ -311,6 +346,36 @@ class RayActor:
             f"  -> Parallel Degrees: Ulysses={self.ulysses_degree}, Ring={self.ring_degree}, CFG={self.cfg_degree}"
         )
 
+    def _init_tensor_parallel(self):
+        """Initialize Tensor Parallel process group.
+
+        Two paths:
+        - Hybrid (FSDP+TP): extract the TP group from the 2-D DeviceMesh
+          built by ``_init_device_mesh``.
+        - Pure-TP: create TP groups via ``dist.new_group``.
+        """
+        from raylight.distributed_modules.tensor_parallel import TensorParallelState
+
+        tp_degree = self.raylight_config.strategy.tensor_parallel_degree
+        print(f"[RayActor] Tensor Parallelism Enabled (TP={tp_degree})")
+
+        if self.device_mesh is not None and self.device_mesh.ndim == 2:
+            # Hybrid path — TP group comes from the mesh's "tp" dimension.
+            from raylight.comfy_dist.fsdp_utils import initialize_tp_from_mesh
+            initialize_tp_from_mesh(self.device_mesh)
+        else:
+            # Pure-TP path — creates contiguous-rank TP subgroups.
+            TensorParallelState.initialize(tp_degree)
+
+        # Apply model-specific TP patching if a handler is registered and
+        # a model is already loaded.
+        if hasattr(self, "model") and self.model is not None:
+            from raylight.comfy_dist.tp_registry import TPRegistry
+            if TPRegistry.has_handler(self.model):
+                TPRegistry.apply(
+                    self.model,
+                    tp_group=TensorParallelState.get_group(),
+                )
 
 
     def get_meta_model(self):
@@ -509,7 +574,20 @@ class RayActor:
         
         # FUNCTIONAL LOAD: Update references from return values
         self.model = ctx.load(state, self.config, self.state_cache)
-        
+
+        # ── TP patching: replace nn.Linear with TPLinear ──
+        # Must happen after model weights are loaded (so _replace_linear can
+        # copy existing weights into each rank's TP shard) and before any
+        # FSDP wrapping (which would shard the parameters further).
+        if self.raylight_config.strategy.is_tp and self.model is not None:
+            from raylight.distributed_modules.tensor_parallel import TensorParallelState
+            from raylight.comfy_dist.tp_registry import TPRegistry
+            if TPRegistry.has_handler(self.model):
+                TPRegistry.apply(
+                    self.model,
+                    tp_group=TensorParallelState.get_group(),
+                )
+
         # Stamp user VRAM limit on model for hot_load budget calculation
         vram_limit = self.config.vram_limit_bytes
         if self.model is not None and vram_limit > 0:

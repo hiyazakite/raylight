@@ -101,6 +101,9 @@ class ActorConfigLike(Protocol):
     def is_fsdp(self) -> bool: ...
 
     @property
+    def is_tp(self) -> bool: ...
+
+    @property
     def fsdp_cpu_offload(self) -> bool: ...
 
     @property
