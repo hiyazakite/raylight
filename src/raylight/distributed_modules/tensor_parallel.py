@@ -378,6 +378,7 @@ class TPLinear(nn.Module):
 
     # -- Forward -------------------------------------------------------------
 
+    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = self.weight
         
@@ -493,6 +494,7 @@ class TPRMSNormAcrossHeads(nn.Module):
     def _resolved_group(self) -> Optional[dist.ProcessGroup]:
         return self._tp_group if self._tp_group is not None else get_tp_group()
 
+    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., local_hidden_size]
         local_sumsq = x.float().pow(2).sum(dim=-1, keepdim=True)

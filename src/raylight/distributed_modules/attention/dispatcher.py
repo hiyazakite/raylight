@@ -25,6 +25,126 @@ from raylight.distributed_modules.attention.backends.xfuser_ring_patch import (
 
 _WRAPPED_CACHE = {}
 
+# ---------------------------------------------------------------------------
+# Per-process cached loaders for local attention kernels (TP path).
+# Each loader tries the import once; subsequent calls return the cached result.
+# Input convention for all wrappers: q/k/v are [B, T, H*D], heads=H scalar.
+# ---------------------------------------------------------------------------
+_sage_attn_fn: Optional[Callable] = None
+_sage_attn_checked: bool = False
+_flash_attn2_fn: Optional[Callable] = None
+_flash_attn2_checked: bool = False
+_flash_attn3_fn: Optional[Callable] = None
+_flash_attn3_checked: bool = False
+
+
+def _try_load_sage_attn() -> Optional[Callable]:
+    """Load SageAttention (NHD layout wrapper). Warns at most once on failure."""
+    global _sage_attn_fn, _sage_attn_checked
+    if _sage_attn_checked:
+        return _sage_attn_fn
+    _sage_attn_checked = True
+
+    # Try the modern `sageattention` package first, then the older `sage_attention`.
+    _sageattn = None
+    _hnd_layout = True  # default: [B,H,N,D]
+    try:
+        from sageattention import sageattn as _sageattn_fn  # type: ignore
+        _sageattn = _sageattn_fn
+        _hnd_layout = False  # sageattn accepts tensor_layout="NHD"
+    except ImportError:
+        try:
+            from sage_attention import sage_attn as _sageattn_fn  # type: ignore
+            _sageattn = _sageattn_fn
+            _hnd_layout = True  # legacy sage_attn expects [B,H,N,D]
+        except ImportError:
+            pass
+
+    if _sageattn is None:
+        logger.warning(
+            "[Raylight] SageAttention requested but not installed. Falling back to Flash Attention."
+        )
+        _sage_attn_fn = None
+        return None
+
+    if _hnd_layout:
+        # Reshape [B, T, H*D] → [B, H, T, D], call, reshape back.
+        # k/v use -1 for seq so cross-attention (kv_seq ≠ q_seq) works.
+        def _wrap_hnd(q, k, v, heads, mask=None, **kwargs):
+            b, q_seq, hd = q.shape
+            dim_head = hd // heads
+            q = q.view(b, q_seq, heads, dim_head).permute(0, 2, 1, 3).contiguous()
+            k = k.view(b, -1, heads, dim_head).permute(0, 2, 1, 3).contiguous()
+            v = v.view(b, -1, heads, dim_head).permute(0, 2, 1, 3).contiguous()
+            out = _sageattn(q, k, v, is_causal=kwargs.get("causal", False))
+            return out.permute(0, 2, 1, 3).reshape(b, q_seq, hd)
+        _sage_attn_fn = _wrap_hnd
+    else:
+        # sageattn NHD: reshape [B, T, H*D] → [B, T, H, D], call with tensor_layout="NHD".
+        # k/v use -1 for seq so cross-attention (kv_seq ≠ q_seq) works.
+        def _wrap_nhd(q, k, v, heads, mask=None, **kwargs):
+            b, q_seq, hd = q.shape
+            dim_head = hd // heads
+            q = q.view(b, q_seq, heads, dim_head).contiguous()
+            k = k.view(b, -1, heads, dim_head).contiguous()
+            v = v.view(b, -1, heads, dim_head).contiguous()
+            out = _sageattn(q, k, v, tensor_layout="NHD", is_causal=kwargs.get("causal", False))
+            return out.reshape(b, q_seq, hd)
+        _sage_attn_fn = _wrap_nhd
+
+    return _sage_attn_fn
+
+
+def _try_load_flash_attn2() -> Optional[Callable]:
+    """Load Flash Attention 2. Warns at most once on failure."""
+    global _flash_attn2_fn, _flash_attn2_checked
+    if _flash_attn2_checked:
+        return _flash_attn2_fn
+    _flash_attn2_checked = True
+    try:
+        from flash_attn import flash_attn_func as _fa2  # type: ignore
+        def _wrap_fa2(q, k, v, heads, mask=None, **kwargs):
+            b, q_seq, hd = q.shape
+            dim_head = hd // heads
+            # flash_attn_func expects [B, T, H, D]; use -1 for kv seq (cross-attn safe)
+            q = q.view(b, q_seq, heads, dim_head)
+            k = k.view(b, -1, heads, dim_head)
+            v = v.view(b, -1, heads, dim_head)
+            out = _fa2(q, k, v, causal=kwargs.get("causal", False))
+            return out.view(b, q_seq, hd)
+        _flash_attn2_fn = _wrap_fa2
+    except ImportError:
+        logger.warning(
+            "[Raylight] flash_attn not available for TP local attention. Falling back to ComfyUI."
+        )
+        _flash_attn2_fn = None
+    return _flash_attn2_fn
+
+
+def _try_load_flash_attn3() -> Optional[Callable]:
+    """Load Flash Attention 3. Warns at most once on failure."""
+    global _flash_attn3_fn, _flash_attn3_checked
+    if _flash_attn3_checked:
+        return _flash_attn3_fn
+    _flash_attn3_checked = True
+    try:
+        from flash_attn_interface import flash_attn_func as _fa3  # type: ignore
+        def _wrap_fa3(q, k, v, heads, mask=None, **kwargs):
+            b, q_seq, hd = q.shape
+            dim_head = hd // heads
+            q = q.view(b, q_seq, heads, dim_head)
+            k = k.view(b, -1, heads, dim_head)
+            v = v.view(b, -1, heads, dim_head)
+            out, _ = _fa3(q, k, v, causal=kwargs.get("causal", False))
+            return out.view(b, q_seq, hd)
+        _flash_attn3_fn = _wrap_fa3
+    except ImportError:
+        logger.warning(
+            "[Raylight] Flash Attention 3 not available for TP local attention. Falling back to FA2."
+        )
+        _flash_attn3_fn = None
+    return _flash_attn3_fn
+
 def select_ring_attn_fn(
     use_compact_ring: bool,
     has_mask: bool,
@@ -146,30 +266,69 @@ def prepare_ring_attn_kwargs(
 
 def get_local_attn_fn(raylight_config: Optional['RaylightConfig'] = None) -> Callable:
     """
-    Selects a local high-performance attention kernel (Sage, Flash, or xformers) 
-    without any Sequence Parallel / yunchang overhead.
+    Selects a local high-performance attention kernel for use in the TP path,
+    where no sequence-parallel communication is needed.
+
+    Dispatch priority per configured RaylightAttnType:
+      FLASH_ATTN_3            → FA3 → FA2 → ComfyUI
+      FLASH_ATTN              → FA2 → ComfyUI
+      SAGE_* (any SAGE type)  → Sage → FA2 → ComfyUI
+      TORCH                   → torch SDPA → ComfyUI
+      *                       → ComfyUI
+
+    All wrappers accept (q, k, v, heads, mask=None, **kwargs) with
+    q/k/v in [B, T, H*D] format (ComfyUI linear output convention).
     """
     from raylight.distributed_modules.attention import get_config
     cfg = raylight_config or get_config()
     attn_type_name = cfg.strategy.attention_type.name
 
-    # Select core kernel based on attn_type_name
-    if "SAGE" in attn_type_name:
-        try:
-            from sage_attention import sage_attn
-            return lambda q, k, v, heads, mask=None, **kwargs: sage_attn(q, k, v, is_causal=kwargs.get("causal", False))
-        except ImportError:
-            logger.warning("[Raylight] SageAttention requested but not installed. Falling back to ComfyUI.")
+    # FA3
+    if "FLASH_ATTN_3" in attn_type_name:
+        fn = _try_load_flash_attn3()
+        if fn is not None:
+            return fn
+        # FA3 missing → try FA2
+        fn = _try_load_flash_attn2()
+        if fn is not None:
+            return fn
 
-    # Default fallback to ComfyUI's optimized attention kernels
+    # FA2
+    elif "FLASH_ATTN" in attn_type_name:
+        fn = _try_load_flash_attn2()
+        if fn is not None:
+            return fn
+
+    # Any SAGE variant → try Sage, then FA2
+    elif "SAGE" in attn_type_name:
+        fn = _try_load_sage_attn()
+        if fn is not None:
+            return fn
+        fn = _try_load_flash_attn2()
+        if fn is not None:
+            return fn
+
+    # TORCH SDPA
+    elif attn_type_name == "TORCH":
+        import torch.nn.functional as F
+        def _sdpa(q, k, v, heads, mask=None, **kwargs):
+            b, q_seq, hd = q.shape
+            dim_head = hd // heads
+            # SDPA expects [B, H, T, D]; use -1 for kv seq (cross-attn safe)
+            q = q.view(b, q_seq, heads, dim_head).permute(0, 2, 1, 3)
+            k = k.view(b, -1, heads, dim_head).permute(0, 2, 1, 3)
+            v = v.view(b, -1, heads, dim_head).permute(0, 2, 1, 3)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=kwargs.get("causal", False))
+            return out.permute(0, 2, 1, 3).reshape(b, q_seq, hd)
+        return _sdpa
+
+    # ComfyUI fallback (handles its own reshaping internally)
     import comfy.ldm.modules.attention as comfy_attn
-    
-    def _local_dispatch(q, k, v, heads, mask=None, **kwargs):
-        # We use ComfyUI's standard logic but ensure its backend selection 
-        # is influenced by the current context if possible.
+
+    def _comfy_dispatch(q, k, v, heads, mask=None, **kwargs):
         if mask is None:
             return comfy_attn.optimized_attention(q, k, v, heads, **kwargs)
         else:
             return comfy_attn.optimized_attention_masked(q, k, v, heads, mask, **kwargs)
 
-    return _local_dispatch
+    return _comfy_dispatch

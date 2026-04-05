@@ -239,6 +239,7 @@ def apply_tp_to_ltxav_cross_attention(
         attn.to_gate_logits = new_to_gate
 
     # 5. Replace forward with a TP-aware version
+    @torch.compiler.disable
     def _tp_forward(self, x, context=None, mask=None, pe=None, k_pe=None,
                     transformer_options=None):
         if transformer_options is None:
@@ -311,6 +312,7 @@ def _patch_block_forward_for_tp(block, tp_group):
         # For BasicAVTransformerBlock
         original_forward = block.forward
         
+        @torch.compiler.disable
         def _tp_av_forward(self, *args, **kwargs):
             # Temporarily shadow rms_norm in the global scope of the function? 
             # Riskier than just rewriting the calls.
@@ -327,6 +329,7 @@ def _patch_block_forward_for_tp(block, tp_group):
     else:
         # For standard BasicTransformerBlock
         original_forward = block.forward
+        @torch.compiler.disable
         def _tp_v_forward(self, *args, **kwargs):
             import comfy.ldm.common_dit
             old_rms = comfy.ldm.common_dit.rms_norm
