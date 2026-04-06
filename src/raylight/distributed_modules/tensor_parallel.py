@@ -447,7 +447,14 @@ class TPLinear(nn.Module):
                         w_float = w_float * float(w_scale)  # type: ignore[arg-type]
                 out = torch.nn.functional.linear(x, w_float, bias)
         else:
-            out = torch.nn.functional.linear(x, weight, bias)
+            # Cast weight/bias to match input dtype (e.g. float16 weight
+            # from GGUF dequant fallback with bfloat16 activations).
+            # Mirrors TPGGMLLinear.forward behaviour.
+            w = weight if weight.dtype == x.dtype else weight.to(x.dtype)
+            b = bias
+            if b is not None and b.dtype != x.dtype:
+                b = b.to(x.dtype)
+            out = torch.nn.functional.linear(x, w, b)
 
         # 3. Dynamic LoRA Hook support (mirrors Int8SafetensorOps)
         if getattr(self, "lora_A", None) is not None and getattr(self, "lora_B", None) is not None:

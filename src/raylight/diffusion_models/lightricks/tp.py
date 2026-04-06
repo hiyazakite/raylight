@@ -32,6 +32,7 @@ from raylight.distributed_modules.tensor_parallel import (
     get_tp_group,
 )
 from raylight.distributed_modules.tp_compress import TPCompressor, TPCompressConfig
+from raylight.distributed_modules.tp_linear_factory import make_tp_linear
 
 
 def _slice_rope_for_tp(
@@ -107,62 +108,28 @@ def apply_tp_to_ltxav_cross_attention(
 
     tp_rank = TensorParallelState.get_rank()
 
-    # Infer dimensions from existing linears
-    query_dim  = attn.to_q.weight.shape[1]   # in_features
-    inner_dim  = attn.to_q.weight.shape[0]   # out_features = heads * dim_head
-    context_dim = attn.to_k.weight.shape[1]
+    # Infer dimensions from existing linears (use module attrs, not
+    # weight.shape, so this works for both nn.Linear and GGMLOps.Linear).
+    query_dim  = attn.to_q.in_features
+    inner_dim  = attn.to_q.out_features      # heads * dim_head
+    context_dim = attn.to_k.in_features
 
     local_inner_dim = inner_dim // tp_size
     local_heads = attn.heads // tp_size
 
     # 1. Replace QKV projections
-    new_to_q = TPLinear(
-        query_dim, inner_dim, bias=attn.to_q.bias is not None, parallelism="column",
-        gather_output=False, tp_group=tp_group, dtype=attn.to_q.weight.dtype,
-        device="meta" if structure_only else attn.to_q.weight.device
+    new_to_q = make_tp_linear(
+        attn.to_q, parallelism="column", gather_output=False,
+        tp_group=tp_group, structure_only=structure_only,
     )
-    new_to_k = TPLinear(
-        context_dim, inner_dim, bias=attn.to_k.bias is not None, parallelism="column",
-        gather_output=False, tp_group=tp_group, dtype=attn.to_k.weight.dtype,
-        device="meta" if structure_only else attn.to_k.weight.device
+    new_to_k = make_tp_linear(
+        attn.to_k, parallelism="column", gather_output=False,
+        tp_group=tp_group, structure_only=structure_only,
     )
-    new_to_v = TPLinear(
-        context_dim, inner_dim, bias=attn.to_v.bias is not None, parallelism="column",
-        gather_output=False, tp_group=tp_group, dtype=attn.to_v.weight.dtype,
-        device="meta" if structure_only else attn.to_v.weight.device
+    new_to_v = make_tp_linear(
+        attn.to_v, parallelism="column", gather_output=False,
+        tp_group=tp_group, structure_only=structure_only,
     )
-
-    if not structure_only:
-        new_to_q.weight_loader(new_to_q.weight, attn.to_q.weight.data)
-        if attn.to_q.bias is not None:
-            new_to_q.weight_loader(new_to_q.bias, attn.to_q.bias.data)
-            
-        new_to_k.weight_loader(new_to_k.weight, attn.to_k.weight.data)
-        if attn.to_k.bias is not None:
-            new_to_k.weight_loader(new_to_k.bias, attn.to_k.bias.data)
-            
-        new_to_v.weight_loader(new_to_v.weight, attn.to_v.weight.data)
-        if attn.to_v.bias is not None:
-            new_to_v.weight_loader(new_to_v.bias, attn.to_v.bias.data)
-
-    if not structure_only:
-        # Lora copying for QKV
-        if hasattr(attn.to_q, "lora_A"): new_to_q.lora_A = attn.to_q.lora_A
-        if hasattr(attn.to_q, "lora_B"): new_to_q.lora_B = attn.to_q.lora_B
-        if hasattr(attn.to_q, "lora_alpha"): new_to_q.lora_alpha = attn.to_q.lora_alpha
-        if hasattr(attn.to_k, "lora_A"): new_to_k.lora_A = attn.to_k.lora_A
-        if hasattr(attn.to_k, "lora_B"): new_to_k.lora_B = attn.to_k.lora_B
-        if hasattr(attn.to_k, "lora_alpha"): new_to_k.lora_alpha = attn.to_k.lora_alpha
-        if hasattr(attn.to_v, "lora_A"): new_to_v.lora_A = attn.to_v.lora_A
-        if hasattr(attn.to_v, "lora_B"): new_to_v.lora_B = attn.to_v.lora_B
-        if hasattr(attn.to_v, "lora_alpha"): new_to_v.lora_alpha = attn.to_v.lora_alpha
-
-        # INT8 Support: preserve and shard weight scales
-        for old_m, new_m in [(attn.to_q, new_to_q), (attn.to_k, new_to_k), (attn.to_v, new_to_v)]:
-            if hasattr(old_m, "weight_scale"):
-                new_m.weight_scale = old_m.weight_scale
-            if hasattr(old_m, "scale"):
-                new_m.scale = old_m.scale
 
     attn.to_q = new_to_q
     attn.to_k = new_to_k
@@ -191,7 +158,7 @@ def apply_tp_to_ltxav_cross_attention(
     attn.k_norm = new_k_norm
 
     # 3. Replace output projection
-    out_dim    = attn.to_out[0].weight.shape[0]  # query_dim (output of to_out)
+    out_dim    = attn.to_out[0].out_features     # query_dim (output of to_out)
     _compressor = None
     if compress_config is not None and compress_config.enabled:
         _compressor = TPCompressor(
@@ -200,26 +167,11 @@ def apply_tp_to_ltxav_cross_attention(
             layer_id=block_idx * 10,  # unique per block, sub_idx=0 for attn out
             device=attn.to_out[0].weight.device,
         )
-    new_to_out = TPLinear(
-        inner_dim, out_dim, bias=attn.to_out[0].bias is not None, parallelism="row",
-        input_is_parallel=True, reduce_results=True, tp_group=tp_group,
-        dtype=attn.to_out[0].weight.dtype,
-        device="meta" if structure_only else attn.to_out[0].weight.device,
-        compressor=_compressor,
+    new_to_out = make_tp_linear(
+        attn.to_out[0], parallelism="row", tp_group=tp_group,
+        input_is_parallel=True, reduce_results=True,
+        structure_only=structure_only, compressor=_compressor,
     )
-    if not structure_only:
-        new_to_out.weight_loader(new_to_out.weight, attn.to_out[0].weight.data)
-        if attn.to_out[0].bias is not None and new_to_out.bias is not None:
-            new_to_out.bias.data.copy_(attn.to_out[0].bias.data)
-            
-        if hasattr(attn.to_out[0], "lora_A"): new_to_out.lora_A = attn.to_out[0].lora_A
-        if hasattr(attn.to_out[0], "lora_B"): new_to_out.lora_B = attn.to_out[0].lora_B
-        if hasattr(attn.to_out[0], "lora_alpha"): new_to_out.lora_alpha = attn.to_out[0].lora_alpha
-
-        if hasattr(attn.to_out[0], "weight_scale"):
-            new_to_out.weight_scale = attn.to_out[0].weight_scale
-        if hasattr(attn.to_out[0], "scale"):
-            new_to_out.scale = attn.to_out[0].scale
 
     attn.to_out[0] = new_to_out
 
@@ -230,24 +182,10 @@ def apply_tp_to_ltxav_cross_attention(
 
     # Gate logic handling
     if attn.to_gate_logits is not None:
-        gate_bias = attn.to_gate_logits.bias is not None
-        # Using column parallel without output gather to correctly shard gates
-        new_to_gate = TPLinear(
-            query_dim, attn.heads, bias=gate_bias, parallelism="column",
-            gather_output=False, tp_group=tp_group,
-            dtype=attn.to_gate_logits.weight.dtype,
-            device="meta" if structure_only else attn.to_gate_logits.weight.device,
+        new_to_gate = make_tp_linear(
+            attn.to_gate_logits, parallelism="column", gather_output=False,
+            tp_group=tp_group, structure_only=structure_only,
         )
-        if not structure_only:
-            new_to_gate.weight_loader(new_to_gate.weight, attn.to_gate_logits.weight.data)
-            if gate_bias:
-                new_to_gate.weight_loader(new_to_gate.bias, attn.to_gate_logits.bias.data)
-            
-            if hasattr(attn.to_gate_logits, "weight_scale"):
-                new_to_gate.weight_scale = attn.to_gate_logits.weight_scale
-            if hasattr(attn.to_gate_logits, "scale"):
-                new_to_gate.scale = attn.to_gate_logits.scale
-            
         attn.to_gate_logits = new_to_gate
 
     # 5. Replace forward with a TP-aware version
@@ -315,31 +253,15 @@ def apply_tp_to_ltxav_feedforward(
     proj_in  = ff.net[0].proj   # GELU_approx.proj: Linear(dim → inner_dim)
     proj_out = ff.net[2]        # Linear(inner_dim → dim_out)
 
-    dim      = proj_in.weight.shape[1]
-    inner_dim = proj_in.weight.shape[0]
-    dim_out  = proj_out.weight.shape[0]
+    dim      = proj_in.in_features
+    inner_dim = proj_in.out_features
+    dim_out  = proj_out.out_features
 
     # Replace IN projection
-    new_in = TPLinear(
-        dim, inner_dim, bias=proj_in.bias is not None, parallelism="column",
-        gather_output=False, tp_group=tp_group,
-        dtype=proj_in.weight.dtype,
-        device="meta" if structure_only else proj_in.weight.device,
+    new_in = make_tp_linear(
+        proj_in, parallelism="column", gather_output=False,
+        tp_group=tp_group, structure_only=structure_only,
     )
-    if not structure_only:
-        new_in.weight_loader(new_in.weight, proj_in.weight.data)
-        if proj_in.bias is not None:
-            new_in.weight_loader(new_in.bias, proj_in.bias.data)
-            
-        if hasattr(proj_in, "lora_A"): new_in.lora_A = proj_in.lora_A
-        if hasattr(proj_in, "lora_B"): new_in.lora_B = proj_in.lora_B
-        if hasattr(proj_in, "lora_alpha"): new_in.lora_alpha = proj_in.lora_alpha
-        
-        if hasattr(proj_in, "weight_scale"):
-            new_in.weight_scale = proj_in.weight_scale
-        if hasattr(proj_in, "scale"):
-            new_in.scale = proj_in.scale
-        
     ff.net[0].proj = new_in
 
     # Replace OUT projection
@@ -351,27 +273,11 @@ def apply_tp_to_ltxav_feedforward(
             layer_id=block_idx * 10 + 1,  # sub_idx=1 for ffn out
             device=proj_out.weight.device,
         )
-    new_out = TPLinear(
-        inner_dim, dim_out, bias=proj_out.bias is not None, parallelism="row",
-        input_is_parallel=True, reduce_results=True, tp_group=tp_group,
-        dtype=proj_out.weight.dtype,
-        device="meta" if structure_only else proj_out.weight.device,
-        compressor=_compressor,
+    new_out = make_tp_linear(
+        proj_out, parallelism="row", tp_group=tp_group,
+        input_is_parallel=True, reduce_results=True,
+        structure_only=structure_only, compressor=_compressor,
     )
-    if not structure_only:
-        new_out.weight_loader(new_out.weight, proj_out.weight.data)
-        if proj_out.bias is not None and new_out.bias is not None:
-            new_out.bias.data.copy_(proj_out.bias.data)
-            
-        if hasattr(proj_out, "lora_A"): new_out.lora_A = proj_out.lora_A
-        if hasattr(proj_out, "lora_B"): new_out.lora_B = proj_out.lora_B
-        if hasattr(proj_out, "lora_alpha"): new_out.lora_alpha = proj_out.lora_alpha
-        
-        if hasattr(proj_out, "weight_scale"):
-            new_out.weight_scale = proj_out.weight_scale
-        if hasattr(proj_out, "scale"):
-            new_out.scale = proj_out.scale
-        
     ff.net[2] = new_out
 
 
@@ -441,31 +347,13 @@ def apply_tp_to_ltxav_model(model: nn.Module, tp_group=None, compress_config: TP
         if not hasattr(parent, attr) or getattr(parent, attr) is None:
             return
         lin = getattr(parent, attr)
-        in_f, out_f = lin.weight.shape[1], lin.weight.shape[0]
-        has_bias = lin.bias is not None
-        
+
         # We use gather_output=True for boundary layers to keep activations 
         # replicated between the blocks and the model boundaries.
-        new_lin = TPLinear(
-            in_f, out_f, bias=has_bias, parallelism="column",
-            gather_output=True, tp_group=tp_group,
-            dtype=lin.weight.dtype,
-            device="meta" if structure_only else lin.weight.device,
+        new_lin = make_tp_linear(
+            lin, parallelism="column", gather_output=True,
+            tp_group=tp_group, structure_only=structure_only,
         )
-        if not structure_only:
-            new_lin.weight_loader(new_lin.weight, lin.weight.data)
-            if has_bias:
-                new_lin.weight_loader(new_lin.bias, lin.bias.data)
-            
-            if hasattr(lin, "lora_A"): new_lin.lora_A = lin.lora_A
-            if hasattr(lin, "lora_B"): new_lin.lora_B = lin.lora_B
-            if hasattr(lin, "lora_alpha"): new_lin.lora_alpha = lin.lora_alpha
-            
-            if hasattr(lin, "weight_scale"):
-                new_lin.weight_scale = lin.weight_scale
-            if hasattr(lin, "scale"):
-                new_lin.scale = lin.scale
-            
         setattr(parent, attr, new_lin)
 
     def _patch_adaln(parent, attr):

@@ -52,15 +52,20 @@ def _replace_linear(
     tp_group: Optional[dist.ProcessGroup] = None,
     structure_only: bool = False,
 ) -> None:
-    """Replace ``parent.<attr_name>`` (an ``nn.Linear``) with a ``TPLinear``.
+    """Replace ``parent.<attr_name>`` (an ``nn.Linear``) with a TP variant.
 
     Supports sequential-style indexed access (``parent[idx]``) when
     *attr_name* is a digit string and *parent* is an ``nn.Sequential``.
 
-    When *structure_only* is True, the TPLinear is created with the correct
-    shape but ``weight_loader()`` is NOT called — weights are left
-    uninitialised for later streaming population by TPContext.
+    Automatically selects ``TPGGMLLinear`` for GGML-quantised weights
+    (preserving quantisation in VRAM) or ``TPLinear`` otherwise.
+
+    When *structure_only* is True, a ``TPLinear`` with meta-device weights
+    is created regardless — weights are left uninitialised for later
+    streaming population by TPContext.
     """
+    from raylight.distributed_modules.tp_linear_factory import make_tp_linear
+
     if attr_name.isdigit():
         linear = parent[int(attr_name)]  # type: ignore
     else:
@@ -69,38 +74,13 @@ def _replace_linear(
     if not isinstance(linear, nn.Linear):
         return  # nothing to replace
 
-    tp_lin = TPLinear(
-        in_features=linear.in_features,
-        out_features=linear.out_features,
-        bias=linear.bias is not None,
+    tp_lin = make_tp_linear(
+        linear,
         parallelism=parallelism,
         gather_output=gather_output,
         tp_group=tp_group,
-        dtype=linear.weight.dtype,
-        device="meta" if structure_only else linear.weight.device,
+        structure_only=structure_only,
     )
-
-    if not structure_only:
-        # Copy existing weights into the TP shard.  When the model has already
-        # been loaded (pure-TP path) the old nn.Linear holds the full checkpoint
-        # tensor; weight_loader() slices this rank's shard via narrow().
-        tp_lin.weight_loader(tp_lin.weight, linear.weight.data)
-        if linear.bias is not None and tp_lin.bias is not None:
-            if parallelism == "column":
-                tp_lin.weight_loader(tp_lin.bias, linear.bias.data)
-            else:
-                tp_lin.bias.data.copy_(linear.bias.data)
-
-    # Preserve INT8 quantization scale (sharded to match weight)
-    if not structure_only and hasattr(linear, "weight_scale"):
-        scale = linear.weight_scale
-        if isinstance(scale, torch.Tensor):
-            if parallelism == "column" and scale.numel() > tp_lin.local_out_features:
-                tp_rank = tp_lin._tp_rank
-                scale = scale.narrow(0, tp_rank * tp_lin.local_out_features, tp_lin.local_out_features)
-            tp_lin.register_buffer("weight_scale", scale)
-        else:
-            tp_lin.weight_scale = scale
 
     if attr_name.isdigit():
         parent[int(attr_name)] = tp_lin  # type: ignore
