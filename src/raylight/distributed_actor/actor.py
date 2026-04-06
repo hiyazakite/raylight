@@ -372,9 +372,19 @@ class RayActor:
         if hasattr(self, "model") and self.model is not None:
             from raylight.comfy_dist.tp_registry import TPRegistry
             if TPRegistry.has_handler(self.model):
+                from raylight.distributed_modules.tp_compress import TPCompressConfig
+                _strategy = self.raylight_config.strategy
+                _compress_config = TPCompressConfig(
+                    mode=_strategy.tp_allreduce_compress,
+                    bits=_strategy.tp_compress_bits,
+                    group_size=_strategy.tp_compress_group_size,
+                    use_residual=_strategy.tp_compress_residual,
+                    rotation=_strategy.tp_compress_rotation,
+                )
                 TPRegistry.apply(
                     self.model,
                     tp_group=TensorParallelState.get_group(),
+                    compress_config=_compress_config,
                 )
 
 
@@ -574,19 +584,6 @@ class RayActor:
         
         # FUNCTIONAL LOAD: Update references from return values
         self.model = ctx.load(state, self.config, self.state_cache)
-
-        # ── TP patching: replace nn.Linear with TPLinear ──
-        # Must happen after model weights are loaded (so _replace_linear can
-        # copy existing weights into each rank's TP shard) and before any
-        # FSDP wrapping (which would shard the parameters further).
-        if self.raylight_config.strategy.is_tp and self.model is not None:
-            from raylight.distributed_modules.tensor_parallel import TensorParallelState
-            from raylight.comfy_dist.tp_registry import TPRegistry
-            if TPRegistry.has_handler(self.model):
-                TPRegistry.apply(
-                    self.model,
-                    tp_group=TensorParallelState.get_group(),
-                )
 
         # Stamp user VRAM limit on model for hot_load budget calculation
         vram_limit = self.config.vram_limit_bytes

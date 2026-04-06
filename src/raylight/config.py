@@ -69,6 +69,13 @@ class ExecutionStrategy:
     attention_type: RaylightAttnType = RaylightAttnType.TORCH
     ring_impl: str = "basic"              # "basic" or "zigzag"
 
+    # TP Communication Compression
+    tp_allreduce_compress: str = "none"    # "none" | "fp8" | "turboquant"
+    tp_compress_bits: int = 4              # 2 | 4  (bit-width for turboquant)
+    tp_compress_group_size: int = 64       # must divide hidden_dim
+    tp_compress_residual: bool = False     # step-to-step residual caching (Phase 2)
+    tp_compress_rotation: str = "signperm" # "signperm" | "wht" (Phase 3)
+
     @property
     def is_fsdp(self) -> bool:
         """True when Fully Sharded Data Parallelism is active."""
@@ -153,11 +160,13 @@ class DeviceConfig:
         gpu_indices: Specific CUDA device indices to use.
         vram_limit_gb: Soft memory limit to prevent OOM.
         use_mmap: Use memory-mapped files for model weights.
+        zero_ram: Stream weights directly from NVMe to VRAM with no RAM build-up.
     """
     world_size: int = field(default_factory=_get_default_world_size)
     gpu_indices: List[int] = field(default_factory=list)
     vram_limit_gb: float = 0.0
     use_mmap: bool = True
+    zero_ram: bool = False
 
 @dataclass(frozen=True)
 class DebugConfig:

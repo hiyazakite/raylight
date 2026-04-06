@@ -12,6 +12,7 @@ from ._base import (                  # noqa: F401
 from .gguf import GGUFContext          # noqa: F401
 from .lazy_tensor import LazyTensorContext  # noqa: F401
 from .fsdp import FSDPContext          # noqa: F401
+from .tp import TPContext              # noqa: F401
 from .vae import VAEContext            # noqa: F401
 from .bnb import BNBContext            # noqa: F401
 
@@ -49,6 +50,15 @@ def get_context(
                 "Please use a standard Safetensors model or disable FSDP/Context Parallel to use GGUF."
             )
         return FSDPContext(use_mmap=use_mmap)
+
+    if getattr(config, "is_tp", False):
+        if path.lower().endswith(".gguf"):
+            raise ValueError(
+                "[Raylight] TP is not supported for GGUF models. "
+                "Please use a standard Safetensors model or disable TP to use GGUF."
+            )
+        zero_ram = getattr(config, "zero_ram", False)
+        return TPContext(use_mmap=use_mmap, zero_ram=zero_ram)
 
     if path.lower().endswith(".gguf"):
         return GGUFContext(use_mmap=use_mmap)

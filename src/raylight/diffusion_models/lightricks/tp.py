@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import types
@@ -29,19 +31,7 @@ from raylight.distributed_modules.tensor_parallel import (
     TensorParallelState,
     get_tp_group,
 )
-
-
-def tp_rms_norm(x, full_dim, tp_group, eps=1e-6):
-    """Distributed-aware RMSNorm."""
-    # x: [..., local_D]
-    # Sum squares locally
-    local_sumsq = x.float().pow(2).sum(dim=-1, keepdim=True)
-    # All-reduce to get global sum squares
-    import torch.distributed as dist
-    dist.all_reduce(local_sumsq, op=dist.ReduceOp.SUM, group=tp_group)
-    # Variance is global sum squares / full_dim
-    var = local_sumsq / float(full_dim)
-    return (x.float() * torch.rsqrt(var + eps)).to(x.dtype)
+from raylight.distributed_modules.tp_compress import TPCompressor, TPCompressConfig
 
 
 def _slice_rope_for_tp(
@@ -104,6 +94,9 @@ def _slice_rope_for_tp(
 def apply_tp_to_ltxav_cross_attention(
     attn: CrossAttention,
     tp_group=None,
+    compress_config: TPCompressConfig | None = None,
+    block_idx: int = 0,
+    structure_only: bool = False,
 ) -> None:
     """
     In-place TP patching of a CrossAttention module for LTXAV.
@@ -118,7 +111,6 @@ def apply_tp_to_ltxav_cross_attention(
     query_dim  = attn.to_q.weight.shape[1]   # in_features
     inner_dim  = attn.to_q.weight.shape[0]   # out_features = heads * dim_head
     context_dim = attn.to_k.weight.shape[1]
-    out_dim    = attn.to_out[0].weight.shape[0]  # query_dim (output of to_out)
 
     local_inner_dim = inner_dim // tp_size
     local_heads = attn.heads // tp_size
@@ -126,46 +118,51 @@ def apply_tp_to_ltxav_cross_attention(
     # 1. Replace QKV projections
     new_to_q = TPLinear(
         query_dim, inner_dim, bias=attn.to_q.bias is not None, parallelism="column",
-        gather_output=False, tp_group=tp_group, dtype=attn.to_q.weight.dtype, device=attn.to_q.weight.device
+        gather_output=False, tp_group=tp_group, dtype=attn.to_q.weight.dtype,
+        device="meta" if structure_only else attn.to_q.weight.device
     )
     new_to_k = TPLinear(
         context_dim, inner_dim, bias=attn.to_k.bias is not None, parallelism="column",
-        gather_output=False, tp_group=tp_group, dtype=attn.to_k.weight.dtype, device=attn.to_k.weight.device
+        gather_output=False, tp_group=tp_group, dtype=attn.to_k.weight.dtype,
+        device="meta" if structure_only else attn.to_k.weight.device
     )
     new_to_v = TPLinear(
         context_dim, inner_dim, bias=attn.to_v.bias is not None, parallelism="column",
-        gather_output=False, tp_group=tp_group, dtype=attn.to_v.weight.dtype, device=attn.to_v.weight.device
+        gather_output=False, tp_group=tp_group, dtype=attn.to_v.weight.dtype,
+        device="meta" if structure_only else attn.to_v.weight.device
     )
 
-    new_to_q.weight_loader(new_to_q.weight, attn.to_q.weight.data)
-    if attn.to_q.bias is not None:
-        new_to_q.weight_loader(new_to_q.bias, attn.to_q.bias.data)
-        
-    new_to_k.weight_loader(new_to_k.weight, attn.to_k.weight.data)
-    if attn.to_k.bias is not None:
-        new_to_k.weight_loader(new_to_k.bias, attn.to_k.bias.data)
-        
-    new_to_v.weight_loader(new_to_v.weight, attn.to_v.weight.data)
-    if attn.to_v.bias is not None:
-        new_to_v.weight_loader(new_to_v.bias, attn.to_v.bias.data)
+    if not structure_only:
+        new_to_q.weight_loader(new_to_q.weight, attn.to_q.weight.data)
+        if attn.to_q.bias is not None:
+            new_to_q.weight_loader(new_to_q.bias, attn.to_q.bias.data)
+            
+        new_to_k.weight_loader(new_to_k.weight, attn.to_k.weight.data)
+        if attn.to_k.bias is not None:
+            new_to_k.weight_loader(new_to_k.bias, attn.to_k.bias.data)
+            
+        new_to_v.weight_loader(new_to_v.weight, attn.to_v.weight.data)
+        if attn.to_v.bias is not None:
+            new_to_v.weight_loader(new_to_v.bias, attn.to_v.bias.data)
 
-    # Lora copying for QKV
-    if hasattr(attn.to_q, "lora_A"): new_to_q.lora_A = attn.to_q.lora_A
-    if hasattr(attn.to_q, "lora_B"): new_to_q.lora_B = attn.to_q.lora_B
-    if hasattr(attn.to_q, "lora_alpha"): new_to_q.lora_alpha = attn.to_q.lora_alpha
-    if hasattr(attn.to_k, "lora_A"): new_to_k.lora_A = attn.to_k.lora_A
-    if hasattr(attn.to_k, "lora_B"): new_to_k.lora_B = attn.to_k.lora_B
-    if hasattr(attn.to_k, "lora_alpha"): new_to_k.lora_alpha = attn.to_k.lora_alpha
-    if hasattr(attn.to_v, "lora_A"): new_to_v.lora_A = attn.to_v.lora_A
-    if hasattr(attn.to_v, "lora_B"): new_to_v.lora_B = attn.to_v.lora_B
-    if hasattr(attn.to_v, "lora_alpha"): new_to_v.lora_alpha = attn.to_v.lora_alpha
+    if not structure_only:
+        # Lora copying for QKV
+        if hasattr(attn.to_q, "lora_A"): new_to_q.lora_A = attn.to_q.lora_A
+        if hasattr(attn.to_q, "lora_B"): new_to_q.lora_B = attn.to_q.lora_B
+        if hasattr(attn.to_q, "lora_alpha"): new_to_q.lora_alpha = attn.to_q.lora_alpha
+        if hasattr(attn.to_k, "lora_A"): new_to_k.lora_A = attn.to_k.lora_A
+        if hasattr(attn.to_k, "lora_B"): new_to_k.lora_B = attn.to_k.lora_B
+        if hasattr(attn.to_k, "lora_alpha"): new_to_k.lora_alpha = attn.to_k.lora_alpha
+        if hasattr(attn.to_v, "lora_A"): new_to_v.lora_A = attn.to_v.lora_A
+        if hasattr(attn.to_v, "lora_B"): new_to_v.lora_B = attn.to_v.lora_B
+        if hasattr(attn.to_v, "lora_alpha"): new_to_v.lora_alpha = attn.to_v.lora_alpha
 
-    # INT8 Support: preserve and shard weight scales
-    for old_m, new_m in [(attn.to_q, new_to_q), (attn.to_k, new_to_k), (attn.to_v, new_to_v)]:
-        if hasattr(old_m, "weight_scale"):
-            new_m.weight_scale = old_m.weight_scale
-        if hasattr(old_m, "scale"):
-            new_m.scale = old_m.scale
+        # INT8 Support: preserve and shard weight scales
+        for old_m, new_m in [(attn.to_q, new_to_q), (attn.to_k, new_to_k), (attn.to_v, new_to_v)]:
+            if hasattr(old_m, "weight_scale"):
+                new_m.weight_scale = old_m.weight_scale
+            if hasattr(old_m, "scale"):
+                new_m.scale = old_m.scale
 
     attn.to_q = new_to_q
     attn.to_k = new_to_k
@@ -186,30 +183,43 @@ def apply_tp_to_ltxav_cross_attention(
     )
     
     # QK Norm parameter loading (not sharded inherently in weight loader but internally handles local vs full)
-    new_q_norm.weight_loader(new_q_norm.weight, attn.q_norm.weight.data)
-    new_k_norm.weight_loader(new_k_norm.weight, attn.k_norm.weight.data)
+    if not structure_only:
+        new_q_norm.weight_loader(new_q_norm.weight, attn.q_norm.weight.data)
+        new_k_norm.weight_loader(new_k_norm.weight, attn.k_norm.weight.data)
 
     attn.q_norm = new_q_norm
     attn.k_norm = new_k_norm
 
     # 3. Replace output projection
+    out_dim    = attn.to_out[0].weight.shape[0]  # query_dim (output of to_out)
+    _compressor = None
+    if compress_config is not None and compress_config.enabled:
+        _compressor = TPCompressor(
+            config=compress_config,
+            hidden_dim=out_dim,
+            layer_id=block_idx * 10,  # unique per block, sub_idx=0 for attn out
+            device=attn.to_out[0].weight.device,
+        )
     new_to_out = TPLinear(
         inner_dim, out_dim, bias=attn.to_out[0].bias is not None, parallelism="row",
         input_is_parallel=True, reduce_results=True, tp_group=tp_group,
-        dtype=attn.to_out[0].weight.dtype, device=attn.to_out[0].weight.device
+        dtype=attn.to_out[0].weight.dtype,
+        device="meta" if structure_only else attn.to_out[0].weight.device,
+        compressor=_compressor,
     )
-    new_to_out.weight_loader(new_to_out.weight, attn.to_out[0].weight.data)
-    if attn.to_out[0].bias is not None and new_to_out.bias is not None:
-        new_to_out.bias.data.copy_(attn.to_out[0].bias.data)
-        
-    if hasattr(attn.to_out[0], "lora_A"): new_to_out.lora_A = attn.to_out[0].lora_A
-    if hasattr(attn.to_out[0], "lora_B"): new_to_out.lora_B = attn.to_out[0].lora_B
-    if hasattr(attn.to_out[0], "lora_alpha"): new_to_out.lora_alpha = attn.to_out[0].lora_alpha
+    if not structure_only:
+        new_to_out.weight_loader(new_to_out.weight, attn.to_out[0].weight.data)
+        if attn.to_out[0].bias is not None and new_to_out.bias is not None:
+            new_to_out.bias.data.copy_(attn.to_out[0].bias.data)
+            
+        if hasattr(attn.to_out[0], "lora_A"): new_to_out.lora_A = attn.to_out[0].lora_A
+        if hasattr(attn.to_out[0], "lora_B"): new_to_out.lora_B = attn.to_out[0].lora_B
+        if hasattr(attn.to_out[0], "lora_alpha"): new_to_out.lora_alpha = attn.to_out[0].lora_alpha
 
-    if hasattr(attn.to_out[0], "weight_scale"):
-        new_to_out.weight_scale = attn.to_out[0].weight_scale
-    if hasattr(attn.to_out[0], "scale"):
-        new_to_out.scale = attn.to_out[0].scale
+        if hasattr(attn.to_out[0], "weight_scale"):
+            new_to_out.weight_scale = attn.to_out[0].weight_scale
+        if hasattr(attn.to_out[0], "scale"):
+            new_to_out.scale = attn.to_out[0].scale
 
     attn.to_out[0] = new_to_out
 
@@ -225,16 +235,18 @@ def apply_tp_to_ltxav_cross_attention(
         new_to_gate = TPLinear(
             query_dim, attn.heads, bias=gate_bias, parallelism="column",
             gather_output=False, tp_group=tp_group,
-            dtype=attn.to_gate_logits.weight.dtype, device=attn.to_gate_logits.weight.device
+            dtype=attn.to_gate_logits.weight.dtype,
+            device="meta" if structure_only else attn.to_gate_logits.weight.device,
         )
-        new_to_gate.weight_loader(new_to_gate.weight, attn.to_gate_logits.weight.data)
-        if gate_bias:
-            new_to_gate.weight_loader(new_to_gate.bias, attn.to_gate_logits.bias.data)
-        
-        if hasattr(attn.to_gate_logits, "weight_scale"):
-            new_to_gate.weight_scale = attn.to_gate_logits.weight_scale
-        if hasattr(attn.to_gate_logits, "scale"):
-            new_to_gate.scale = attn.to_gate_logits.scale
+        if not structure_only:
+            new_to_gate.weight_loader(new_to_gate.weight, attn.to_gate_logits.weight.data)
+            if gate_bias:
+                new_to_gate.weight_loader(new_to_gate.bias, attn.to_gate_logits.bias.data)
+            
+            if hasattr(attn.to_gate_logits, "weight_scale"):
+                new_to_gate.weight_scale = attn.to_gate_logits.weight_scale
+            if hasattr(attn.to_gate_logits, "scale"):
+                new_to_gate.scale = attn.to_gate_logits.scale
             
         attn.to_gate_logits = new_to_gate
 
@@ -289,59 +301,10 @@ def apply_tp_to_ltxav_cross_attention(
     attn.forward = types.MethodType(_tp_forward, attn)
 
 
-def _patch_block_forward_for_tp(block, tp_group):
-    """
-    Monkey-patch the block's forward to use distributed-aware rms_norm.
-    """
-    import comfy.ldm.common_dit
-    
-    # We create a local scope version of rms_norm that uses the tp_group
-    # Since we can't easily find every local reference, we replace the block's 
-    # reference to the module's function if possible, or patch the forward logic.
-    
-    # Context discovery to handle both LTXV and LTXAV blocks
-    is_av = hasattr(block, "audio_attn1")
-    
-    def _tp_rms_norm_wrapper(x, full_dim_override=None):
-        # Infer full dimension from x and tp_size
-        tp_size = TensorParallelState.get_size()
-        f_dim = full_dim_override or (x.shape[-1] * tp_size)
-        return tp_rms_norm(x, f_dim, tp_group)
-
-    if is_av:
-        # For BasicAVTransformerBlock
-        original_forward = block.forward
-        
-        @torch.compiler.disable
-        def _tp_av_forward(self, *args, **kwargs):
-            # Temporarily shadow rms_norm in the global scope of the function? 
-            # Riskier than just rewriting the calls.
-            # But the AV block uses it many times. Let's redirect it.
-            import comfy.ldm.common_dit
-            old_rms = comfy.ldm.common_dit.rms_norm
-            comfy.ldm.common_dit.rms_norm = _tp_rms_norm_wrapper
-            try:
-                return original_forward(*args, **kwargs)
-            finally:
-                comfy.ldm.common_dit.rms_norm = old_rms
-                
-        block.forward = types.MethodType(_tp_av_forward, block)
-    else:
-        # For standard BasicTransformerBlock
-        original_forward = block.forward
-        @torch.compiler.disable
-        def _tp_v_forward(self, *args, **kwargs):
-            import comfy.ldm.common_dit
-            old_rms = comfy.ldm.common_dit.rms_norm
-            comfy.ldm.common_dit.rms_norm = _tp_rms_norm_wrapper
-            try:
-                return original_forward(*args, **kwargs)
-            finally:
-                comfy.ldm.common_dit.rms_norm = old_rms
-        block.forward = types.MethodType(_tp_v_forward, block)
-
-
-def apply_tp_to_ltxav_feedforward(ff, tp_group=None) -> None:
+def apply_tp_to_ltxav_feedforward(
+    ff, tp_group=None, compress_config: TPCompressConfig | None = None, block_idx: int = 0,
+    structure_only: bool = False,
+) -> None:
     """
     In-place TP patching of a FeedForward module (ComfyUI LTXAV variant).
     """
@@ -360,49 +323,68 @@ def apply_tp_to_ltxav_feedforward(ff, tp_group=None) -> None:
     new_in = TPLinear(
         dim, inner_dim, bias=proj_in.bias is not None, parallelism="column",
         gather_output=False, tp_group=tp_group,
-        dtype=proj_in.weight.dtype, device=proj_in.weight.device
+        dtype=proj_in.weight.dtype,
+        device="meta" if structure_only else proj_in.weight.device,
     )
-    new_in.weight_loader(new_in.weight, proj_in.weight.data)
-    if proj_in.bias is not None:
-        new_in.weight_loader(new_in.bias, proj_in.bias.data)
+    if not structure_only:
+        new_in.weight_loader(new_in.weight, proj_in.weight.data)
+        if proj_in.bias is not None:
+            new_in.weight_loader(new_in.bias, proj_in.bias.data)
+            
+        if hasattr(proj_in, "lora_A"): new_in.lora_A = proj_in.lora_A
+        if hasattr(proj_in, "lora_B"): new_in.lora_B = proj_in.lora_B
+        if hasattr(proj_in, "lora_alpha"): new_in.lora_alpha = proj_in.lora_alpha
         
-    if hasattr(proj_in, "lora_A"): new_in.lora_A = proj_in.lora_A
-    if hasattr(proj_in, "lora_B"): new_in.lora_B = proj_in.lora_B
-    if hasattr(proj_in, "lora_alpha"): new_in.lora_alpha = proj_in.lora_alpha
-    
-    if hasattr(proj_in, "weight_scale"):
-        new_in.weight_scale = proj_in.weight_scale
-    if hasattr(proj_in, "scale"):
-        new_in.scale = proj_in.scale
+        if hasattr(proj_in, "weight_scale"):
+            new_in.weight_scale = proj_in.weight_scale
+        if hasattr(proj_in, "scale"):
+            new_in.scale = proj_in.scale
         
     ff.net[0].proj = new_in
 
     # Replace OUT projection
+    _compressor = None
+    if compress_config is not None and compress_config.enabled:
+        _compressor = TPCompressor(
+            config=compress_config,
+            hidden_dim=dim_out,
+            layer_id=block_idx * 10 + 1,  # sub_idx=1 for ffn out
+            device=proj_out.weight.device,
+        )
     new_out = TPLinear(
         inner_dim, dim_out, bias=proj_out.bias is not None, parallelism="row",
         input_is_parallel=True, reduce_results=True, tp_group=tp_group,
-        dtype=proj_out.weight.dtype, device=proj_out.weight.device
+        dtype=proj_out.weight.dtype,
+        device="meta" if structure_only else proj_out.weight.device,
+        compressor=_compressor,
     )
-    new_out.weight_loader(new_out.weight, proj_out.weight.data)
-    if proj_out.bias is not None and new_out.bias is not None:
-        new_out.bias.data.copy_(proj_out.bias.data)
+    if not structure_only:
+        new_out.weight_loader(new_out.weight, proj_out.weight.data)
+        if proj_out.bias is not None and new_out.bias is not None:
+            new_out.bias.data.copy_(proj_out.bias.data)
+            
+        if hasattr(proj_out, "lora_A"): new_out.lora_A = proj_out.lora_A
+        if hasattr(proj_out, "lora_B"): new_out.lora_B = proj_out.lora_B
+        if hasattr(proj_out, "lora_alpha"): new_out.lora_alpha = proj_out.lora_alpha
         
-    if hasattr(proj_out, "lora_A"): new_out.lora_A = proj_out.lora_A
-    if hasattr(proj_out, "lora_B"): new_out.lora_B = proj_out.lora_B
-    if hasattr(proj_out, "lora_alpha"): new_out.lora_alpha = proj_out.lora_alpha
-    
-    if hasattr(proj_out, "weight_scale"):
-        new_out.weight_scale = proj_out.weight_scale
-    if hasattr(proj_out, "scale"):
-        new_out.scale = proj_out.scale
+        if hasattr(proj_out, "weight_scale"):
+            new_out.weight_scale = proj_out.weight_scale
+        if hasattr(proj_out, "scale"):
+            new_out.scale = proj_out.scale
         
     ff.net[2] = new_out
 
 
-def apply_tp_to_ltxav_block(block, tp_group=None) -> None:
+def apply_tp_to_ltxav_block(
+    block, tp_group=None, compress_config: TPCompressConfig | None = None, block_idx: int = 0,
+    structure_only: bool = False,
+) -> None:
     """
     Patch all attention and FFN submodules of one BasicAVTransformerBlock.
     """
+    # Each attention sub-module within a block gets a unique sub_idx offset
+    # via the attn_sub_offset so layer_ids don't collide.
+    attn_sub_offset = 0
     for attn_attr in (
         "attn1",              # video self-attn
         "audio_attn1",        # audio self-attn
@@ -412,19 +394,42 @@ def apply_tp_to_ltxav_block(block, tp_group=None) -> None:
         "video_to_audio_attn",  # V2A (Q=audio, K/V=video)
     ):
         if hasattr(block, attn_attr):
-            apply_tp_to_ltxav_cross_attention(getattr(block, attn_attr), tp_group=tp_group)
+            apply_tp_to_ltxav_cross_attention(
+                getattr(block, attn_attr), tp_group=tp_group,
+                compress_config=compress_config,
+                block_idx=block_idx * 100 + attn_sub_offset,
+                structure_only=structure_only,
+            )
+            attn_sub_offset += 1
 
     if hasattr(block, "ff"):
-        apply_tp_to_ltxav_feedforward(block.ff, tp_group=tp_group)
+        apply_tp_to_ltxav_feedforward(
+            block.ff, tp_group=tp_group,
+            compress_config=compress_config, block_idx=block_idx * 100 + 50,
+            structure_only=structure_only,
+        )
     if hasattr(block, "audio_ff"):
-        apply_tp_to_ltxav_feedforward(block.audio_ff, tp_group=tp_group)
+        apply_tp_to_ltxav_feedforward(
+            block.audio_ff, tp_group=tp_group,
+            compress_config=compress_config, block_idx=block_idx * 100 + 51,
+            structure_only=structure_only,
+        )
 
     # Note: We keep AdaLN tables and block-level norms replicated because 
     # activations are gathered between blocks in this TP implementation.
     # This ensures stability and compatibility with torch.compile.
 
+    # Mark TP-patched blocks so _discover_compile_keys skips them.
+    # LTXAV block forwards use `del` between graph breaks, causing Dynamo
+    # resume-function guard invalidation (___stack0 deallocation) on every
+    # step — an upstream PyTorch limitation that prevents stable compilation.
+    # The funcol infrastructure in tensor_parallel.py is ready for when this
+    # is resolved upstream.
+    block._tp_patched = True
 
-def apply_tp_to_ltxav_model(model: nn.Module, tp_group=None) -> None:
+
+def apply_tp_to_ltxav_model(model: nn.Module, tp_group=None, compress_config: TPCompressConfig | None = None,
+                            structure_only: bool = False) -> None:
     """
     Full in-place TP patching of the LTXAV or LTXV model.
     """
@@ -444,20 +449,22 @@ def apply_tp_to_ltxav_model(model: nn.Module, tp_group=None) -> None:
         new_lin = TPLinear(
             in_f, out_f, bias=has_bias, parallelism="column",
             gather_output=True, tp_group=tp_group,
-            dtype=lin.weight.dtype, device=lin.weight.device
+            dtype=lin.weight.dtype,
+            device="meta" if structure_only else lin.weight.device,
         )
-        new_lin.weight_loader(new_lin.weight, lin.weight.data)
-        if has_bias:
-            new_lin.weight_loader(new_lin.bias, lin.bias.data)
-        
-        if hasattr(lin, "lora_A"): new_lin.lora_A = lin.lora_A
-        if hasattr(lin, "lora_B"): new_lin.lora_B = lin.lora_B
-        if hasattr(lin, "lora_alpha"): new_lin.lora_alpha = lin.lora_alpha
-        
-        if hasattr(lin, "weight_scale"):
-            new_lin.weight_scale = lin.weight_scale
-        if hasattr(lin, "scale"):
-            new_lin.scale = lin.scale
+        if not structure_only:
+            new_lin.weight_loader(new_lin.weight, lin.weight.data)
+            if has_bias:
+                new_lin.weight_loader(new_lin.bias, lin.bias.data)
+            
+            if hasattr(lin, "lora_A"): new_lin.lora_A = lin.lora_A
+            if hasattr(lin, "lora_B"): new_lin.lora_B = lin.lora_B
+            if hasattr(lin, "lora_alpha"): new_lin.lora_alpha = lin.lora_alpha
+            
+            if hasattr(lin, "weight_scale"):
+                new_lin.weight_scale = lin.weight_scale
+            if hasattr(lin, "scale"):
+                new_lin.scale = lin.scale
             
         setattr(parent, attr, new_lin)
 
@@ -492,8 +499,12 @@ def apply_tp_to_ltxav_model(model: nn.Module, tp_group=None) -> None:
     if hasattr(model, "transformer_blocks"):
         blocks = model.transformer_blocks
         if isinstance(blocks, nn.ModuleList):
-            for block in blocks:
-                apply_tp_to_ltxav_block(block, tp_group=tp_group)
+            for idx, block in enumerate(blocks):
+                apply_tp_to_ltxav_block(
+                    block, tp_group=tp_group,
+                    compress_config=compress_config, block_idx=idx,
+                    structure_only=structure_only,
+                )
 
     if LTXAVModel is not None and isinstance(model, LTXAVModel):
         def _tp_prepare_context(self, context, batch_size, x, attention_mask=None):

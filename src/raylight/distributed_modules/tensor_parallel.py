@@ -21,6 +21,15 @@ import torch.distributed as dist
 import torch.nn as nn
 
 try:
+    from torch.distributed._functional_collectives import (
+        all_reduce as funcol_all_reduce,
+        all_gather_tensor as funcol_all_gather,
+    )
+    _HAS_FUNCOL = True
+except ImportError:
+    _HAS_FUNCOL = False
+
+try:
     from raylight.comfy_extra_dist.int8.int8_quant import (  # type: ignore
         int8_forward_dynamic,
         int8_forward_dynamic_per_row,
@@ -199,9 +208,12 @@ def gather_tensor_along_dim(
             dim=dim,
         )
 
-    tensor_list = [torch.empty_like(tensor) for _ in range(num_splits)]
-    dist.all_gather(tensor_list, tensor.contiguous(), group=group)
-    result = torch.cat(tensor_list, dim=dim)
+    if _HAS_FUNCOL:
+        result = funcol_all_gather(tensor.contiguous(), dim, group)
+    else:
+        tensor_list = [torch.empty_like(tensor) for _ in range(num_splits)]
+        dist.all_gather(tensor_list, tensor.contiguous(), group=group)
+        result = torch.cat(tensor_list, dim=dim)
 
     # Trim trailing padding from the concatenated result.
     if full_size is not None and result.shape[dim] != full_size:
@@ -213,12 +225,14 @@ def gather_tensor_along_dim(
 
 
 def all_reduce_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    """In-place all-reduce *tensor* across the TP group."""
+    """All-reduce *tensor* across the TP group (compile-safe when possible)."""
     if get_tp_size() == 1:
         return tensor
     group = get_tp_group()
     if group is None:
         return tensor
+    if _HAS_FUNCOL:
+        return funcol_all_reduce(tensor, "sum", group)
     dist.all_reduce(tensor, group=group)
     return tensor
 
@@ -257,6 +271,7 @@ class TPLinear(nn.Module):
         tp_group: Optional[dist.ProcessGroup] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        compressor=None,
     ):
         super().__init__()
         self.in_features = in_features
@@ -266,6 +281,7 @@ class TPLinear(nn.Module):
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
         self._tp_group = tp_group
+        self.compressor = compressor
 
         # Resolve tp_size at construction to compute weight shapes.
         _tp_size = (
@@ -450,7 +466,10 @@ class TPLinear(nn.Module):
                 out = gather_tensor_along_dim(out, dim=-1, full_size=self.out_features)
         else:  # row
             if self.reduce_results and self._tp_size_runtime > 1:
-                out = all_reduce_tensor(out)
+                if self.compressor is not None:
+                    out = self.compressor.compressed_all_reduce(out, group=self._resolved_group)
+                else:
+                    out = all_reduce_tensor(out)
                 
         return out
 
@@ -498,7 +517,10 @@ class TPRMSNormAcrossHeads(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., local_hidden_size]
         local_sumsq = x.float().pow(2).sum(dim=-1, keepdim=True)
-        dist.all_reduce(local_sumsq, op=dist.ReduceOp.SUM, group=self._resolved_group)
+        if _HAS_FUNCOL:
+            local_sumsq = funcol_all_reduce(local_sumsq, "sum", self._resolved_group)
+        else:
+            dist.all_reduce(local_sumsq, op=dist.ReduceOp.SUM, group=self._resolved_group)
         var = local_sumsq / float(self.full_hidden_size)
         return (x.float() * torch.rsqrt(var + self.eps)).to(x.dtype) * self.weight
 

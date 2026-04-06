@@ -50,11 +50,16 @@ def _replace_linear(
     parallelism: Literal["column", "row"] = "column",
     gather_output: bool = True,
     tp_group: Optional[dist.ProcessGroup] = None,
+    structure_only: bool = False,
 ) -> None:
     """Replace ``parent.<attr_name>`` (an ``nn.Linear``) with a ``TPLinear``.
 
     Supports sequential-style indexed access (``parent[idx]``) when
     *attr_name* is a digit string and *parent* is an ``nn.Sequential``.
+
+    When *structure_only* is True, the TPLinear is created with the correct
+    shape but ``weight_loader()`` is NOT called — weights are left
+    uninitialised for later streaming population by TPContext.
     """
     if attr_name.isdigit():
         linear = parent[int(attr_name)]  # type: ignore
@@ -72,21 +77,22 @@ def _replace_linear(
         gather_output=gather_output,
         tp_group=tp_group,
         dtype=linear.weight.dtype,
-        device=linear.weight.device,
+        device="meta" if structure_only else linear.weight.device,
     )
 
-    # Copy existing weights into the TP shard.  When the model has already
-    # been loaded (pure-TP path) the old nn.Linear holds the full checkpoint
-    # tensor; weight_loader() slices this rank's shard via narrow().
-    tp_lin.weight_loader(tp_lin.weight, linear.weight.data)
-    if linear.bias is not None and tp_lin.bias is not None:
-        if parallelism == "column":
-            tp_lin.weight_loader(tp_lin.bias, linear.bias.data)
-        else:
-            tp_lin.bias.data.copy_(linear.bias.data)
+    if not structure_only:
+        # Copy existing weights into the TP shard.  When the model has already
+        # been loaded (pure-TP path) the old nn.Linear holds the full checkpoint
+        # tensor; weight_loader() slices this rank's shard via narrow().
+        tp_lin.weight_loader(tp_lin.weight, linear.weight.data)
+        if linear.bias is not None and tp_lin.bias is not None:
+            if parallelism == "column":
+                tp_lin.weight_loader(tp_lin.bias, linear.bias.data)
+            else:
+                tp_lin.bias.data.copy_(linear.bias.data)
 
     # Preserve INT8 quantization scale (sharded to match weight)
-    if hasattr(linear, "weight_scale"):
+    if not structure_only and hasattr(linear, "weight_scale"):
         scale = linear.weight_scale
         if isinstance(scale, torch.Tensor):
             if parallelism == "column" and scale.numel() > tp_lin.local_out_features:
@@ -105,6 +111,7 @@ def _replace_linear(
 def _replace_mlp_linears(
     mlp: nn.Module,
     tp_group: Optional[dist.ProcessGroup] = None,
+    structure_only: bool = False,
 ) -> None:
     """Replace all ``nn.Linear`` layers inside a Flux MLP module.
 
@@ -116,12 +123,12 @@ def _replace_mlp_linears(
     if isinstance(mlp, nn.Sequential):
         for idx, child in enumerate(mlp):
             if isinstance(child, nn.Linear):
-                _replace_linear(mlp, str(idx), tp_group=tp_group)
+                _replace_linear(mlp, str(idx), tp_group=tp_group, structure_only=structure_only)
     else:
         # YakMLP (or similar): replace named Linear children.
         for name in ("gate_proj", "up_proj", "down_proj"):
             if hasattr(mlp, name) and isinstance(getattr(mlp, name), nn.Linear):
-                _replace_linear(mlp, name, tp_group=tp_group)
+                _replace_linear(mlp, name, tp_group=tp_group, structure_only=structure_only)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +138,7 @@ def _replace_mlp_linears(
 def apply_tp_to_flux_double_block(
     block: nn.Module,
     tp_group: Optional[dist.ProcessGroup] = None,
+    structure_only: bool = False,
 ) -> None:
     """In-place TP patching of a Flux ``DoubleStreamBlock``.
 
@@ -144,15 +152,15 @@ def apply_tp_to_flux_double_block(
         attn = getattr(block, attn_name, None)
         if attn is None:
             continue
-        _replace_linear(attn, "qkv", tp_group=tp_group)
-        _replace_linear(attn, "proj", tp_group=tp_group)
+        _replace_linear(attn, "qkv", tp_group=tp_group, structure_only=structure_only)
+        _replace_linear(attn, "proj", tp_group=tp_group, structure_only=structure_only)
 
     # MLP (both streams)
     for mlp_name in ("img_mlp", "txt_mlp"):
         mlp = getattr(block, mlp_name, None)
         if mlp is None:
             continue
-        _replace_mlp_linears(mlp, tp_group=tp_group)
+        _replace_mlp_linears(mlp, tp_group=tp_group, structure_only=structure_only)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +170,7 @@ def apply_tp_to_flux_double_block(
 def apply_tp_to_flux_single_block(
     block: nn.Module,
     tp_group: Optional[dist.ProcessGroup] = None,
+    structure_only: bool = False,
 ) -> None:
     """In-place TP patching of a Flux ``SingleStreamBlock``.
 
@@ -170,8 +179,8 @@ def apply_tp_to_flux_single_block(
     ``gather_output=True`` so the split/concat logic in ``forward()``
     sees unchanged shapes.
     """
-    _replace_linear(block, "linear1", tp_group=tp_group)
-    _replace_linear(block, "linear2", tp_group=tp_group)
+    _replace_linear(block, "linear1", tp_group=tp_group, structure_only=structure_only)
+    _replace_linear(block, "linear2", tp_group=tp_group, structure_only=structure_only)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +190,7 @@ def apply_tp_to_flux_single_block(
 def apply_tp_to_flux_model(
     model: nn.Module,
     tp_group: Optional[dist.ProcessGroup] = None,
+    structure_only: bool = False,
 ) -> None:
     """Full in-place TP patching of the Flux diffusion model.
 
@@ -201,11 +211,11 @@ def apply_tp_to_flux_model(
 
     # Double-stream blocks
     for block in getattr(model, "double_blocks", []):
-        apply_tp_to_flux_double_block(block, tp_group=tp_group)
+        apply_tp_to_flux_double_block(block, tp_group=tp_group, structure_only=structure_only)
 
     # Single-stream blocks
     for block in getattr(model, "single_blocks", []):
-        apply_tp_to_flux_single_block(block, tp_group=tp_group)
+        apply_tp_to_flux_single_block(block, tp_group=tp_group, structure_only=structure_only)
 
 
 # ---------------------------------------------------------------------------

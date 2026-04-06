@@ -323,6 +323,27 @@ class RayInitializer:
                     "max": 8,
                     "tooltip": "Number of GPUs for Tensor Parallelism weight sharding (1 = disabled). Must divide GPU count evenly."
                 }),
+                "tp_compress": (
+                    ["none", "fp8", "turboquant"],
+                    {"default": "none",
+                     "tooltip": "TP all-reduce compression. 'turboquant' = rotation + quantization (4× reduction). 'fp8' = 2× reduction."}
+                ),
+                "tp_compress_bits": ("INT", {
+                    "default": 4,
+                    "min": 2,
+                    "max": 4,
+                    "step": 2,
+                    "tooltip": "TurboQuant quantization bits. 4 = recommended (quality ≈ FP8). 2 = aggressive (8× compression)."
+                }),
+                "tp_compress_residual": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Step-to-step delta compression. Caches previous step's result and only transmits the change. Adds ~7.5 GB VRAM per rank but greatly improves compression quality."
+                }),
+                "tp_compress_rotation": (
+                    ["signperm", "wht"],
+                    {"default": "signperm",
+                     "tooltip": "Rotation mode. 'signperm' = fast sign-flip + permutation. 'wht' = Walsh-Hadamard Transform (better quality at 2-bit, requires Triton)."}
+                ),
                 "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
@@ -394,6 +415,10 @@ class RayInitializer:
                     "default": True,
                     "tooltip": "Use memory-mapped (zero-copy) model loading."
                 }),
+                "zero_ram": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Stream weights directly from NVMe to VRAM with no RAM build-up. Offload frees CUDA memory entirely; reload re-streams from disk (~10-30s vs ~0.5s pinned). Best for systems with limited RAM."
+                }),
             }
         }
 
@@ -416,6 +441,10 @@ class RayInitializer:
         ring_degree: int = 1,
         cfg_degree: int = 1,
         tensor_parallel_degree: int = 1,
+        tp_compress: str = "none",
+        tp_compress_bits: int = 4,
+        tp_compress_residual: bool = False,
+        tp_compress_rotation: str = "signperm",
         sync_ulysses: bool = False,
         FSDP: bool = False,
         FSDP_CPU_OFFLOAD: bool = False,
@@ -434,6 +463,7 @@ class RayInitializer:
         gpu_indices: str = "",
         skip_comm_test: bool = True,
         use_mmap: bool = True,
+        zero_ram: bool = False,
     ):
         with monitor_memory("RayInitializer.spawn_actor"):
             # Release pinned caches on any previously tracked actors and
@@ -500,6 +530,10 @@ class RayInitializer:
                     attention_backend=attention_backend,
                     attention_type=attn_type_enum,
                     ring_impl=ring_impl_type,
+                    tp_allreduce_compress=tp_compress,
+                    tp_compress_bits=tp_compress_bits,
+                    tp_compress_residual=tp_compress_residual,
+                    tp_compress_rotation=tp_compress_rotation,
                 ),
                 compact=CompactConfig(
                     enabled=delta_compression != "IDENTITY",
@@ -520,6 +554,7 @@ class RayInitializer:
                     gpu_indices=parsed_gpu_indices,
                     vram_limit_gb=vram_limit_gb,
                     use_mmap=use_mmap,
+                    zero_ram=zero_ram,
                 ),
                 debug=DebugConfig(
                     skip_comm_test=skip_comm_test,
@@ -656,6 +691,27 @@ class RayInitializerAdvanced(RayInitializer):
                     "max": 8,
                     "tooltip": "Number of GPUs for Tensor Parallelism weight sharding (1 = disabled). Must divide GPU count evenly."
                 }),
+                "tp_compress": (
+                    ["none", "fp8", "turboquant"],
+                    {"default": "none",
+                     "tooltip": "TP all-reduce compression. 'turboquant' = rotation + quantization (4× reduction). 'fp8' = 2× reduction."}
+                ),
+                "tp_compress_bits": ("INT", {
+                    "default": 4,
+                    "min": 2,
+                    "max": 4,
+                    "step": 2,
+                    "tooltip": "TurboQuant quantization bits. 4 = recommended (quality ≈ FP8). 2 = aggressive (8× compression)."
+                }),
+                "tp_compress_residual": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Step-to-step delta compression. Caches previous step's result and only transmits the change. Adds ~7.5 GB VRAM per rank but greatly improves compression quality."
+                }),
+                "tp_compress_rotation": (
+                    ["signperm", "wht"],
+                    {"default": "signperm",
+                     "tooltip": "Rotation mode. 'signperm' = fast sign-flip + permutation. 'wht' = Walsh-Hadamard Transform (better quality at 2-bit, requires Triton)."}
+                ),
                 "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
@@ -770,12 +826,22 @@ def _discover_compile_keys(diffusion_model) -> list[str]:
     Falls back to ["diffusion_model"] if no known block attributes are found.
     """
     keys: list[str] = []
+    found_any_blocks = False
     for layer_name in _TRANSFORMER_BLOCK_NAMES:
         if hasattr(diffusion_model, layer_name):
             blocks = getattr(diffusion_model, layer_name)
             for i in range(len(blocks)):
+                found_any_blocks = True
+                block = blocks[i]
+                # Skip TP-patched blocks: their sub-modules use
+                # @torch.compiler.disable which creates graph breaks and
+                # causes recompilation storms inside the block forward.
+                if getattr(block, '_tp_patched', False):
+                    continue
                 keys.append(f"diffusion_model.{layer_name}.{i}")
-    return keys if keys else ["diffusion_model"]
+    if not found_any_blocks:
+        return ["diffusion_model"]
+    return keys
 
 
 def _check_compile_compatible(unet_name: str, config: RaylightConfig, backend: str = "inductor") -> tuple[bool, str]:
@@ -928,6 +994,9 @@ class RayUNETLoader:
                     m = model.clone()
                     diffusion_model = m.get_model_object("diffusion_model")
                     keys = _discover_compile_keys(diffusion_model)
+                    if not keys:
+                        print("[Raylight] torch.compile skipped — all blocks are TP-patched (incompatible with Dynamo tracing)")
+                        return m
                     set_torch_compile_wrapper(model=m, backend="inductor", mode=mode, dynamic=dynamic, keys=keys)
                     return m
                 compile_futures = [actor.model_function_runner.remote(_apply_compile, compile_mode, compile_dynamic) for actor in actors]

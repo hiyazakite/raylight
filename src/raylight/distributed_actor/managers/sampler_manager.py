@@ -127,6 +127,12 @@ class SamplerManager:
                     compact_reset()
                 except Exception:
                     pass
+
+                try:
+                    from raylight.distributed_modules.tp_compress import clear_all_tp_residual_caches
+                    clear_all_tp_residual_caches()
+                except Exception:
+                    pass
                 finally:
                     # CRITICAL: Always defragment GPU allocator to prevent cross-run
                     # slowdown from fragmented ring attention / compact buffers.
@@ -209,6 +215,12 @@ class SamplerManager:
                      # Essential: Always reset state before sampling to clear indices/state from previous runs
                      compact_reset()
                      compact_set_step(0) 
+                 except Exception:
+                     pass
+
+                 try:
+                     from raylight.distributed_modules.tp_compress import clear_all_tp_residual_caches
+                     clear_all_tp_residual_caches()
                  except Exception:
                      pass
 
@@ -321,6 +333,12 @@ class SamplerManager:
                     # Essential: Always reset state before sampling to clear indices/state from previous runs
                     compact_reset()
                     compact_set_step(start_step if start_step is not None else 0)
+                except Exception:
+                    pass
+
+                try:
+                    from raylight.distributed_modules.tp_compress import clear_all_tp_residual_caches
+                    clear_all_tp_residual_caches()
                 except Exception:
                     pass
                 

@@ -94,6 +94,18 @@ if _AVAILABLE and Int8TensorwiseOps is not None:
                 _ = state_dict.pop(input_scale_key, None)
 
                 if weight_tensor is not None:
+                    # Meta/lazy tensors (used by streaming TP Phase 2 to
+                    # establish architecture shapes) have no data.  Just
+                    # assign them as-is — Phase 4 will stream real values.
+                    if getattr(weight_tensor, "is_meta", False):
+                        self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                        if weight_scale is not None:
+                            self.weight_scale = weight_scale
+                        bias_tensor = state_dict.pop(bias_key, None)
+                        if bias_tensor is not None:
+                            self.bias = nn.Parameter(bias_tensor, requires_grad=False)
+                        return
+
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
                         # ---- Pre-quantized INT8 checkpoint ----
                         self._is_quantized = True

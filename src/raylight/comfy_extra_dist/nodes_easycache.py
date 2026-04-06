@@ -36,6 +36,17 @@ from comfy_extras.nodes_easycache import EasyCacheHolder
 from .ray_patch_decorator import ray_patch
 
 
+def _resolve_tp_group():
+    """Return the TP process group if tensor parallelism is active, else None."""
+    try:
+        from ..distributed_modules.tensor_parallel import TensorParallelState
+        if TensorParallelState.is_initialized():
+            return TensorParallelState.get_group()
+    except Exception:
+        pass
+    return None
+
+
 class DistributedCacheMixin:
     def __init__(self, enable_sync: bool = True) -> None:
         self._enable_sync = enable_sync
@@ -45,9 +56,18 @@ class DistributedCacheMixin:
             and torch.distributed.is_initialized()
         )
         self._dist_backend: Optional[str] = None
+        # Prefer TP group over world group so that sync stays within the
+        # tensor-parallel shard (correct for TP+FSDP 2D meshes).
+        self._sync_group: Optional[torch.distributed.ProcessGroup] = None
         if self._distributed:
-            self._rank = torch.distributed.get_rank()
-            self._world_size = torch.distributed.get_world_size()
+            tp_group = _resolve_tp_group()
+            if tp_group is not None:
+                self._sync_group = tp_group
+                self._rank = torch.distributed.get_rank(tp_group)
+                self._world_size = torch.distributed.get_world_size(tp_group)
+            else:
+                self._rank = torch.distributed.get_rank()
+                self._world_size = torch.distributed.get_world_size()
             try:
                 self._dist_backend = str(torch.distributed.get_backend())
             except Exception:
@@ -102,7 +122,7 @@ class DistributedCacheMixin:
             reduce_op = torch.distributed.ReduceOp.SUM
         else:
             raise ValueError(f"Unsupported reduction op '{op}'")
-        torch.distributed.all_reduce(tensor, op=reduce_op)
+        torch.distributed.all_reduce(tensor, op=reduce_op, group=self._sync_group)
         if op == "mean":
             tensor /= float(self._world_size)
         return float(tensor.item())
@@ -112,7 +132,7 @@ class DistributedCacheMixin:
             return flag
         t = torch.tensor(1 if flag else 0, device=self._sync_device, dtype=torch.int32)
         op = torch.distributed.ReduceOp.MIN if mode == "all" else torch.distributed.ReduceOp.MAX
-        torch.distributed.all_reduce(t, op=op)
+        torch.distributed.all_reduce(t, op=op, group=self._sync_group)
         return bool(int(t.item()) != 0)
 
 

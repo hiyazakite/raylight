@@ -107,12 +107,29 @@ class LoraManager:
             # Restore original weights from backup if any
             if hasattr(model, "backup") and model.backup:
                 print(f"[RayActor {config.local_rank}] Restoring {len(model.backup)} backed up weights...")
+                # Determine target device: if model is actively on CUDA (e.g.
+                # zero_ram), restored weights must stay there.  Backups live on
+                # offload_device (CPU) so a device move is needed.
+                target_dev = getattr(model, "current_device", None)
+                need_move = target_dev is not None and target_dev.type == "cuda"
+
                 for k, bk in model.backup.items():
+                    w = bk.weight
+                    if need_move and w.device != target_dev:
+                        w = w.to(target_dev)
                     if bk.inplace_update:
-                        comfy.utils.copy_to_param(model.model, k, bk.weight)
+                        comfy.utils.copy_to_param(model.model, k, w)
                     else:
-                        comfy.utils.set_attr_param(model.model, k, bk.weight)
+                        comfy.utils.set_attr_param(model.model, k, w)
                 model.backup.clear()
+
+            # Sync weight-patches UUID so ComfyUI's partially_load() knows
+            # the current weights already reflect the (now empty) patches
+            # state.  Without this, the UUID mismatch triggers a wasteful
+            # unpatch_model(cpu) → load(cuda) cycle that can leave TP-only
+            # modules (e.g. TPRMSNormAcrossHeads) stranded on CPU.
+            if hasattr(model, "patches_uuid") and hasattr(model, "model"):
+                model.model.current_weight_patches_uuid = model.patches_uuid
         
         print(f"[RayActor {config.local_rank}] LoRAs reset complete.")
 

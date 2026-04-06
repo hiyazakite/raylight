@@ -30,10 +30,44 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+import torch.distributed as dist
+
 import comfy.model_patcher
 import comfy.patcher_extension
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# TP-aware sync helpers
+# =============================================================================
+
+def _get_tp_group():
+    """Return the TP process group if TP is active, else None."""
+    try:
+        from ..distributed_modules.tensor_parallel import TensorParallelState
+        if TensorParallelState.is_initialized():
+            return TensorParallelState.get_group()
+    except Exception:
+        pass
+    return None
+
+
+def _tp_sync_bool(flag: bool, tp_group) -> bool:
+    """Synchronise a boolean across TP ranks using all-reduce(MIN).
+
+    All ranks must agree to skip (conservative: if any rank wants to compute,
+    everyone computes).  Cost: one scalar all-reduce per step — negligible.
+    """
+    if tp_group is None:
+        return flag
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+    except RuntimeError:
+        device = torch.device("cpu")
+    t = torch.tensor(1 if flag else 0, device=device, dtype=torch.int32)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=tp_group)
+    return bool(int(t.item()) != 0)
 
 
 # =============================================================================
@@ -360,6 +394,8 @@ def _enable_lightweight_cache(
         "compute_times": [],
     })
 
+    tp_group = _get_tp_group()
+
     def _cached_forward(*args, **kwargs):
         state = _lightweight_cache_state
         state["call_count"] += 1
@@ -378,6 +414,9 @@ def _enable_lightweight_cache(
         steps_after = n - warmup_steps
         should_skip = (skip_interval > 1) and ((steps_after % skip_interval) != 0)
 
+        # TP safety: all ranks must agree to skip (conservative)
+        should_skip = _tp_sync_bool(should_skip, tp_group)
+
         if should_skip and state["last_result"] is not None:
             state["skip_count"] += 1
             cached = state["last_result"]
@@ -395,8 +434,9 @@ def _enable_lightweight_cache(
     transformer.forward = _cached_forward
 
     logger.info(
-        "[CacheDiT] Lightweight cache active: transformer=%d, warmup=%d, skip_interval=%d, noise=%.4f",
+        "[CacheDiT] Lightweight cache active: transformer=%d, warmup=%d, skip_interval=%d, noise=%.4f, tp_sync=%s",
         current_id, warmup_steps, skip_interval, noise_scale,
+        tp_group is not None,
     )
 
 
@@ -657,12 +697,13 @@ def _print_summary(transformer: torch.nn.Module, config: CacheDiTConfig) -> None
         avg_t = lightweight_stats["avg_compute_time"]
         width = 54
         sep = "─" * width
+        tp_active = _get_tp_group() is not None
         lines = [
             "╔" + "═" * width + "╗",
             "║" + " CacheDiT Performance Dashboard ".center(width) + "║",
             "╠" + sep + "╣",
             "║" + f"  Model : {config.model_type}".ljust(width) + "║",
-            "║" + f"  Mode  : Lightweight (Tier-1)".ljust(width) + "║",
+            "║" + f"  Mode  : Lightweight (Tier-1, TP-sync={'on' if tp_active else 'off'})".ljust(width) + "║",
             "╠" + sep + "╣",
             "║" + f"  Total steps    : {total}".ljust(width) + "║",
             "║" + f"  Computed steps : {computed}".ljust(width) + "║",

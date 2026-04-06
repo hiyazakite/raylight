@@ -14,8 +14,7 @@ class ActorConfig:
     device: torch.device
     parallel_dict: Dict[str, Any]
     global_world_size: int
-    
-    # [SENIOR REFACTOR] The Unified Configuration Engine
+
     raylight_config: RaylightConfig
     
     device_mesh: Optional[Any] = None
@@ -39,6 +38,10 @@ class ActorConfig:
     @property
     def use_mmap(self) -> bool:
         return self.raylight_config.device.use_mmap
+
+    @property
+    def zero_ram(self) -> bool:
+        return self.raylight_config.device.zero_ram
 
     @property
     def vram_limit_gb(self) -> float:
