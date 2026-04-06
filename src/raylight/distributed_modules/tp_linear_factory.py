@@ -172,6 +172,21 @@ class TPGGMLLinear(nn.Module):
         # None = native quant precision, "target" = match input dtype.
         self.dequant_dtype = None
 
+        # Zero-element weight so state_dict() exposes "*.weight" keys.
+        # ComfyUI's model_lora_keys_unet() and add_patches() both require
+        # a .weight entry to build the LoRA key_map and register patches.
+        # A zero-element tensor costs 0 bytes, avoids module_size inflation,
+        # and works with .to() without the meta-device issues.
+        # The real data lives in quantized_weight (dequantised per-forward).
+        self.weight = nn.Parameter(
+            torch.empty(0),
+            requires_grad=False,
+        )
+
+        # Mark as comfy_cast_weights so RaylightModelPatcher.load() hooks
+        # up weight_function / bias_function for lowvram LoRA patching.
+        self.comfy_cast_weights = True
+
         # Bias (typically unquantised)
         if bias:
             if parallelism == "column":
@@ -285,10 +300,19 @@ class TPGGMLLinear(nn.Module):
         if bias is not None:
             bias = bias.to(x.dtype)
 
-        # 3. Local matmul
+        # 3. Apply LoRA patches (if any).
+        #    ComfyUI attaches weight_function via LowVramPatch when LoRA
+        #    patches are registered.  Apply them to the dequantised weight
+        #    before the matmul so the LoRA delta is fused into the output.
+        wf = getattr(self, "weight_function", None)
+        if wf:
+            for fn in wf:
+                weight = fn(weight)
+
+        # 4. Local matmul
         out = F.linear(x, weight, bias)
 
-        # 4. TP collective
+        # 5. TP collective
         if self.parallelism == "column":
             if self.gather_output and self._tp_size_runtime > 1:
                 out = gather_tensor_along_dim(

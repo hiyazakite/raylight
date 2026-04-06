@@ -123,6 +123,17 @@ class LoraManager:
                         comfy.utils.set_attr_param(model.model, k, w)
                 model.backup.clear()
 
+            # Wipe weight_function / bias_function from modules that had
+            # LoRA patches attached via LowVramPatch (e.g. TPGGMLLinear).
+            # Without this, stale LowVramPatch callbacks would try to look
+            # up keys in the now-empty patches dict → KeyError.
+            if hasattr(model, "model") and model.model is not None:
+                for m in model.model.modules():
+                    if hasattr(m, "weight_function") and m.weight_function:
+                        m.weight_function = []
+                    if hasattr(m, "bias_function") and m.bias_function:
+                        m.bias_function = []
+
             # Sync weight-patches UUID so ComfyUI's partially_load() knows
             # the current weights already reflect the (now empty) patches
             # state.  Without this, the UUID mismatch triggers a wasteful

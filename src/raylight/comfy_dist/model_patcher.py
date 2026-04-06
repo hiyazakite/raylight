@@ -29,6 +29,8 @@ class LowVramPatch:
         self.set_func = set_func  # Keep for API compatibility
 
     def __call__(self, weight):
+        if self.key not in self.patches:
+            return weight
         intermediate_dtype = weight.dtype
         if intermediate_dtype not in [torch.float32, torch.float16, torch.bfloat16]:   # intermediate_dtype has to be one that is supported in math ops
             intermediate_dtype = torch.float32
@@ -90,6 +92,37 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
         if pinned_cache is not None and pinned_cache.built:
             return  # already pinned / registered — nothing to do
         super().pin_weight_to_device(key)
+
+    # --------------------------------------------------------- LoRA patching
+
+    def patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False):
+        """Route TPGGMLLinear patches through weight_function.
+
+        TPGGMLLinear stores quantised bytes and dequantises per-forward.
+        The standard ``patch_weight_to_device`` path would try to read,
+        back-up, and compute on a zero-element placeholder ``weight``
+        parameter — which has the wrong shape for LoRA arithmetic.
+
+        Instead, attach a ``LowVramPatch`` to the module so LoRA deltas
+        are applied to the *dequantised* weight inside ``forward()``.
+        """
+        from raylight.distributed_modules.tp_linear_factory import TPGGMLLinear
+
+        parts = key.rsplit('.', 1)
+        if len(parts) == 2:
+            try:
+                op = comfy.utils.get_attr(self.model, parts[0])
+            except (AttributeError, KeyError):
+                op = None
+            if isinstance(op, TPGGMLLinear):
+                if key in self.patches:
+                    attr = "weight_function" if parts[1] == "weight" else "bias_function"
+                    if not hasattr(op, attr):
+                        setattr(op, attr, [])
+                    setattr(op, attr, [LowVramPatch(key, self.patches)])
+                return None
+
+        return super().patch_weight_to_device(key, device_to, inplace_update, return_weight)
 
     # ------------------------------------------------------------------ load
 
@@ -192,6 +225,15 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
                     wipe_lowvram_weight(m)
                 self.model.model_lowvram = False
                 self.model.lowvram_patch_counter = 0
+            else:
+                # TPGGMLLinear modules always use weight_function (set by
+                # our patch_weight_to_device override) even when the model
+                # is NOT in lowvram mode.  Clean them up here so stale
+                # LoRA patches don't persist after unpatch.
+                from raylight.distributed_modules.tp_linear_factory import TPGGMLLinear
+                for m in self.model.modules():
+                    if isinstance(m, TPGGMLLinear):
+                        wipe_lowvram_weight(m)
 
             keys = list(self.backup.keys())
             for k in keys:
