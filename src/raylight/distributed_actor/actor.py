@@ -606,6 +606,10 @@ class RayActor:
             self.model.current_device = self.device
             self.memory.after_reload()
             check_mmap_leak(unet_path)
+        elif self.model is not None:
+            # Non-GGUF (TP safetensors, legacy): activate via context so the
+            # model is on CUDA *before* any LoRA or sampler reload_if_needed.
+            ctx.activate(self.model, self.device, memory=self.memory)
 
         import ray
         self.base_sd_ref = ray.put({
@@ -622,6 +626,14 @@ class RayActor:
         diff_model = getattr(self.model, 'model', None)
         if cache is not None and diff_model is not None:
             self.memory.set_offload_target(cache, diff_model)
+
+            # Register mmap state dict as fallback for pressure eviction.
+            # When the pinned cache isn't built yet, the interceptor can
+            # still free VRAM by dropping CUDA storages — the data is
+            # recoverable from the mmap source without extra RAM allocation.
+            mmap_sd = getattr(self.model, 'mmap_cache', None)
+            if mmap_sd is not None:
+                cache.set_mmap_fallback(mmap_sd)
 
             # Install CUDA allocator interceptor — on-demand eviction when
             # any cudaMalloc fails (handles unpredictable activation spikes).

@@ -20,6 +20,14 @@ class LoraManager:
         # weights for this config — no hooks or re-baking needed on reruns.
         self._baked_config_hash: Optional[str] = None
 
+        # ── Solution 4: Patch cache ──────────────────────────────────
+        # Cache converted LoRA patches keyed by lora_path so reapply
+        # cycles skip the expensive file I/O + convert_lora() step.
+        # Each entry holds the result of dist_load_lora(convert_lora(sd), key_map)
+        # which is a dict[str, adapter] — typically ~100KB per LoRA.
+        self._patch_cache: Dict[str, Dict] = {}  # lora_path -> loaded_patches
+        self._baked_config_hash: Optional[str] = None
+
     def load_lora(
         self, 
         model: Any, 
@@ -124,15 +132,22 @@ class LoraManager:
                 model.backup.clear()
 
             # Wipe weight_function / bias_function from modules that had
-            # LoRA patches attached via LowVramPatch (e.g. TPGGMLLinear).
-            # Without this, stale LowVramPatch callbacks would try to look
-            # up keys in the now-empty patches dict → KeyError.
+            # LoRA patches attached via LowVramPatch (e.g. TPGGMLLinear),
+            # and clear activation-space LoRA attrs from TPLinear / nn.Linear.
             if hasattr(model, "model") and model.model is not None:
+                from raylight.distributed_modules.lora_triton import clear_lora
+                from raylight.distributed_modules.tensor_parallel import TPLinear
+                from raylight.comfy_dist.model_patcher import clear_linear_lora
+                import torch.nn as _nn
                 for m in model.model.modules():
                     if hasattr(m, "weight_function") and m.weight_function:
                         m.weight_function = []
                     if hasattr(m, "bias_function") and m.bias_function:
                         m.bias_function = []
+                    if isinstance(m, TPLinear):
+                        clear_lora(m)
+                    elif isinstance(m, _nn.Linear):
+                        clear_linear_lora(m)
 
             # Sync weight-patches UUID so ComfyUI's partially_load() knows
             # the current weights already reflect the (now empty) patches
@@ -191,21 +206,33 @@ class LoraManager:
         return True
     
     def _apply_lora_core(self, model: Any, config: "ActorConfig", lora_path: str, strength_model: float):
-        """Core LoRA application logic without registration/tracking."""
+        """Core LoRA application logic without registration/tracking.
+
+        Uses a patch cache to avoid re-reading + re-converting the LoRA file
+        on reapply cycles.  The first load reads from disk; subsequent calls
+        for the same path reuse the cached converted patches.
+        """
         filename = os.path.basename(lora_path)
-        
-        # Load LoRA State Dict (Mmap)
-        lora_sd = comfy.utils.load_torch_file(lora_path)
-        
-        # Resolve Keys & Convert
-        key_map = {}
-        if model is not None:
-            key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
-        
-        lora_patches = convert_lora(lora_sd)
-        
-        # Load Patches using Raylight's distributed lora helper
-        loaded_patches = dist_load_lora(lora_patches, key_map)
+
+        # ── Patch cache: skip file I/O + convert on reapply ───────────
+        loaded_patches = self._patch_cache.get(lora_path)
+        if loaded_patches is not None:
+            print(f"[RayActor {config.local_rank}] Patch cache hit: {filename}")
+        else:
+            # Cold path: load from disk, convert, cache
+            lora_sd = comfy.utils.load_torch_file(lora_path)
+
+            key_map = {}
+            if model is not None:
+                key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
+
+            lora_patches = convert_lora(lora_sd)
+            loaded_patches = dist_load_lora(lora_patches, key_map)
+
+            # Cache for future reapply (adapter weights are small — rank×dim)
+            self._patch_cache[lora_path] = loaded_patches
+            del lora_sd  # release the full state dict immediately
+            print(f"[RayActor {config.local_rank}] Patch cache miss → loaded: {filename}")
 
         # INT8 auto-detection: rewrap adapters for quantized layers so the
         # LoRA delta is applied correctly in INT8 space via stochastic rounding.
@@ -280,3 +307,10 @@ class LoraManager:
         self._applied_loras.clear()
         self._current_lora_config_hash = None
         self._baked_config_hash = None
+
+    def clear_patch_cache(self):
+        """Evict all cached LoRA patch dicts to free RAM."""
+        count = len(self._patch_cache)
+        self._patch_cache.clear()
+        if count:
+            print(f"[LoraManager] Evicted {count} cached LoRA patch dicts.")

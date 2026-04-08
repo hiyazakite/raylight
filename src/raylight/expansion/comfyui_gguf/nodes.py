@@ -123,6 +123,22 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
             out_weight.patches = [(patches, key)]
         else:
+            # Activation-space LoRA: for non-quantized .weight keys on
+            # nn.Linear modules, decompose into lora_A/lora_B attrs +
+            # forward hook — avoids backup dict + weight mutation RAM.
+            parts = key.rsplit('.', 1)
+            if len(parts) == 2 and parts[1] == "weight":
+                try:
+                    import torch.nn as _nn
+                    op = comfy.utils.get_attr(self.model, parts[0])
+                    if isinstance(op, _nn.Linear):
+                        from raylight.comfy_dist.model_patcher import _decompose_lora_for_linear
+                        if _decompose_lora_for_linear(op, patches):
+                            return
+                except (AttributeError, KeyError):
+                    pass
+
+            # Fallback: standard backup + mutate
             inplace_update = self.weight_inplace_update or inplace_update
             
             # CRITICAL: Backup the original (likely mmap) weight before modifying or moving
@@ -147,6 +163,14 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         if unpatch_weights:
             
+            # 0. Clear activation-space LoRA attrs + hooks from nn.Linear
+            #    modules before standard unpatch touches weights.
+            import torch.nn as _nn
+            from raylight.comfy_dist.model_patcher import clear_linear_lora
+            for m in self.model.modules():
+                if isinstance(m, _nn.Linear):
+                    clear_linear_lora(m)
+
             # 1. Standard unpatch for non-weight state.
             super().unpatch_model(device_to=None, unpatch_weights=unpatch_weights)
 

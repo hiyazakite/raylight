@@ -32,6 +32,48 @@ class TPContext(ModelContext):
         super().__init__(use_mmap)
         self._zero_ram = zero_ram
 
+    # ─── Activate (initial load → CUDA) ──────────────────────
+
+    def activate(self, model: Any, device: torch.device,
+                 memory: Any = None) -> None:
+        """Move a freshly-loaded TP model onto *device*.
+
+        * **zero_ram** — weights were already streamed to CUDA during
+          ``_load_streaming``, so we only stamp ``current_device``.
+        * **non-zero_ram** — weights live on CPU; build pinned cache then
+          reload to CUDA so the model is immediately usable.
+        """
+        if model is None:
+            return
+
+        zero_ram = getattr(model, "_zero_ram", False)
+        current = getattr(model, "current_device", None)
+
+        if zero_ram and current is not None and str(current) == str(device):
+            # Already activated by streaming load.
+            return
+
+        # Non-zero_ram path: must move weights to CUDA.
+        pinned_cache = getattr(model, "pinned_param_cache", None)
+        diffusion_model = getattr(model, "model", None)
+
+        if pinned_cache is not None and not pinned_cache.built and diffusion_model is not None:
+            print("[TPContext] activate: building pinned cache from CPU params...")
+            pinned_cache.build(diffusion_model)
+
+        if pinned_cache is not None and pinned_cache.built and diffusion_model is not None:
+            print("[TPContext] activate: pinned cache → CUDA...")
+            pinned_cache.reload_to_cuda(diffusion_model)
+            diffusion_model.device = device
+            self._fast_reload_tp(model, diffusion_model, device)
+            model.current_device = device
+            return
+
+        # Fallback: model.load() for legacy / non-pinned path
+        if hasattr(model, "load"):
+            model.load(device)
+        model.current_device = device
+
     # ─── Disk loading (used by legacy fallback) ──────────────
 
     def load_state_dict_mmap(self, state: ModelState, config: "ActorConfigLike") -> Any:
@@ -53,9 +95,9 @@ class TPContext(ModelContext):
 
     @staticmethod
     def _make_pinned_cache(config: "ActorConfigLike", model_path: str):
-        """TP ranks hold different shards — always use private PinnedParamCache."""
-        from raylight.distributed_modules.pinned_cache import PinnedParamCache
-        return PinnedParamCache()
+        """TP ranks hold different shards — always use private contiguous cache."""
+        from raylight.distributed_modules.pinned_cache import ContiguousPinnedCache
+        return ContiguousPinnedCache()
 
     # ─── Streaming load (main path) ──────────────────────────
 
@@ -157,10 +199,26 @@ class TPContext(ModelContext):
         loaded_count = self._stream_weights_into_model(model, path, target_device=target_device)
 
         # ── Phase 5: Finalize ──
+        #
+        # Streaming load never creates a full state dict — weights flow
+        # one-at-a-time from safe_open → model params → discard.  There is
+        # no mmap_cache to retain (unlike the legacy path).
+        model.mmap_cache = None
+
         if zero_ram:
             model.pinned_param_cache = None
         else:
-            model.pinned_param_cache = self._make_pinned_cache(config, path)
+            # Build pinned cache eagerly while params are still resident.
+            # Deferring to the first hot_load would force the (now freed)
+            # mmap_cache to be kept alive — exactly the ~1× model RAM
+            # spike we want to eliminate (cf. sglang/vllm pattern of
+            # streaming → pin → release source immediately).
+            cache = self._make_pinned_cache(config, path)
+            diffusion_model = getattr(model, "model", None)
+            if diffusion_model is not None:
+                cache.build(diffusion_model)
+            model.pinned_param_cache = cache
+
         model.unet_path = state.unet_path
         model.load_config = state
         model._zero_ram = zero_ram
@@ -474,6 +532,18 @@ class TPContext(ModelContext):
                 compress_config=_compress_config,
             )
 
+        # Stamp lifecycle attributes (same as _load_streaming Phase 5)
+        if model is not None:
+            # The base class load() retains the full state dict as mmap_cache.
+            # For TP safetensors, the pinned cache reads from live params (not
+            # from the source dict), so drop mmap_cache immediately to free
+            # ~1× model worth of RAM.
+            model.mmap_cache = None
+            model.unet_path = state.unet_path
+            model.load_config = state
+            model._zero_ram = False
+            model.current_device = torch.device("cpu")
+
         return model
 
     # ─── Instantiation (for legacy path) ─────────────────────
@@ -501,9 +571,21 @@ class TPContext(ModelContext):
         if cast_dtype and hasattr(model, "model"):
             model.model.manual_cast_dtype = cast_dtype
 
-        model.mmap_cache = sd
+        # The state dict has been consumed by load_diffusion_model_state_dict;
+        # weights now live in model parameters.  Do NOT retain the full dict
+        # as mmap_cache — the pinned cache reads from live params, not from
+        # the source dict.  Dropping it immediately saves ~1× model in RAM
+        # (sglang pattern: stream → consume → release source).
+        model.mmap_cache = None
         model.__class__ = RaylightModelPatcher
-        model.pinned_param_cache = self._make_pinned_cache(config, state.unet_path)
+        # Build pinned cache eagerly — params are CPU-resident right now,
+        # so build() does pin_memory + pointer-swap with zero transient
+        # overhead (each param swapped in-place, old freed by refcount).
+        cache = self._make_pinned_cache(config, state.unet_path)
+        diffusion_model = getattr(model, "model", None)
+        if diffusion_model is not None:
+            cache.build(diffusion_model)
+        model.pinned_param_cache = cache
         return model
 
     # ─── Offload (Template Method hook) ──────────────────────
@@ -568,10 +650,36 @@ class TPContext(ModelContext):
 
     # ─── Hot load ────────────────────────────────────────────
 
+    @staticmethod
+    def _has_meta_params(model: Any) -> bool:
+        """Check if the inner diffusion model has meta-device parameters.
+
+        Meta tensors are the hallmark of a zero-RAM offload: real CUDA
+        storages were freed and replaced with shape-preserving meta
+        placeholders.  Detecting this lets ``hot_load`` recover even when
+        the ``_zero_ram`` flag was lost (e.g. through a clone).
+        """
+        inner = getattr(getattr(model, "model", None), "diffusion_model", None)
+        if inner is None:
+            return False
+        for p in inner.parameters():
+            if p.device.type == "meta":
+                return True
+        return False
+
     def hot_load(self, model: Any, device: torch.device,
                  reload_params: Dict[str, Any]) -> None:
         """Restore TP model from pinned RAM (or re-stream in zero_ram mode)."""
         zero_ram = getattr(model, "_zero_ram", False)
+
+        # Fallback detection: if the flag was lost (e.g. via clone) but
+        # parameters are on ``meta`` device, treat as zero_ram.
+        if not zero_ram and self._has_meta_params(model):
+            unet_path = getattr(model, "unet_path", None)
+            if unet_path and unet_path.lower().endswith(".safetensors"):
+                print("[TPContext] Detected meta params without _zero_ram flag — treating as zero-RAM.")
+                model._zero_ram = True  # restore for future cycles
+                zero_ram = True
 
         if zero_ram:
             return self._hot_load_zero_ram(model, device)
@@ -579,22 +687,18 @@ class TPContext(ModelContext):
         pinned_cache = getattr(model, "pinned_param_cache", None)
         diffusion_model = getattr(model, "model", None)
 
-        # Eagerly build cache if not built yet (first run or legacy path)
+        # Cache is now built eagerly during load() — no deferred build
+        # needed here.  Guard retained for safety (e.g. external callers).
         if (
             pinned_cache is not None
             and not pinned_cache.built
             and diffusion_model is not None
         ):
-            print("[TPContext] Building pinned cache from CUDA params...")
+            print("[TPContext] Late cache build (should not happen — check load path)...")
             try:
                 pinned_cache.build(diffusion_model)
-                # Pinned cache now owns the reload data — drop the mmap reference
-                # so the full checkpoint (~24GB) can be reclaimed by the OS.
-                if hasattr(model, "mmap_cache") and model.mmap_cache is not None:
-                    del model.mmap_cache
-                    model.mmap_cache = None
             except Exception as e:
-                print(f"[TPContext] Eager cache build failed: {e}")
+                print(f"[TPContext] Late cache build failed: {e}")
 
         # Pinned-cache fast path
         if pinned_cache is not None and pinned_cache.built and diffusion_model is not None:

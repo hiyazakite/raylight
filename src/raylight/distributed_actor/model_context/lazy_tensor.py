@@ -7,6 +7,7 @@ import os
 import torch
 
 from ._base import ModelContext, ModelState, _compute_vram_budget, _ops_for_model_options
+from raylight.utils.memory import NULL_POLICY
 from raylight.expansion.comfyui_lazytensors.loader import SafetensorMmapWrapper
 
 if TYPE_CHECKING:
@@ -74,8 +75,8 @@ class LazyTensorContext(ModelContext):
                 shm_backend=build_posix_shm_backend(),
             )
         else:
-            from raylight.distributed_modules.pinned_cache import PinnedParamCache
-            return PinnedParamCache()
+            from raylight.distributed_modules.pinned_cache import ContiguousPinnedCache
+            return ContiguousPinnedCache()
 
     # ─── Instantiation ───────────────────────────────────────
 
@@ -108,6 +109,33 @@ class LazyTensorContext(ModelContext):
         model.pinned_param_cache = self._make_pinned_cache(config, state.unet_path)
         print("[LazyTensorContext] Pinned param cache attached (will build on first offload).")
         return model
+
+    # ─── Activate ────────────────────────────────────────────
+
+    def activate(self, model: Any, device: torch.device,
+                 memory: "MemoryPolicy" = NULL_POLICY) -> None:
+        """Build pinned cache eagerly while params are CPU-resident, then activate.
+
+        Building before ``model.load(device)`` gives us:
+        - Shared /dev/shm buffer across all actors (no per-actor pageable copies)
+        - Pinned RAM for fast DMA during LowVram per-layer streaming
+        - Built cache enables pressure-triggered VRAM eviction during VAE decode
+        - On reload, pinned cache restores weights without disk I/O
+        """
+        if model is None:
+            return
+
+        cache = getattr(model, 'pinned_param_cache', None)
+        diff_model = getattr(model, 'model', None)
+        if cache is not None and diff_model is not None and not cache.built:
+            cache.build(diff_model)
+            # Cache now holds all param data in shared pinned memory.
+            # Free the mmap state dict to release page cache pressure —
+            # the pinned cache is the authoritative source for offload/reload.
+            if hasattr(model, 'mmap_cache') and model.mmap_cache is not None:
+                model.mmap_cache = None
+
+        super().activate(model, device, memory=memory)
 
     def instantiate_model_with_fallback(self, sd: Dict, state: ModelState,
                                         config: "ActorConfigLike") -> Any:

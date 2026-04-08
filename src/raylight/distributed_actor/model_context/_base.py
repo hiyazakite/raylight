@@ -169,6 +169,22 @@ class ModelContext(ABC):
         """Fast VRAM transfer for soft-reloaded models."""
         ...
 
+    def activate(self, model: Any, device: torch.device,
+                 memory: "MemoryPolicy" = NULL_POLICY) -> None:
+        """Activate a freshly-loaded model on *device*.
+
+        Called once after ``load()`` to move the model to CUDA and set
+        internal state flags.  The default implementation calls
+        ``model.load(device)`` which runs ComfyUI's patch/hook/callback
+        pipeline.  Subclasses override for format-specific behaviour
+        (e.g. zero-RAM models are already on CUDA after streaming).
+        """
+        if model is None:
+            return
+        if hasattr(model, "load"):
+            model.load(device)
+        model.current_device = device
+
     # ─── Template Method: offload ────────────────────────────
 
     def offload(

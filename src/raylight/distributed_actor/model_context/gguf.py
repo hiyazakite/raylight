@@ -7,8 +7,10 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 
 from ._base import ModelContext, ModelState, _compute_vram_budget
+from raylight.utils.memory import NULL_POLICY
 
 if TYPE_CHECKING:
+    from raylight.utils.memory import MemoryPolicy
     from raylight.raylight_types import LoraManagerLike, ActorConfigLike
 
 
@@ -81,7 +83,34 @@ class GGUFContext(ModelContext):
                 self._swap_params_to_pinned(model, pinned)
                 print("[GGUFContext] mmap_cache swapped to pinned RAM.")
 
+            # Attach DictPinnedCache so actor.py Phase 4 registers it
+            # with MemoryPolicy and installs the CUDA allocator interceptor.
+            # build() is deferred to activate() — needs module params on CUDA.
+            from raylight.distributed_modules.pinned_cache import DictPinnedCache
+            model.pinned_param_cache = DictPinnedCache(
+                model.mmap_cache, tag="GGUFPinnedCache",
+            )
+
         return model
+
+    # ─── Activate ────────────────────────────────────────────
+
+    def activate(self, model: Any, device: torch.device,
+                 memory: "MemoryPolicy" = NULL_POLICY) -> None:
+        """Move model to CUDA, then build the DictPinnedCache.
+
+        Building *after* ``super().activate()`` means ``_on_cuda`` is
+        correctly set to True, and the cache's key map references the
+        actual module parameters that are now on device.
+        """
+        if model is None:
+            return
+        super().activate(model, device, memory=memory)
+
+        cache = getattr(model, 'pinned_param_cache', None)
+        diff_model = getattr(model, 'model', None)
+        if cache is not None and diff_model is not None and not cache.built:
+            cache.build(diff_model)
 
     # ─── Param swap ──────────────────────────────────────────
 

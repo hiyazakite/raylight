@@ -224,12 +224,16 @@ class MemoryPolicy:
 
         cache = self._pinned_cache
         module = self._offload_module
-        if cache is not None and module is not None and getattr(cache, 'built', False):
-            try:
-                freed = cache.offload_by_pressure(module, deficit)
-                freed_total += freed
-            except Exception as e:
-                print(f"[MemoryPolicy] Pressure offload failed: {e}")
+        if cache is not None and module is not None:
+            # Allow eviction when the cache is built (pinned path) OR when
+            # an mmap fallback is available (zero-alloc eviction).
+            can_evict = getattr(cache, 'built', False) or getattr(cache, 'has_mmap_fallback', False)
+            if can_evict:
+                try:
+                    freed = cache.offload_by_pressure(module, deficit)
+                    freed_total += freed
+                except Exception as e:
+                    print(f"[MemoryPolicy] Pressure offload failed: {e}")
 
         return freed_total
 

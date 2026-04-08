@@ -450,22 +450,50 @@ class TPLinear(nn.Module):
             # Cast weight/bias to match input dtype (e.g. float16 weight
             # from GGUF dequant fallback with bfloat16 activations).
             # Mirrors TPGGMLLinear.forward behaviour.
-            w = weight if weight.dtype == x.dtype else weight.to(x.dtype)
+            # Also move to input device for zero-RAM mode where weights stay on CPU.
+            if weight.device != x.device or weight.dtype != x.dtype:
+                w = weight.to(device=x.device, dtype=x.dtype, non_blocking=True)
+            else:
+                w = weight
             b = bias
-            if b is not None and b.dtype != x.dtype:
-                b = b.to(x.dtype)
+            if b is not None and (b.device != x.device or b.dtype != x.dtype):
+                b = b.to(device=x.device, dtype=x.dtype, non_blocking=True)
             out = torch.nn.functional.linear(x, w, b)
 
-        # 3. Dynamic LoRA Hook support (mirrors Int8SafetensorOps)
-        if getattr(self, "lora_A", None) is not None and getattr(self, "lora_B", None) is not None:
-            lA = getattr(self, "lora_A").to(x.device, non_blocking=True)
-            lB = getattr(self, "lora_B").to(x.device, non_blocking=True)
-            lora_x = torch.nn.functional.linear(x.to(lA.dtype), lA)
-            lora_y = torch.nn.functional.linear(lora_x, lB)
-            alpha = getattr(self, "lora_alpha", None)
-            if alpha is not None:
-                lora_y = lora_y * alpha
-            out = out + lora_y.to(out.dtype)
+        # 3. Activation-space LoRA via fused Triton kernel
+        lora_A = getattr(self, "lora_A", None)
+        lora_B = getattr(self, "lora_B", None)
+        if lora_A is not None and lora_B is not None:
+            scale = getattr(self, "lora_scale", None)
+            if scale is None:
+                # Backward compat: lora_alpha from INT8's _apply_composition
+                scale = getattr(self, "lora_alpha", 1.0)
+            if scale is None:
+                scale = 1.0
+            from raylight.distributed_modules.lora_triton import lora_forward, apply_dora
+            lora_delta = lora_forward(x, lora_A, lora_B, float(scale))
+            dora_scale = getattr(self, "lora_dora_scale", None)
+            if dora_scale is not None:
+                out = apply_dora(
+                    out, lora_delta, self.weight, dora_scale,
+                    lora_a=lora_A, lora_b=lora_B,
+                )
+            else:
+                out = out + lora_delta.to(out.dtype)
+        else:
+            # 3b. Full-delta path (LoHa / LoKr)
+            ld = getattr(self, "lora_delta", None)
+            if ld is not None:
+                from raylight.distributed_modules.lora_triton import apply_dora_with_delta
+                d = ld.to(device=x.device, dtype=x.dtype, non_blocking=True)
+                act_delta = torch.nn.functional.linear(x, d)
+                dora_scale = getattr(self, "lora_dora_scale", None)
+                if dora_scale is not None:
+                    out = apply_dora_with_delta(
+                        out, act_delta, self.weight, dora_scale, lora_delta=d,
+                    )
+                else:
+                    out = out + act_delta.to(out.dtype)
 
         # 4. Post-matmul communication
         if self.parallelism == "column":
@@ -529,7 +557,8 @@ class TPRMSNormAcrossHeads(nn.Module):
         else:
             dist.all_reduce(local_sumsq, op=dist.ReduceOp.SUM, group=self._resolved_group)
         var = local_sumsq / float(self.full_hidden_size)
-        return (x.float() * torch.rsqrt(var + self.eps)).to(x.dtype) * self.weight
+        w = self.weight if self.weight.device == x.device else self.weight.to(x.device, non_blocking=True)
+        return (x.float() * torch.rsqrt(var + self.eps)).to(x.dtype) * w
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         """Load and shard weights for the norm layer."""

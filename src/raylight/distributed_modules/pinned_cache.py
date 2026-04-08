@@ -167,6 +167,19 @@ class BasePinnedCache(ABC):
         self._watermark: int = 0  # 0 = nothing evicted, len = all evicted
         self._partial_freed: Dict[str, Tuple[torch.UntypedStorage, int]] = {}
 
+        # ── Read-only source optimisation ──
+        # When True, the CPU-side data is authoritative and never stale
+        # relative to CUDA (e.g. GGUF mmap_cache).  offload_by_pressure()
+        # skips the redundant CUDA→CPU snapshot before freeing VRAM.
+        self._skip_d2h_refresh: bool = False
+
+        # ── Mmap fallback for pressure relief without built pinned cache ──
+        # When the pinned cache hasn't been built yet, we can still evict
+        # CUDA weights: just free the storage and reload from the mmap'd
+        # safetensor later.  No extra RAM allocation needed.
+        self._mmap_sd: Optional[Dict[str, torch.Tensor]] = None
+        self._mmap_key_map: Optional[Dict[str, str]] = None  # param_name -> mmap_key
+
     # -------------------------------------------------------------- public
 
     @property
@@ -202,6 +215,57 @@ class BasePinnedCache(ABC):
         self._on_cuda = any(
             p.device.type == "cuda" for p in module.parameters()
         )
+
+    def set_mmap_fallback(self, mmap_sd: Dict[str, torch.Tensor]) -> None:
+        """Register an mmap-backed state dict for zero-alloc pressure eviction.
+
+        When the pinned cache hasn't been built yet, ``offload_by_pressure``
+        can still free VRAM: it just drops the CUDA storage, knowing the
+        data is recoverable from the mmap source at reload time.  This
+        avoids allocating a pinned RAM buffer, which is critical in
+        RAM-constrained settings with multiple actors.
+        """
+        self._mmap_sd = mmap_sd
+
+    def _resolve_mmap_key(self, param_name: str) -> Optional[str]:
+        """Find the mmap_sd key corresponding to a module parameter name.
+
+        Handles prefix differences: mmap keys may be raw or prefixed with
+        ``diffusion_model.`` / ``model.diffusion_model.``.
+        Builds and caches the key map on first call.
+        """
+        if self._mmap_sd is None:
+            return None
+        if self._mmap_key_map is None:
+            self._mmap_key_map = {}
+            mmap_keys = set(self._mmap_sd.keys())
+            for name in (self._param_order or []):
+                # Direct match
+                if name in mmap_keys:
+                    self._mmap_key_map[name] = name
+                    continue
+                # Try stripping common prefixes from mmap keys
+                found = False
+                for prefix in ('diffusion_model.', 'model.diffusion_model.'):
+                    candidate = prefix + name
+                    if candidate in mmap_keys:
+                        self._mmap_key_map[name] = candidate
+                        found = True
+                        break
+                if not found:
+                    # Reverse: check if param name has a prefix the mmap key doesn't
+                    for prefix in ('diffusion_model.', 'model.diffusion_model.'):
+                        if name.startswith(prefix):
+                            stripped = name[len(prefix):]
+                            if stripped in mmap_keys:
+                                self._mmap_key_map[name] = stripped
+                                break
+        return self._mmap_key_map.get(param_name)
+
+    @property
+    def has_mmap_fallback(self) -> bool:
+        """True if mmap fallback is available for pressure eviction."""
+        return self._mmap_sd is not None
 
     def offload_to_cpu(
         self,
@@ -599,13 +663,32 @@ class BasePinnedCache(ABC):
         Stops as soon as cumulative freed bytes >= target_bytes.  Mirrors
         aimdo's watermark eviction that scans from the VBAR tail.
 
+        When the pinned cache is built, snapshots CUDA → pinned before
+        freeing.  When *not* built but an mmap fallback is registered,
+        simply frees the CUDA storage — the data is recoverable from the
+        mmap source.  This avoids allocating a pinned RAM buffer in
+        RAM-constrained settings.
+
         Does NOT set ``_on_cuda = False`` — the model is now **partially
         resident** (some params on CUDA, some freed).
 
         Returns actual bytes freed.
         """
-        if not self._built or target_bytes <= 0:
+        if target_bytes <= 0:
             return 0
+
+        use_mmap = False
+        if not self._built:
+            if self._mmap_sd is not None:
+                use_mmap = True
+            else:
+                return 0
+
+        # Lazy-init param_order if not yet populated (mmap path, no build)
+        if not self._param_order:
+            self._param_order = [name for name, _ in module.named_parameters()]
+            # Also build the mmap key map now that we have param names
+            self._mmap_key_map = None  # force rebuild
 
         freed = 0
         param_dict = dict(module.named_parameters())
@@ -618,10 +701,19 @@ class BasePinnedCache(ABC):
             if param is None or param.device.type != "cuda":
                 continue
 
-            # Snapshot to pinned cache before freeing
-            cpu_buf = self._get_cpu_buf(name)
-            if cpu_buf is not None:
-                cpu_buf.copy_(param.data, non_blocking=non_blocking)
+            if use_mmap:
+                # Mmap fallback: verify the mmap source exists before freeing.
+                # No CPU copy needed — data is recoverable from mmap.
+                mmap_key = self._resolve_mmap_key(name)
+                if mmap_key is None:
+                    continue  # can't recover this param, skip
+            elif not self._skip_d2h_refresh:
+                # Pinned cache path: snapshot to pinned cache before freeing.
+                # Skipped when source is read-only (e.g. GGUF pinned dict)
+                # because the host data is always authoritative.
+                cpu_buf = self._get_cpu_buf(name)
+                if cpu_buf is not None:
+                    cpu_buf.copy_(param.data, non_blocking=non_blocking)
 
             # Free CUDA storage
             s = param.data.untyped_storage()
@@ -635,8 +727,9 @@ class BasePinnedCache(ABC):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             self._watermark = len(self._partial_freed)
+            source = "mmap" if use_mmap else "pinned"
             print(
-                f"[{self._tag}] Watermark offload: freed {freed / 1e9:.2f} GB "
+                f"[{self._tag}] Watermark offload ({source}): freed {freed / 1e9:.2f} GB "
                 f"({self._watermark}/{len(self._param_order)} params evicted)"
             )
 
@@ -651,6 +744,9 @@ class BasePinnedCache(ABC):
 
         Equivalent to aimdo's re-fault after watermark reset via
         ``vbar.prioritize()``.
+
+        When the pinned cache is built, copies from pinned CPU buffers.
+        Falls back to the mmap state dict when pinned buffers are unavailable.
         """
         if not self._partial_freed:
             return 0
@@ -659,15 +755,30 @@ class BasePinnedCache(ABC):
         for name, (storage, nbytes) in self._partial_freed.items():
             storage.resize_(nbytes)
 
-        # Copy pinned → CUDA
+        # Copy source → CUDA
         param_dict = dict(module.named_parameters())
         restored = 0
+        mmap_restored = 0
         for name in self._partial_freed:
-            cpu_buf = self._get_cpu_buf(name)
             param = param_dict.get(name)
-            if cpu_buf is not None and param is not None:
+            if param is None:
+                continue
+
+            # Try pinned buffer first (fastest — DMA-capable)
+            cpu_buf = self._get_cpu_buf(name)
+            if cpu_buf is not None:
                 param.data.copy_(cpu_buf, non_blocking=non_blocking)
                 restored += 1
+                continue
+
+            # Fallback: copy from mmap source
+            if self._mmap_sd is not None:
+                mmap_key = self._resolve_mmap_key(name)
+                if mmap_key is not None:
+                    mmap_tensor = self._mmap_sd[mmap_key]
+                    param.data.copy_(mmap_tensor, non_blocking=non_blocking)
+                    restored += 1
+                    mmap_restored += 1
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -675,9 +786,12 @@ class BasePinnedCache(ABC):
         freed_gb = sum(nb for _, nb in self._partial_freed.values()) / 1e9
         self._partial_freed.clear()
         self._watermark = 0
+        source_info = ""
+        if mmap_restored > 0:
+            source_info = f" ({mmap_restored} from mmap)"
         print(
             f"[{self._tag}] Restored {restored} evicted params to CUDA "
-            f"({freed_gb:.2f} GB)."
+            f"({freed_gb:.2f} GB){source_info}."
         )
         return restored
 
@@ -695,6 +809,8 @@ class BasePinnedCache(ABC):
         self._param_order = []
         self._built = False
         self._on_cuda = False
+        self._mmap_sd = None
+        self._mmap_key_map = None
 
     def __del__(self):
         try:
@@ -882,6 +998,345 @@ class PinnedParamCache(BasePinnedCache):
         super().cleanup()
         if gb > 0:
             print(f"[{self._tag}] Cleanup: freed {gb:.2f} GB pinned RAM.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DictPinnedCache — external pre-pinned dict (GGUF mmap_cache, etc.)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class DictPinnedCache(BasePinnedCache):
+    """Pinned cache backed by an externally-pinned dict of tensors.
+
+    Used for model formats (e.g. GGUF) that build their own pinned host
+    dict (``mmap_cache``) outside the ``BasePinnedCache`` machinery.
+    This class bridges that dict into the standard ``BasePinnedCache``
+    interface so pressure eviction, watermark offload, and full
+    offload/reload all work through a single code path.
+
+    The external dict is the **authoritative source** — CUDA data is a
+    copy, so no CUDA→CPU snapshot is needed during eviction
+    (``_skip_d2h_refresh = True``).
+
+    ``build()`` maps external dict keys → ``nn.Module`` parameter names
+    and populates ``_cpu_params``.  After that, all ``BasePinnedCache``
+    methods (``offload_by_pressure``, ``reload_evicted``, ``offload_to_cpu``,
+    ``reload_to_cuda``, etc.) work without modification.
+    """
+
+    def __init__(
+        self,
+        pinned_dict: Dict[str, torch.Tensor],
+        tag: str = "DictPinnedCache",
+    ) -> None:
+        super().__init__(tag=tag)
+        self._external_dict = pinned_dict
+        self._cpu_params: Dict[str, torch.Tensor] = {}
+        self._cpu_buffers: Dict[str, torch.Tensor] = {}
+        # External dict is authoritative — never snapshot CUDA→CPU.
+        self._skip_d2h_refresh = True
+
+    # ── build ─────────────────────────────────────────────────────────
+
+    def _do_build(self, module: torch.nn.Module) -> None:
+        """Map external dict keys → module parameter names."""
+        if self._external_dict is None:
+            return
+
+        param_names = set()
+        for name, _ in module.named_parameters():
+            param_names.add(name)
+
+        ext_keys = set(self._external_dict.keys())
+        mapped = 0
+
+        for ext_key in ext_keys:
+            target_name = self._match_param_name(ext_key, param_names)
+            if target_name is not None:
+                self._cpu_params[target_name] = self._external_dict[ext_key]
+                mapped += 1
+
+        print(
+            f"[{self._tag}] Built: mapped {mapped}/{len(ext_keys)} external "
+            f"tensors to {len(param_names)} module params "
+            f"({self.pinned_ram_bytes() / 1e9:.2f} GB)."
+        )
+
+    @staticmethod
+    def _match_param_name(ext_key: str, param_names: set) -> Optional[str]:
+        """Resolve an external dict key to a module parameter name.
+
+        Handles the common prefix differences between mmap dict keys and
+        ComfyUI's ``named_parameters()`` names.
+        """
+        # Direct match
+        if ext_key in param_names:
+            return ext_key
+        # Try adding common prefixes
+        for prefix in ('diffusion_model.', 'model.diffusion_model.'):
+            candidate = prefix + ext_key
+            if candidate in param_names:
+                return candidate
+        # Try stripping prefix from key
+        for prefix in ('diffusion_model.', 'model.diffusion_model.'):
+            if ext_key.startswith(prefix):
+                stripped = ext_key[len(prefix):]
+                if stripped in param_names:
+                    return stripped
+        return None
+
+    # ── offload (no-op snapshot, CUDA storages freed by base class) ──
+
+    def _snapshot_to_cpu(self, module, non_blocking, freed_ptrs) -> int:
+        offloaded = 0
+        for name, param in module.named_parameters():
+            if param.device.type != "cuda":
+                continue
+            # Skip D2H snapshot — external dict is authoritative.
+            self._collect_storage(param.data, freed_ptrs)
+            offloaded += 1
+        return offloaded
+
+    def _snapshot_cuda_only(self, module, non_blocking, freed_ptrs) -> tuple:
+        cuda_count = cpu_count = 0
+        for name, param in module.named_parameters():
+            if param.device.type == "cuda":
+                self._collect_storage(param.data, freed_ptrs)
+                cuda_count += 1
+            else:
+                cpu_count += 1
+        return cuda_count, cpu_count
+
+    # ── reload (pinned external → CUDA) ──────────────────────────────
+
+    def _copy_to_cuda(self, module, non_blocking) -> int:
+        reloaded = 0
+        for name, param in module.named_parameters():
+            cpu_buf = self._cpu_params.get(name)
+            if cpu_buf is not None:
+                param.data.copy_(cpu_buf, non_blocking=non_blocking)
+                reloaded += 1
+        return reloaded
+
+    def _swap_to_cpu(self, module) -> int:
+        restored = 0
+        for name, param in module.named_parameters():
+            cpu_buf = self._cpu_params.get(name)
+            if cpu_buf is not None:
+                param.data = cpu_buf
+                restored += 1
+        return restored
+
+    # ── info ──────────────────────────────────────────────────────────
+
+    def param_count(self) -> int:
+        return len(self._cpu_params)
+
+    def pinned_ram_bytes(self) -> int:
+        return sum(t.nbytes for t in self._cpu_params.values())
+
+    def cleanup(self) -> None:
+        gb = self.pinned_ram_bytes() / 1e9 if self._cpu_params else 0
+        self._cpu_params.clear()
+        self._cpu_buffers.clear()
+        self._external_dict = None
+        super().cleanup()
+        if gb > 0:
+            print(f"[{self._tag}] Cleanup: released {gb:.2f} GB external dict references.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ContiguousPinnedCache — single slab, zero fragmentation
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ContiguousPinnedCache(BasePinnedCache):
+    """Contiguous pinned-RAM cache using a single ``cudaHostAlloc`` slab.
+
+    Instead of one ``pin_memory()`` call per parameter (hundreds of small
+    ``cudaHostAlloc`` calls, ~2 KB wasted per tensor on page-rounding),
+    a single contiguous buffer is allocated and individual parameter views
+    are carved out via ``torch.as_strided`` on the flat storage.
+
+    Benefits:
+      - One ``cudaHostAlloc`` call → no fragmentation, no per-tensor overhead.
+      - ``cudaMemcpyAsync`` can transfer the entire model in one DMA op
+        (when H2D is a contiguous range).
+      - ~40-50 % faster build vs per-tensor ``pin_memory()`` on large models.
+
+    The slab is a 1-D ``uint8`` pinned tensor.  Each parameter gets an
+    aligned view into this slab (512-byte aligned to match GPU DMA
+    granularity, same as ``SharedPinnedParamCache``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(tag="ContiguousPinnedCache")
+        self._slab: Optional[torch.Tensor] = None
+        self._cpu_params: Dict[str, torch.Tensor] = {}
+        self._cpu_buffers: Dict[str, torch.Tensor] = {}
+        self._total_bytes: int = 0
+
+    # ── build ─────────────────────────────────────────────────────────
+
+    def _do_build(self, module: torch.nn.Module) -> None:
+        # Phase 1: compute layout — total bytes needed with alignment
+        entries: List[Tuple[str, bool, int, torch.Size, torch.dtype]] = []
+        offset = 0
+        for name, param in module.named_parameters():
+            aligned = _align_up(offset)
+            nb = param.data.nbytes
+            entries.append((name, True, aligned, param.data.shape, param.data.dtype))
+            offset = aligned + nb
+        for name, buf in module.named_buffers():
+            aligned = _align_up(offset)
+            nb = buf.data.nbytes
+            entries.append((name, False, aligned, buf.data.shape, buf.data.dtype))
+            offset = aligned + nb
+
+        total_bytes = _align_up(offset)
+        self._total_bytes = total_bytes
+
+        # Phase 2: allocate single contiguous pinned slab
+        self._slab = torch.empty(total_bytes, dtype=torch.uint8, device="cpu").pin_memory()
+
+        # Phase 3: create typed views into the slab and copy data
+        needs_sync = False
+        param_dict = dict(module.named_parameters())
+        buf_dict = dict(module.named_buffers())
+        pinned_cpu = 0
+
+        for name, is_param, byte_offset, shape, dtype in entries:
+            nb = 1
+            for s in shape:
+                nb *= s
+            nbytes = nb * torch._utils._element_size(dtype)
+
+            # Create a typed view into the slab via uint8 slice → view(dtype)
+            flat_view = self._slab[byte_offset:byte_offset + nbytes].view(dtype).reshape(shape)
+
+            src = param_dict[name].data if is_param else buf_dict[name].data
+
+            if src.device.type == "cuda":
+                flat_view.copy_(src, non_blocking=True)
+                needs_sync = True
+            else:
+                flat_view.copy_(src)
+                # Swap CPU param to point at pinned slab view
+                if is_param:
+                    param_dict[name].data = flat_view
+                else:
+                    buf_dict[name].data = flat_view
+                pinned_cpu += 1
+
+            if is_param:
+                self._cpu_params[name] = flat_view
+            else:
+                self._cpu_buffers[name] = flat_view
+
+        if needs_sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        param_count = sum(1 for _, is_p, *_ in entries if is_p)
+        buf_count = sum(1 for _, is_p, *_ in entries if not is_p)
+
+        # Verify the slab is pinned
+        pin_ok = self._slab.is_pinned()
+        pin_status = "pinned ✓" if pin_ok else "WARNING: slab NOT pinned"
+
+        print(
+            f"[{self._tag}] Built: {param_count} params + {buf_count} buffers "
+            f"in single {total_bytes / 1e9:.2f} GB slab ({pin_status}). "
+            f"(pinned_in_place={pinned_cpu})"
+        )
+
+    # ── offload (CUDA → pinned) ──────────────────────────────────────
+
+    def _snapshot_to_cpu(self, module, non_blocking, freed_ptrs) -> int:
+        offloaded = 0
+        for name, param in module.named_parameters():
+            if param.device.type != "cuda":
+                continue
+            cpu_buf = self._cpu_params.get(name)
+            if cpu_buf is not None:
+                cpu_buf.copy_(param.data, non_blocking=non_blocking)
+            self._collect_storage(param.data, freed_ptrs)
+            offloaded += 1
+
+        for name, buf in module.named_buffers():
+            if buf.device.type != "cuda":
+                continue
+            cpu_copy = self._cpu_buffers.get(name)
+            if cpu_copy is not None:
+                cpu_copy.copy_(buf.data, non_blocking=non_blocking)
+            self._collect_storage(buf.data, freed_ptrs)
+
+        return offloaded
+
+    def _snapshot_cuda_only(self, module, non_blocking, freed_ptrs) -> tuple:
+        cuda_count = cpu_count = 0
+        for name, param in module.named_parameters():
+            if param.device.type == "cuda":
+                cpu_buf = self._cpu_params.get(name)
+                if cpu_buf is not None:
+                    cpu_buf.copy_(param.data, non_blocking=non_blocking)
+                self._collect_storage(param.data, freed_ptrs)
+                cuda_count += 1
+            else:
+                cpu_count += 1
+
+        for name, buf in module.named_buffers():
+            if buf.device.type == "cuda":
+                cpu_copy = self._cpu_buffers.get(name)
+                if cpu_copy is not None:
+                    cpu_copy.copy_(buf.data, non_blocking=non_blocking)
+                self._collect_storage(buf.data, freed_ptrs)
+
+        return cuda_count, cpu_count
+
+    # ── reload (pinned → CUDA) ───────────────────────────────────────
+
+    def _copy_to_cuda(self, module, non_blocking) -> int:
+        reloaded = 0
+        for name, param in module.named_parameters():
+            cpu_buf = self._cpu_params.get(name)
+            if cpu_buf is not None:
+                param.data.copy_(cpu_buf, non_blocking=non_blocking)
+                reloaded += 1
+        for name, buf in module.named_buffers():
+            cpu_copy = self._cpu_buffers.get(name)
+            if cpu_copy is not None:
+                buf.data.copy_(cpu_copy, non_blocking=non_blocking)
+        return reloaded
+
+    def _swap_to_cpu(self, module) -> int:
+        """Point param.data directly at pinned slab views."""
+        restored = 0
+        for name, param in module.named_parameters():
+            cpu_buf = self._cpu_params.get(name)
+            if cpu_buf is not None:
+                param.data = cpu_buf
+                restored += 1
+        for name, buf in module.named_buffers():
+            cpu_copy = self._cpu_buffers.get(name)
+            if cpu_copy is not None:
+                buf.data = cpu_copy
+        return restored
+
+    # ── info ──────────────────────────────────────────────────────────
+
+    def param_count(self) -> int:
+        return len(self._cpu_params)
+
+    def pinned_ram_bytes(self) -> int:
+        return self._total_bytes
+
+    def cleanup(self) -> None:
+        gb = self._total_bytes / 1e9 if self._slab is not None else 0
+        self._cpu_params.clear()
+        self._cpu_buffers.clear()
+        self._slab = None
+        self._total_bytes = 0
+        super().cleanup()
+        if gb > 0:
+            print(f"[{self._tag}] Cleanup: freed {gb:.2f} GB contiguous pinned slab.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -39,6 +39,377 @@ class LowVramPatch:
         return comfy_dist.lora.calculate_weight(self.patches[self.key], weight, self.key, intermediate_dtype=intermediate_dtype)
 
 
+def _extract_lora_ab(patches):
+    """Extract (down, up, scale) triples from a list of LoRA patches.
+
+    Returns ``(list_of_A, list_of_B, dora_scale_or_None)`` on success where
+    scale is baked into A, or ``(None, None, None)`` if any patch is
+    unsupported (LoCon, offset, custom function, or non-LoRA type).
+
+    DoRA (dora_scale) is supported: when present the scale is extracted and
+    returned separately.  All patches in the list must agree (all have
+    dora_scale or none do) — mixed sets bail out.
+    """
+    all_A = []  # [rank, in_features] each
+    all_B = []  # [out_features, rank] each
+    dora_scales = []  # one per patch, None when absent
+
+    for p in patches:
+        strength = float(p[0])
+        adapter = p[1]
+        offset = p[3]
+        function = p[4]
+
+        if offset is not None or function is not None:
+            return None, None, None
+
+        if hasattr(adapter, "weights"):
+            v = adapter.weights
+        elif isinstance(adapter, (tuple, list)) and len(adapter) >= 2:
+            v = adapter
+        else:
+            return None, None, None
+
+        up = v[0]       # mat1 / lora_up  — [full_out, rank]
+        down = v[1]     # mat2 / lora_down — [rank, full_in]
+        alpha = v[2] if len(v) > 2 else None
+        mid = v[3] if len(v) > 3 else None
+        dora_scale = v[4] if len(v) > 4 else None
+
+        if mid is not None:
+            return None, None, None
+
+        rank = down.shape[0]
+        scale = (float(alpha) / rank if alpha else 1.0) * strength
+
+        all_A.append(down * scale)
+        all_B.append(up)
+        dora_scales.append(dora_scale)
+
+    if not all_A:
+        return None, None, None
+
+    # DoRA consistency check: all or none must have dora_scale.
+    has_dora = [ds is not None for ds in dora_scales]
+    if any(has_dora) and not all(has_dora):
+        return None, None, None  # mixed — bail
+
+    # For multi-LoRA with DoRA, only single-LoRA is supported for now
+    # (multi-LoRA DoRA would require sequential norm application).
+    if all(has_dora) and len(dora_scales) > 1:
+        return None, None, None
+
+    final_dora = dora_scales[0] if all(has_dora) else None
+    return all_A, all_B, final_dora
+
+
+# ---------------------------------------------------------------------------
+# Full-delta extraction for LoHa / LoKr adapters
+# ---------------------------------------------------------------------------
+
+def _compute_loha_delta(v, strength):
+    """Compute LoHa delta: ``strength * alpha * (w1a @ w1b) ⊙ (w2a @ w2b)``.
+
+    Returns ``(delta [out, in], dora_scale)`` or ``(None, None)`` on bail.
+    """
+    w1a = v[0]
+    w1b = v[1]
+    alpha = v[2]
+    w2a = v[3]
+    w2b = v[4]
+    t1 = v[5] if len(v) > 5 else None
+    t2 = v[6] if len(v) > 6 else None
+    dora_scale = v[7] if len(v) > 7 else None
+
+    # CP decomposition → 4D conv output → bail
+    if t1 is not None or t2 is not None:
+        return None, None
+
+    m1 = torch.mm(w1a.float(), w1b.float())
+    m2 = torch.mm(w2a.float(), w2b.float())
+    delta = m1 * m2  # Hadamard product → [out, in]
+
+    scale_val = (float(alpha) / w1b.shape[0] if alpha is not None else 1.0) * strength
+    return (delta * scale_val), dora_scale
+
+
+def _compute_lokr_delta(v, strength):
+    """Compute LoKr delta: ``strength * alpha * kron(w1, w2)``.
+
+    Returns ``(delta [out, in], dora_scale)`` or ``(None, None)`` on bail.
+    """
+    w1 = v[0]
+    w2 = v[1]
+    alpha = v[2]
+    w1a = v[3] if len(v) > 3 else None
+    w1b = v[4] if len(v) > 4 else None
+    w2a = v[5] if len(v) > 5 else None
+    w2b = v[6] if len(v) > 6 else None
+    t2 = v[7] if len(v) > 7 else None
+    dora_scale = v[8] if len(v) > 8 else None
+
+    dim = None
+
+    if w1 is None:
+        if w1a is None or w1b is None:
+            return None, None
+        dim = w1b.shape[0]
+        w1 = torch.mm(w1a.float(), w1b.float())
+    else:
+        w1 = w1.float()
+
+    if w2 is None:
+        if w2a is None or w2b is None:
+            return None, None
+        dim = w2b.shape[0]
+        if t2 is not None:
+            # einsum with t2 produces 4D → conv → bail
+            return None, None
+        w2 = torch.mm(w2a.float(), w2b.float())
+    else:
+        w2 = w2.float()
+
+    # 4D w2 → conv → bail
+    if w2.ndim == 4:
+        return None, None
+
+    if w2.ndim == 4 or w1.ndim == 4:
+        return None, None
+
+    delta = torch.kron(w1, w2)
+
+    if alpha is not None and dim is not None:
+        scale_val = (float(alpha) / dim) * strength
+    else:
+        scale_val = 1.0 * strength
+
+    return (delta * scale_val), dora_scale
+
+
+def _extract_full_delta(patches):
+    """Extract a full-rank weight delta for LoHa / LoKr adapters.
+
+    Unlike ``_extract_lora_ab`` which returns low-rank (A, B) matrices,
+    this computes the full ``[out, in]`` delta at decompose time.  The
+    delta is applied in activation-space as ``F.linear(x, delta)``.
+
+    Returns ``(delta, dora_scale)`` or ``(None, None)`` on bail.
+    Scale (alpha * strength) is baked into delta.
+    """
+    deltas = []
+    dora_scales = []
+
+    for p in patches:
+        strength = float(p[0])
+        adapter = p[1]
+        offset = p[3]
+        function = p[4]
+
+        if offset is not None or function is not None:
+            return None, None
+
+        name = getattr(adapter, "name", None)
+        if not hasattr(adapter, "weights"):
+            return None, None
+        v = adapter.weights
+
+        if name == "loha":
+            delta, ds = _compute_loha_delta(v, strength)
+        elif name == "lokr":
+            delta, ds = _compute_lokr_delta(v, strength)
+        else:
+            return None, None
+
+        if delta is None:
+            return None, None
+
+        deltas.append(delta)
+        dora_scales.append(ds)
+
+    if not deltas:
+        return None, None
+
+    # DoRA consistency: all or none
+    has_dora = [ds is not None for ds in dora_scales]
+    if any(has_dora) and not all(has_dora):
+        return None, None
+    if all(has_dora) and len(dora_scales) > 1:
+        return None, None  # multi-DoRA not supported
+
+    # Sum all deltas (multi-adapter stacking)
+    total_delta = deltas[0]
+    for d in deltas[1:]:
+        total_delta = total_delta + d
+
+    final_dora = dora_scales[0] if all(has_dora) else None
+    return total_delta, final_dora
+
+
+def _stack_ab(all_A, all_B):
+    """Stack multi-LoRA A/B lists into single tensors."""
+    if len(all_A) == 1:
+        return all_A[0], all_B[0]
+    return torch.cat(all_A, dim=0), torch.cat(all_B, dim=1)
+
+
+def _decompose_lora_for_tp(module, patches):
+    """Decompose LoRA patches into activation-space on a TPLinear module.
+
+    Tries low-rank (A, B) extraction first (LoRA / DoRA), then falls back
+    to full-delta extraction (LoHa / LoKr).
+
+    Returns True on success, False if any patch cannot be decomposed.
+    """
+    from raylight.distributed_modules.lora_triton import attach_lora, attach_delta
+
+    # --- Try low-rank path (LoRA / DoRA) ---
+    all_A, all_B, dora_scale = _extract_lora_ab(patches)
+    if all_A is not None:
+        tp_size = module._tp_size_runtime
+        if tp_size > 1:
+            tp_rank = module._tp_rank
+            for i in range(len(all_A)):
+                if module.parallelism == "column":
+                    local_out = module.local_out_features
+                    if all_B[i].shape[0] != local_out:
+                        all_B[i] = all_B[i].narrow(0, tp_rank * local_out, local_out)
+                else:  # row
+                    local_in = module.local_in_features
+                    if all_A[i].shape[1] != local_in:
+                        all_A[i] = all_A[i].narrow(1, tp_rank * local_in, local_in)
+
+        if dora_scale is not None and tp_size > 1 and module.parallelism == "column":
+            local_out = module.local_out_features
+            if dora_scale.shape[0] != local_out:
+                dora_scale = dora_scale.narrow(0, module._tp_rank * local_out, local_out)
+
+        lora_A, lora_B = _stack_ab(all_A, all_B)
+        attach_lora(module, lora_A, lora_B, scale=1.0, dora_scale=dora_scale)
+        return True
+
+    # --- Try full-delta path (LoHa / LoKr) ---
+    delta, dora_scale = _extract_full_delta(patches)
+    if delta is not None:
+        # TP-shard the delta matrix
+        tp_size = module._tp_size_runtime
+        if tp_size > 1:
+            tp_rank = module._tp_rank
+            if module.parallelism == "column":
+                local_out = module.local_out_features
+                if delta.shape[0] != local_out:
+                    delta = delta.narrow(0, tp_rank * local_out, local_out)
+            else:  # row
+                local_in = module.local_in_features
+                if delta.shape[1] != local_in:
+                    delta = delta.narrow(1, tp_rank * local_in, local_in)
+
+        if dora_scale is not None and tp_size > 1 and module.parallelism == "column":
+            local_out = module.local_out_features
+            if dora_scale.shape[0] != local_out:
+                dora_scale = dora_scale.narrow(0, module._tp_rank * local_out, local_out)
+
+        attach_delta(module, delta, dora_scale=dora_scale)
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Activation-space LoRA for nn.Linear (LazyTensor / GGUF SP paths)
+# ---------------------------------------------------------------------------
+
+_LORA_HOOK_KEY = "_raylight_lora_hook_handle"
+
+
+def _lora_post_hook(module, input, output):
+    """Forward hook that applies the LoRA delta (with optional DoRA norm).
+
+    Supports both low-rank (lora_A/lora_B) and full-delta (lora_delta) paths.
+    """
+    # --- Low-rank path (LoRA / DoRA) ---
+    lora_A = getattr(module, "lora_A", None)
+    lora_B = getattr(module, "lora_B", None)
+    if lora_A is not None and lora_B is not None:
+        from raylight.distributed_modules.lora_triton import lora_forward, apply_dora
+        scale = getattr(module, "lora_scale", 1.0) or 1.0
+        dora_scale = getattr(module, "lora_dora_scale", None)
+        delta = lora_forward(input[0], lora_A, lora_B, float(scale))
+        if dora_scale is not None:
+            return apply_dora(
+                output, delta, module.weight, dora_scale,
+                lora_a=lora_A, lora_b=lora_B,
+            )
+        return output + delta.to(output.dtype)
+
+    # --- Full-delta path (LoHa / LoKr) ---
+    lora_delta = getattr(module, "lora_delta", None)
+    if lora_delta is not None:
+        import torch.nn.functional as F
+        from raylight.distributed_modules.lora_triton import apply_dora_with_delta
+        x = input[0]
+        d = lora_delta.to(device=x.device, dtype=x.dtype, non_blocking=True)
+        delta = F.linear(x, d)
+        dora_scale = getattr(module, "lora_dora_scale", None)
+        if dora_scale is not None:
+            return apply_dora_with_delta(
+                output, delta, module.weight, dora_scale, lora_delta=d,
+            )
+        return output + delta.to(output.dtype)
+
+    return output
+
+
+def _ensure_lora_hook(module):
+    """Register the LoRA forward hook if not already present."""
+    if getattr(module, _LORA_HOOK_KEY, None) is None:
+        handle = module.register_forward_hook(_lora_post_hook)
+        setattr(module, _LORA_HOOK_KEY, handle)
+
+
+def _remove_lora_hook(module):
+    """Remove the LoRA forward hook and clear attributes."""
+    handle = getattr(module, _LORA_HOOK_KEY, None)
+    if handle is not None:
+        handle.remove()
+        setattr(module, _LORA_HOOK_KEY, None)
+
+
+def _decompose_lora_for_linear(module, patches):
+    """Decompose LoRA patches into activation-space on an nn.Linear.
+
+    Tries low-rank (A, B) first (LoRA / DoRA), then full-delta (LoHa / LoKr).
+    Installs a forward hook so the delta is applied additively during
+    forward — the base weight is never backed up or mutated.
+
+    Returns True on success, False if any patch cannot be decomposed.
+    """
+    from raylight.distributed_modules.lora_triton import attach_lora, attach_delta
+
+    # --- Try low-rank path ---
+    all_A, all_B, dora_scale = _extract_lora_ab(patches)
+    if all_A is not None:
+        lora_A, lora_B = _stack_ab(all_A, all_B)
+        attach_lora(module, lora_A, lora_B, scale=1.0, dora_scale=dora_scale)
+        _ensure_lora_hook(module)
+        return True
+
+    # --- Try full-delta path ---
+    delta, dora_scale = _extract_full_delta(patches)
+    if delta is not None:
+        attach_delta(module, delta, dora_scale=dora_scale)
+        _ensure_lora_hook(module)
+        return True
+
+    return False
+
+
+def clear_linear_lora(module):
+    """Remove activation-space LoRA from an nn.Linear (attrs + hook)."""
+    from raylight.distributed_modules.lora_triton import clear_lora
+    clear_lora(module)
+    _remove_lora_hook(module)
+
+
 def wipe_lowvram_weight(m):
     if hasattr(m, "prev_comfy_cast_weights"):
         m.comfy_cast_weights = m.prev_comfy_cast_weights
@@ -64,10 +435,25 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
     going through ``LazyTensorContext.hot_load``).
     """
 
+    # Attributes that must survive clone() so hot-reload, offload, and
+    # re-streaming work correctly regardless of how ComfyUI propagates
+    # the patcher through the execution graph.
+    _LIFECYCLE_ATTRS = (
+        "pinned_param_cache",
+        "_zero_ram",
+        "current_device",
+        "unet_path",
+        "load_config",
+        "vram_limit_bytes",
+        "mmap_cache",
+    )
+
     def clone(self, *args, **kwargs):
         n = super().clone(*args, **kwargs)
         n.__class__ = RaylightModelPatcher
-        n.pinned_param_cache = getattr(self, "pinned_param_cache", None)
+        for attr in self._LIFECYCLE_ATTRS:
+            if hasattr(self, attr):
+                setattr(n, attr, getattr(self, attr))
         # Mark clones so __del__ doesn't destroy the shared cache.
         n._is_cache_owner = False
         return n
@@ -96,30 +482,53 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
     # --------------------------------------------------------- LoRA patching
 
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False):
-        """Route TPGGMLLinear patches through weight_function.
+        """Route module patches through activation-space hooks when possible.
 
-        TPGGMLLinear stores quantised bytes and dequantises per-forward.
-        The standard ``patch_weight_to_device`` path would try to read,
-        back-up, and compute on a zero-element placeholder ``weight``
-        parameter — which has the wrong shape for LoRA arithmetic.
+        TPGGMLLinear: patches go through ``weight_function`` (LowVramPatch).
+        TPLinear: decomposed into ``lora_A``/``lora_B`` attrs (read by forward).
+        nn.Linear: decomposed into ``lora_A``/``lora_B`` attrs + forward hook.
 
-        Instead, attach a ``LowVramPatch`` to the module so LoRA deltas
-        are applied to the *dequantised* weight inside ``forward()``.
+        For all three cases the base weight is **never** backed up or mutated,
+        eliminating the backup-dict RAM overhead and the restore-on-reset copy.
+        Falls through to ComfyUI's standard backup+mutate for unsupported
+        patch types (LoCon, DoRA, offset, custom function).
         """
         from raylight.distributed_modules.tp_linear_factory import TPGGMLLinear
+        from raylight.distributed_modules.tensor_parallel import TPLinear
 
         parts = key.rsplit('.', 1)
-        if len(parts) == 2:
+        if len(parts) == 2 and parts[1] == "weight" and key in self.patches:
+            try:
+                op = comfy.utils.get_attr(self.model, parts[0])
+            except (AttributeError, KeyError):
+                op = None
+
+            if isinstance(op, TPGGMLLinear):
+                attr = "weight_function"
+                if not hasattr(op, attr):
+                    setattr(op, attr, [])
+                setattr(op, attr, [LowVramPatch(key, self.patches)])
+                return None
+
+            if isinstance(op, TPLinear):
+                if _decompose_lora_for_tp(op, self.patches[key]):
+                    return None
+
+            if isinstance(op, nn.Linear) and not isinstance(op, (TPLinear, TPGGMLLinear)):
+                if _decompose_lora_for_linear(op, self.patches[key]):
+                    return None
+
+        # Handle TPGGMLLinear bias patches
+        if len(parts) == 2 and parts[1] == "bias" and key in self.patches:
             try:
                 op = comfy.utils.get_attr(self.model, parts[0])
             except (AttributeError, KeyError):
                 op = None
             if isinstance(op, TPGGMLLinear):
-                if key in self.patches:
-                    attr = "weight_function" if parts[1] == "weight" else "bias_function"
-                    if not hasattr(op, attr):
-                        setattr(op, attr, [])
-                    setattr(op, attr, [LowVramPatch(key, self.patches)])
+                attr = "bias_function"
+                if not hasattr(op, attr):
+                    setattr(op, attr, [])
+                setattr(op, attr, [LowVramPatch(key, self.patches)])
                 return None
 
         return super().patch_weight_to_device(key, device_to, inplace_update, return_weight)
@@ -231,9 +640,15 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
                 # is NOT in lowvram mode.  Clean them up here so stale
                 # LoRA patches don't persist after unpatch.
                 from raylight.distributed_modules.tp_linear_factory import TPGGMLLinear
+                from raylight.distributed_modules.tensor_parallel import TPLinear
+                from raylight.distributed_modules.lora_triton import clear_lora
                 for m in self.model.modules():
                     if isinstance(m, TPGGMLLinear):
                         wipe_lowvram_weight(m)
+                    elif isinstance(m, TPLinear):
+                        clear_lora(m)
+                    elif isinstance(m, nn.Linear):
+                        clear_linear_lora(m)
 
             keys = list(self.backup.keys())
             for k in keys:
