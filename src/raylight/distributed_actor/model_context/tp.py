@@ -25,6 +25,26 @@ if TYPE_CHECKING:
     from raylight.raylight_types import LoraManagerLike, ActorConfigLike
 
 
+def _drop_page_cache(path: str) -> None:
+    """Advise the kernel to drop page cache for *path* (Linux only).
+
+    After a streaming model load, the safetensors pages are no longer
+    needed — weights are on CUDA.  Dropping the page cache prevents Ray's
+    memory monitor from counting those pages as "used" RAM, which can
+    push past the OOM threshold during VAE decode.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        size_gb = os.path.getsize(path) / (1024 ** 3)
+        print(f"[TPContext] Dropped page cache for checkpoint ({size_gb:.1f} GB)")
+    except (OSError, AttributeError):
+        pass  # Not Linux, or file removed
+
+
 class TPContext(ModelContext):
     """Context for Tensor Parallel model loading with streaming weight transfer."""
 
@@ -38,22 +58,37 @@ class TPContext(ModelContext):
                  memory: Any = None) -> None:
         """Move a freshly-loaded TP model onto *device*.
 
-        * **zero_ram** — weights were already streamed to CUDA during
-          ``_load_streaming``, so we only stamp ``current_device``.
-        * **non-zero_ram** — weights live on CPU; build pinned cache then
-          reload to CUDA so the model is immediately usable.
+        Both zero_ram and deferred-pinned modes stream directly to CUDA
+        during ``_load_streaming``, so activate only needs to stamp
+        metadata and apply ComfyUI patch hooks.
+
+        Legacy loads (non-safetensors fallback) still go through the
+        pinned-cache → cold-start path.
         """
         if model is None:
             return
 
-        zero_ram = getattr(model, "_zero_ram", False)
         current = getattr(model, "current_device", None)
 
-        if zero_ram and current is not None and str(current) == str(device):
-            # Already activated by streaming load.
+        if current is not None and str(current) == str(device):
+            # Weights were streamed directly to CUDA, OR the interceptor
+            # may have pressure-evicted some/all weights without updating
+            # current_device.  Restore any evicted params first.
+            pinned_cache = getattr(model, "pinned_param_cache", None)
+            if pinned_cache is not None and pinned_cache._partial_freed:
+                diffusion_model = getattr(model, "model", None)
+                if diffusion_model is not None:
+                    print("[TPContext] activate: restoring pressure-evicted weights...")
+                    pinned_cache.reload_evicted(diffusion_model)
+
+            # Apply ComfyUI patch metadata then return.
+            diffusion_model = getattr(model, "model", None)
+            if diffusion_model is not None:
+                diffusion_model.device = device
+                self._fast_reload_tp(model, diffusion_model, device)
             return
 
-        # Non-zero_ram path: must move weights to CUDA.
+        # Legacy / pinned-cache path: weights on CPU, move to CUDA.
         pinned_cache = getattr(model, "pinned_param_cache", None)
         diffusion_model = getattr(model, "model", None)
 
@@ -64,6 +99,8 @@ class TPContext(ModelContext):
         if pinned_cache is not None and pinned_cache.built and diffusion_model is not None:
             print("[TPContext] activate: pinned cache → CUDA...")
             pinned_cache.reload_to_cuda(diffusion_model)
+            if hasattr(pinned_cache, 'release_host_copy'):
+                pinned_cache.release_host_copy()
             diffusion_model.device = device
             self._fast_reload_tp(model, diffusion_model, device)
             model.current_device = device
@@ -133,9 +170,10 @@ class TPContext(ModelContext):
     def _load_streaming(self, state: ModelState, config: "ActorConfigLike") -> Any:
         """Streaming TP load — peak RAM ≈ single weight tensor + shards.
 
-        In zero_ram mode, weights are streamed directly to CUDA and no
-        pinned cache is created.  Offload frees CUDA storages; reload
-        re-streams from disk.
+        Both zero_ram and standard modes stream directly to CUDA.  An
+        unbuilt ``ContiguousPinnedCache`` is attached for standard mode
+        so the alloc interceptor can do incremental per-layer eviction
+        under VRAM pressure; zero_ram gets no cache at all.
         """
         from safetensors import safe_open
         from raylight.comfy_dist.tp_registry import TPRegistry
@@ -193,12 +231,7 @@ class TPContext(ModelContext):
             structure_only=True,
         )
 
-        # ── Phase 4: Stream weights from disk into TP shards ──
-        target_device = config.device if zero_ram else None
-        print(f"[TPContext] Phase 4: Streaming weights into TP shards (target={target_device or 'cpu'})...")
-        loaded_count = self._stream_weights_into_model(model, path, target_device=target_device)
-
-        # ── Phase 5: Finalize ──
+        # ── Phase 4: Prepare target storage ──
         #
         # Streaming load never creates a full state dict — weights flow
         # one-at-a-time from safe_open → model params → discard.  There is
@@ -206,23 +239,33 @@ class TPContext(ModelContext):
         model.mmap_cache = None
 
         if zero_ram:
+            # zero_ram: no cache at all — offload frees CUDA to meta,
+            # reload re-streams from disk.
             model.pinned_param_cache = None
         else:
-            # Build pinned cache eagerly while params are still resident.
-            # Deferring to the first hot_load would force the (now freed)
-            # mmap_cache to be kept alive — exactly the ~1× model RAM
-            # spike we want to eliminate (cf. sglang/vllm pattern of
-            # streaming → pin → release source immediately).
-            cache = self._make_pinned_cache(config, path)
-            diffusion_model = getattr(model, "model", None)
-            if diffusion_model is not None:
-                cache.build(diffusion_model)
-            model.pinned_param_cache = cache
+            # Create cache object (unbuilt) so it can be registered with
+            # MemoryPolicy + alloc interceptor.  No RAM allocated until
+            # first pressure eviction or full offload.  Weights stream
+            # directly to CUDA — inference runs with zero pinned overhead.
+            model.pinned_param_cache = self._make_pinned_cache(config, path)
+        target_device = config.device
+
+        # ── Phase 5: Stream weights from disk into TP shards ──
+        target_label = str(target_device) if target_device else "pinned"
+        print(f"[TPContext] Phase 5: Streaming weights into TP shards (target={target_label})...")
+        loaded_count = self._stream_weights_into_model(model, path, target_device=target_device)
+
+        # ── Phase 5b: Drop file page cache ──
+        # After streaming, all weights live on CUDA.  The safetensors file
+        # pages (~22 GB) linger in the OS page cache which Ray counts as
+        # "used" via `(total - available) / total`.  Advise the kernel to
+        # drop them so VAE decode doesn't push past the OOM threshold.
+        _drop_page_cache(path)
 
         model.unet_path = state.unet_path
         model.load_config = state
         model._zero_ram = zero_ram
-        model.current_device = config.device if zero_ram else torch.device("cpu")
+        model.current_device = config.device  # already on CUDA after streaming
 
         dt = (time.perf_counter() - t0) * 1000
         print(
@@ -626,10 +669,16 @@ class TPContext(ModelContext):
                 lora_manager.clear_tracking()
             return False
 
-        pinned_cache = getattr(model, "pinned_param_cache", None)
         diffusion_model = getattr(model, "model", None)
+        pinned_cache = getattr(model, "pinned_param_cache", None)
 
         if pinned_cache is not None and diffusion_model is not None:
+            # Restore any pressure-evicted params whose CUDA storages were
+            # freed.  build() (called by offload_to_cpu when !built) needs
+            # live CUDA data to construct the contiguous slab.
+            if pinned_cache._partial_freed:
+                pinned_cache.reload_evicted(diffusion_model)
+
             print(f"[TPContext {config.local_rank}] Pinned-RAM Offload: CUDA → pinned CPU...")
 
             try:
@@ -715,6 +764,8 @@ class TPContext(ModelContext):
                 print("[TPContext] Pinned-RAM Hot-Reload (full): pinned CPU → CUDA...")
                 try:
                     pinned_cache.reload_to_cuda(diffusion_model)
+                    if hasattr(pinned_cache, 'release_host_copy'):
+                        pinned_cache.release_host_copy()
                     diffusion_model.device = device
                     self._fast_reload_tp(model, diffusion_model, device)
                     model.current_device = device

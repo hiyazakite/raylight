@@ -30,6 +30,10 @@ _CENTROIDS_2BIT = torch.tensor([-1.510, -0.453, 0.453, 1.510])
 # Boundaries are midpoints between adjacent centroids
 _BOUNDARIES_2BIT = torch.tensor([-0.9815, 0.0, 0.9815])
 
+# 3-bit (8 levels): Lloyd-Max optimal for N(0, 1) marginals
+_CENTROIDS_3BIT = torch.tensor([-2.152, -1.344, -0.756, -0.245, 0.245, 0.756, 1.344, 2.152])
+_BOUNDARIES_3BIT = torch.tensor([-1.748, -1.050, -0.501, 0.0, 0.501, 1.050, 1.748])
+
 
 # =============================================================================
 # Configuration
@@ -45,7 +49,7 @@ class TPCompressConfig:
     """
 
     mode: str = "none"  # "none" | "fp8" | "turboquant"
-    bits: int = 4  # 2 | 4
+    bits: int = 4  # 2 | 3 | 4
     group_size: int = 64
     use_residual: bool = False
     rotation: str = "signperm"  # "signperm" | "wht"
@@ -92,6 +96,82 @@ def _unpack_int4(packed: torch.Tensor, last_dim_size: int) -> torch.Tensor:
     out = torch.empty(shape, dtype=torch.uint8, device=packed.device)
     out[..., 0::2] = low
     out[..., 1::2] = high
+    if last_dim_size != out.shape[-1]:
+        out = out[..., :last_dim_size]
+    return out
+
+
+def _pack_int3(indices: torch.Tensor) -> torch.Tensor:
+    """Pack INT3 indices (0..7) into uint8: 8 values per 3 bytes.
+
+    Layout per group of 8 values (v0..v7, each 3 bits = 24 bits = 3 bytes):
+        byte0 = v0 | (v1 << 3) | ((v2 & 0x3) << 6)
+        byte1 = (v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 0x1) << 7)
+        byte2 = (v5 >> 1) | (v6 << 2) | (v7 << 5)
+
+    Args:
+        indices: (..., N) tensor with values in [0, 7]. N must be divisible by 8.
+
+    Returns:
+        (..., N * 3 // 8) uint8 tensor.
+    """
+    v0 = indices[..., 0::8].to(torch.uint8)
+    v1 = indices[..., 1::8].to(torch.uint8)
+    v2 = indices[..., 2::8].to(torch.uint8)
+    v3 = indices[..., 3::8].to(torch.uint8)
+    v4 = indices[..., 4::8].to(torch.uint8)
+    v5 = indices[..., 5::8].to(torch.uint8)
+    v6 = indices[..., 6::8].to(torch.uint8)
+    v7 = indices[..., 7::8].to(torch.uint8)
+
+    byte0 = v0 | (v1 << 3) | ((v2 & 0x3) << 6)
+    byte1 = (v2 >> 2) | (v3 << 1) | (v4 << 4) | ((v5 & 0x1) << 7)
+    byte2 = (v5 >> 1) | (v6 << 2) | (v7 << 5)
+
+    # Interleave: [byte0_0, byte1_0, byte2_0, byte0_1, byte1_1, byte2_1, ...]
+    n_groups = byte0.shape[-1]
+    shape = indices.shape[:-1] + (n_groups * 3,)
+    out = torch.empty(shape, dtype=torch.uint8, device=indices.device)
+    out[..., 0::3] = byte0
+    out[..., 1::3] = byte1
+    out[..., 2::3] = byte2
+    return out
+
+
+def _unpack_int3(packed: torch.Tensor, last_dim_size: int) -> torch.Tensor:
+    """Unpack uint8 back to INT3 indices.
+
+    Args:
+        packed: (..., N * 3 // 8) uint8 tensor.
+        last_dim_size: Original size of the last dimension (N).
+
+    Returns:
+        (..., N) tensor with values in [0, 7].
+    """
+    byte0 = packed[..., 0::3]
+    byte1 = packed[..., 1::3]
+    byte2 = packed[..., 2::3]
+
+    v0 = byte0 & 0x07
+    v1 = (byte0 >> 3) & 0x07
+    v2 = ((byte0 >> 6) & 0x03) | ((byte1 & 0x01) << 2)
+    v3 = (byte1 >> 1) & 0x07
+    v4 = (byte1 >> 4) & 0x07
+    v5 = ((byte1 >> 7) & 0x01) | ((byte2 & 0x03) << 1)
+    v6 = (byte2 >> 2) & 0x07
+    v7 = (byte2 >> 5) & 0x07
+
+    n_groups = byte0.shape[-1]
+    shape = packed.shape[:-1] + (n_groups * 8,)
+    out = torch.empty(shape, dtype=torch.uint8, device=packed.device)
+    out[..., 0::8] = v0
+    out[..., 1::8] = v1
+    out[..., 2::8] = v2
+    out[..., 3::8] = v3
+    out[..., 4::8] = v4
+    out[..., 5::8] = v5
+    out[..., 6::8] = v6
+    out[..., 7::8] = v7
     if last_dim_size != out.shape[-1]:
         out = out[..., :last_dim_size]
     return out
@@ -208,6 +288,16 @@ def _quantize_and_pack(
         indices_flat = indices.reshape(*orig_shape[:-1], C)
         packed = _pack_int4(indices_flat)
         return packed, scale.squeeze(-1), vmin.squeeze(-1), gs
+    elif bits == 3:
+        # Centroid-based quantization: 8 Lloyd-Max levels, true 3-bit packing
+        absmax = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+        scale = absmax / 2.152  # Normalize so max centroid = absmax
+        normalized = grouped / scale
+        boundaries = _BOUNDARIES_3BIT.to(x.device, x.dtype)
+        indices = torch.bucketize(normalized, boundaries).to(torch.uint8)
+        indices_flat = indices.reshape(*orig_shape[:-1], C)
+        packed = _pack_int3(indices_flat)
+        return packed, scale.squeeze(-1), None, gs
     elif bits == 2:
         # Centroid-based quantization (PolarQuant-style)
         absmax = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
@@ -221,7 +311,7 @@ def _quantize_and_pack(
         packed = _pack_int2(indices_flat)
         return packed, scale.squeeze(-1), None, gs
     else:
-        raise ValueError(f"Unsupported bits={bits}. Use 2 or 4.")
+        raise ValueError(f"Unsupported bits={bits}. Use 2, 3, or 4.")
 
 
 def _turboquant_decompress(
@@ -279,6 +369,11 @@ def _dequantize_and_unpack(
         indices = _unpack_int4(packed, C)
         grouped_idx = indices.reshape(*orig_shape[:-1], C // group_size, group_size)
         dequant = grouped_idx.to(dtype) * scales.unsqueeze(-1) + zero_points.unsqueeze(-1)
+    elif bits == 3:
+        indices = _unpack_int3(packed, C)
+        centroids = _CENTROIDS_3BIT.to(device=packed.device, dtype=dtype)
+        grouped_idx = indices.reshape(*orig_shape[:-1], C // group_size, group_size)
+        dequant = centroids[grouped_idx.long()] * scales.unsqueeze(-1)
     elif bits == 2:
         indices = _unpack_int2(packed, C)
         centroids = _CENTROIDS_2BIT.to(device=packed.device, dtype=dtype)
@@ -308,6 +403,11 @@ def _compressed_payload_size(C: int, group_size: int, bits: int) -> tuple[int, i
         scales_bf16 = n_groups
         zp_bf16 = n_groups
         return packed_bf16, scales_bf16, zp_bf16
+    elif bits == 3:
+        packed_bytes = C * 3 // 8  # true 3-bit: 8 values per 3 bytes
+        packed_bf16 = (packed_bytes + 1) // 2
+        scales_bf16 = n_groups
+        return packed_bf16, scales_bf16, 0  # no zero_points
     elif bits == 2:
         packed_bytes = C // 4
         packed_bf16 = (packed_bytes + 1) // 2
@@ -377,6 +477,8 @@ def _deserialize_compressed(
     # Trim to actual packed size
     if bits == 4:
         actual_packed_per_token = C // 2
+    elif bits == 3:
+        actual_packed_per_token = C * 3 // 8
     else:
         actual_packed_per_token = C // 4
     packed = packed_uint8[:, :actual_packed_per_token]

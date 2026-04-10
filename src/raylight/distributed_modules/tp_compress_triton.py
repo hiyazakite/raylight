@@ -458,11 +458,14 @@ if _HAS_TRITON:
         PACK_GROUPS: tl.constexpr = GS // 4
         idx_p = tl.reshape(idx, [N_GROUPS, PACK_GROUPS, 4])
 
-        # tl.split only works on last dim of size 2, so split twice
+        # tl.split only works on last dim of size 2, so split twice.
+        # split on [2,2] extracts columns: lo=[q0,q2], hi=[q1,q3]
+        # so i0=q0, i1=q2, i2=q1, i3=q3 — swap i1/i2 in packing
+        # to produce standard order: q0|(q1<<2)|(q2<<4)|(q3<<6)
         idx_lo2, idx_hi2 = tl.split(tl.reshape(idx_p, [N_GROUPS, PACK_GROUPS, 2, 2]))  # each (N_GROUPS, PACK_GROUPS, 2)
-        i0, i1 = tl.split(idx_lo2)  # each (N_GROUPS, PACK_GROUPS)
-        i2, i3 = tl.split(idx_hi2)
-        packed = (i0 | (i1 << 2) | (i2 << 4) | (i3 << 6)).to(tl.uint8)
+        i0, i1 = tl.split(idx_lo2)  # i0=q0, i1=q2
+        i2, i3 = tl.split(idx_hi2)  # i2=q1, i3=q3
+        packed = (i0 | (i2 << 2) | (i1 << 4) | (i3 << 6)).to(tl.uint8)
 
         # --- Store packed data ---
         # packed shape: (N_GROUPS, PACK_GROUPS) → flatten to (C//4,)
@@ -505,22 +508,18 @@ if _HAS_TRITON:
         packed_flat = tl.load(PACKED_ptr + row * PACKED_PER_ROW + packed_offs)
 
         # --- Unpack 4 x 2-bit from uint8 ---
-        i0 = (packed_flat & 0x03).to(tl.int32)
-        i1 = ((packed_flat >> 2) & 0x03).to(tl.int32)
-        i2 = ((packed_flat >> 4) & 0x03).to(tl.int32)
-        i3 = ((packed_flat >> 6) & 0x03).to(tl.int32)
-
-        # Interleave back: reshape packed to (N_GROUPS, PACK_GROUPS), then
-        # each group has PACK_GROUPS packed bytes = GS indices
         packed_g = tl.reshape(packed_flat, [N_GROUPS, PACK_GROUPS])
         i0 = (packed_g & 0x03).to(tl.int32)
         i1 = ((packed_g >> 2) & 0x03).to(tl.int32)
         i2 = ((packed_g >> 4) & 0x03).to(tl.int32)
         i3 = ((packed_g >> 6) & 0x03).to(tl.int32)
 
-        # Reconstruct indices as (N_GROUPS, PACK_GROUPS, 4) then reshape to (N_GROUPS, GS)
-        idx_p = tl.join(tl.join(i0, i1), tl.join(i2, i3))
-        # idx_p shape: (N_GROUPS, PACK_GROUPS, 4)
+        # Reconstruct indices as (N_GROUPS, PACK_GROUPS, 2, 2) then reshape to (N_GROUPS, GS).
+        # tl.join adds a new LAST dim, so nested joins produce [2,2] where the
+        # outer-join index varies fastest in row-major.  Interleave i0/i2 and
+        # i1/i3 so that row-major flatten gives [q0, q1, q2, q3].
+        idx_p = tl.join(tl.join(i0, i2), tl.join(i1, i3))
+        # idx_p shape: (N_GROUPS, PACK_GROUPS, 2, 2)
         idx = tl.reshape(idx_p, [N_GROUPS, GS])
 
         # --- Load scales and dequantize ---
@@ -576,6 +575,244 @@ if _HAS_TRITON:
         x = x * s1
 
         # --- Store (only hidden_dim elements if OUT_DIM < C) ---
+        out_offs = tl.arange(0, C)
+        out_mask = out_offs < OUT_DIM
+        tl.store(OUT_ptr + row * OUT_DIM + out_offs, x, mask=out_mask)
+
+    # -----------------------------------------------------------------
+    # 3-bit fused kernels (8 Lloyd-Max centroids, true 3-bit packing)
+    # -----------------------------------------------------------------
+
+    @triton.jit
+    def _fused_wht_compress_3bit_kernel(
+        X_ptr,          # (T, C_padded) input
+        PACKED_ptr,     # (T, C*3//8) uint8 output
+        SCALES_ptr,     # (T, n_groups) bf16 output
+        SIGNS1_ptr,     # (C_padded,) sign vector
+        SIGNS2_ptr,     # (C_padded,) sign vector
+        T,
+        C: tl.constexpr,
+        LOG2_C: tl.constexpr,
+        GS: tl.constexpr,
+    ):
+        """Fused: sign1 → WHT butterfly → normalize → sign2 → 3-bit quant → true 3-bit pack."""
+        row = tl.program_id(0)
+        if row >= T:
+            return
+
+        offs = tl.arange(0, C)
+
+        # --- Load and apply sign1 ---
+        x = tl.load(X_ptr + row * C + offs).to(tl.float32)
+        s1 = tl.load(SIGNS1_ptr + offs).to(tl.float32)
+        x = x * s1
+
+        # --- WHT butterfly stages ---
+        if LOG2_C >= 1:
+            x = _wht_butterfly_stage(x, 1, C)
+        if LOG2_C >= 2:
+            x = _wht_butterfly_stage(x, 2, C)
+        if LOG2_C >= 3:
+            x = _wht_butterfly_stage(x, 4, C)
+        if LOG2_C >= 4:
+            x = _wht_butterfly_stage(x, 8, C)
+        if LOG2_C >= 5:
+            x = _wht_butterfly_stage(x, 16, C)
+        if LOG2_C >= 6:
+            x = _wht_butterfly_stage(x, 32, C)
+        if LOG2_C >= 7:
+            x = _wht_butterfly_stage(x, 64, C)
+        if LOG2_C >= 8:
+            x = _wht_butterfly_stage(x, 128, C)
+        if LOG2_C >= 9:
+            x = _wht_butterfly_stage(x, 256, C)
+        if LOG2_C >= 10:
+            x = _wht_butterfly_stage(x, 512, C)
+        if LOG2_C >= 11:
+            x = _wht_butterfly_stage(x, 1024, C)
+        if LOG2_C >= 12:
+            x = _wht_butterfly_stage(x, 2048, C)
+        if LOG2_C >= 13:
+            x = _wht_butterfly_stage(x, 4096, C)
+
+        # --- Normalize ---
+        x = x * (1.0 / tl.sqrt(float(C)))
+
+        # --- Apply sign2 ---
+        s2 = tl.load(SIGNS2_ptr + offs).to(tl.float32)
+        x = x * s2
+
+        # --- 3-bit group quantization (8 Lloyd-Max centroids) ---
+        N_GROUPS: tl.constexpr = C // GS
+        x_g = tl.reshape(x, [N_GROUPS, GS])
+
+        # Per-group absmax scaling
+        absmax = tl.max(tl.abs(x_g), axis=1)  # (N_GROUPS,)
+        absmax = tl.maximum(absmax, 1e-10)
+        scale = absmax / 2.152  # (N_GROUPS,)
+
+        # Normalize within groups
+        normalized = x_g / scale[:, None]
+
+        # Quantize to 8 centroids via 7 boundaries
+        idx = tl.zeros([N_GROUPS, GS], dtype=tl.int32)
+        idx = tl.where(normalized >= -1.748, idx + 1, idx)
+        idx = tl.where(normalized >= -1.050, idx + 1, idx)
+        idx = tl.where(normalized >= -0.501, idx + 1, idx)
+        idx = tl.where(normalized >= 0.0, idx + 1, idx)
+        idx = tl.where(normalized >= 0.501, idx + 1, idx)
+        idx = tl.where(normalized >= 1.050, idx + 1, idx)
+        idx = tl.where(normalized >= 1.748, idx + 1, idx)
+
+        # --- True 3-bit packing: 8 values → 3 bytes ---
+        # Flatten to 1-D then reshape to [PACK8, 2, 2, 2] for triple split
+        PACK8: tl.constexpr = C // 8
+        idx_flat = tl.reshape(idx, [C])
+        idx_222 = tl.reshape(idx_flat, [PACK8, 2, 2, 2])
+
+        # Triple split extracts 8 scalar streams:
+        #   split → c0[p,a,b]=even, c1[p,a,b]=odd over last dim
+        #   split → c00[p,a]=v0/v4, c01[p,a]=v2/v6, c10[p,a]=v1/v5, c11[p,a]=v3/v7
+        #   split → individual v0..v7
+        c0, c1 = tl.split(idx_222)
+        c00, c01 = tl.split(c0)
+        c10, c11 = tl.split(c1)
+        v0, v4 = tl.split(c00)
+        v2, v6 = tl.split(c01)
+        v1, v5 = tl.split(c10)
+        v3, v7 = tl.split(c11)
+
+        # Pack 8×3-bit into 24-bit int32, then extract 3 bytes
+        packed = (v0 | (v1 << 3) | (v2 << 6) | (v3 << 9)
+                 | (v4 << 12) | (v5 << 15) | (v6 << 18) | (v7 << 21))
+        byte0 = (packed & 0xFF).to(tl.uint8)
+        byte1 = ((packed >> 8) & 0xFF).to(tl.uint8)
+        byte2 = ((packed >> 16) & 0xFF).to(tl.uint8)
+
+        # Store with stride-3 pattern: [b0_0, b1_0, b2_0, b0_1, b1_1, b2_1, ...]
+        PACKED_PER_ROW: tl.constexpr = C * 3 // 8
+        base = row * PACKED_PER_ROW
+        stride_offs = tl.arange(0, PACK8)
+        tl.store(PACKED_ptr + base + stride_offs * 3, byte0)
+        tl.store(PACKED_ptr + base + stride_offs * 3 + 1, byte1)
+        tl.store(PACKED_ptr + base + stride_offs * 3 + 2, byte2)
+
+        # --- Store scales ---
+        scale_offs = tl.arange(0, N_GROUPS)
+        tl.store(SCALES_ptr + row * N_GROUPS + scale_offs, scale.to(tl.bfloat16))
+
+    @triton.jit
+    def _fused_wht_decompress_3bit_kernel(
+        PACKED_ptr,     # (T, C*3//8) uint8 input
+        SCALES_ptr,     # (T, n_groups) bf16 input
+        OUT_ptr,        # (T, OUT_DIM) output
+        SIGNS1_ptr,     # (C_padded,) sign vector
+        SIGNS2_ptr,     # (C_padded,) sign vector
+        T,
+        C: tl.constexpr,
+        LOG2_C: tl.constexpr,
+        GS: tl.constexpr,
+        OUT_DIM: tl.constexpr,
+    ):
+        """Fused: true 3-bit unpack → centroid dequant → sign2 → WHT → normalize → sign1."""
+        row = tl.program_id(0)
+        if row >= T:
+            return
+
+        N_GROUPS: tl.constexpr = C // GS
+        PACK8: tl.constexpr = C // 8
+        PACKED_PER_ROW: tl.constexpr = C * 3 // 8
+
+        # --- Load packed data with stride-3 ---
+        base = row * PACKED_PER_ROW
+        stride_offs = tl.arange(0, PACK8)
+        byte0 = tl.load(PACKED_ptr + base + stride_offs * 3)
+        byte1 = tl.load(PACKED_ptr + base + stride_offs * 3 + 1)
+        byte2 = tl.load(PACKED_ptr + base + stride_offs * 3 + 2)
+
+        # --- Unpack 8 values from 3 bytes via 24-bit int32 ---
+        packed = byte0.to(tl.int32) | (byte1.to(tl.int32) << 8) | (byte2.to(tl.int32) << 16)
+        v0 = packed & 0x7
+        v1 = (packed >> 3) & 0x7
+        v2 = (packed >> 6) & 0x7
+        v3 = (packed >> 9) & 0x7
+        v4 = (packed >> 12) & 0x7
+        v5 = (packed >> 15) & 0x7
+        v6 = (packed >> 18) & 0x7
+        v7 = (packed >> 21) & 0x7
+
+        # Reassemble to flat [C] via inverse of the triple-split
+        c00 = tl.join(v0, v4)    # [PACK8, 2]
+        c01 = tl.join(v2, v6)
+        c10 = tl.join(v1, v5)
+        c11 = tl.join(v3, v7)
+        c0 = tl.join(c00, c01)   # [PACK8, 2, 2]
+        c1 = tl.join(c10, c11)
+        idx_222 = tl.join(c0, c1) # [PACK8, 2, 2, 2]
+        idx = tl.reshape(idx_222, [N_GROUPS, GS])
+
+        # --- Load scales and dequantize via centroid lookup ---
+        scale_offs = tl.arange(0, N_GROUPS)
+        scale = tl.load(SCALES_ptr + row * N_GROUPS + scale_offs).to(tl.float32)
+
+        # 8 Lloyd-Max centroids for N(0,1)
+        c_0: tl.constexpr = -2.152
+        c_1: tl.constexpr = -1.344
+        c_2: tl.constexpr = -0.756
+        c_3: tl.constexpr = -0.245
+        c_4: tl.constexpr = 0.245
+        c_5: tl.constexpr = 0.756
+        c_6: tl.constexpr = 1.344
+        c_7: tl.constexpr = 2.152
+        vals = tl.where(idx == 0, c_0,
+               tl.where(idx == 1, c_1,
+               tl.where(idx == 2, c_2,
+               tl.where(idx == 3, c_3,
+               tl.where(idx == 4, c_4,
+               tl.where(idx == 5, c_5,
+               tl.where(idx == 6, c_6, c_7)))))))
+        x_g = vals.to(tl.float32) * scale[:, None]
+
+        # Flatten groups to (C,)
+        x = tl.reshape(x_g, [C])
+
+        # --- Inverse WHT: undo sign2, butterfly, normalize, undo sign1 ---
+        s2 = tl.load(SIGNS2_ptr + tl.arange(0, C)).to(tl.float32)
+        x = x * s2
+
+        if LOG2_C >= 1:
+            x = _wht_butterfly_stage(x, 1, C)
+        if LOG2_C >= 2:
+            x = _wht_butterfly_stage(x, 2, C)
+        if LOG2_C >= 3:
+            x = _wht_butterfly_stage(x, 4, C)
+        if LOG2_C >= 4:
+            x = _wht_butterfly_stage(x, 8, C)
+        if LOG2_C >= 5:
+            x = _wht_butterfly_stage(x, 16, C)
+        if LOG2_C >= 6:
+            x = _wht_butterfly_stage(x, 32, C)
+        if LOG2_C >= 7:
+            x = _wht_butterfly_stage(x, 64, C)
+        if LOG2_C >= 8:
+            x = _wht_butterfly_stage(x, 128, C)
+        if LOG2_C >= 9:
+            x = _wht_butterfly_stage(x, 256, C)
+        if LOG2_C >= 10:
+            x = _wht_butterfly_stage(x, 512, C)
+        if LOG2_C >= 11:
+            x = _wht_butterfly_stage(x, 1024, C)
+        if LOG2_C >= 12:
+            x = _wht_butterfly_stage(x, 2048, C)
+        if LOG2_C >= 13:
+            x = _wht_butterfly_stage(x, 4096, C)
+
+        x = x * (1.0 / tl.sqrt(float(C)))
+
+        s1 = tl.load(SIGNS1_ptr + tl.arange(0, C)).to(tl.float32)
+        x = x * s1
+
+        # --- Store ---
         out_offs = tl.arange(0, C)
         out_mask = out_offs < OUT_DIM
         tl.store(OUT_ptr + row * OUT_DIM + out_offs, x, mask=out_mask)
@@ -762,7 +999,7 @@ class FusedWHTCompressor:
     """Fused WHT rotation + quantization + packing in single kernel launches.
 
     Eliminates intermediate tensors between rotation and quantization.
-    Supports both 2-bit and 4-bit modes.
+    Supports 2-bit, 3-bit, and 4-bit modes.
     """
 
     def __init__(self, hidden_dim: int, group_size: int, bits: int, seed: int, device: torch.device):
@@ -798,6 +1035,8 @@ class FusedWHTCompressor:
         self.n_groups = self.padded_dim // self.group_size
         if bits == 2:
             self.packed_per_row = self.padded_dim // 4   # 4 values per byte
+        elif bits == 3:
+            self.packed_per_row = self.padded_dim * 3 // 8  # 8 values per 3 bytes
         else:
             self.packed_per_row = self.padded_dim // 2   # 2 values per byte
 
@@ -817,6 +1056,7 @@ class FusedWHTCompressor:
 
         Returns:
             2-bit: (packed, scales, None)
+            3-bit: (packed, scales, None)
             4-bit: (packed, scales, zero_points)
         """
         self._ensure_device(x.device)
@@ -834,6 +1074,16 @@ class FusedWHTCompressor:
 
         if self.bits == 2:
             _fused_wht_compress_2bit_kernel[grid](
+                x, packed, scales, self.signs1, self.signs2,
+                T,
+                C=self.padded_dim,
+                LOG2_C=self.log2_dim,
+                GS=self.group_size,
+                num_warps=warps,
+            )
+            return packed, scales, None
+        elif self.bits == 3:
+            _fused_wht_compress_3bit_kernel[grid](
                 x, packed, scales, self.signs1, self.signs2,
                 T,
                 C=self.padded_dim,
@@ -880,6 +1130,16 @@ class FusedWHTCompressor:
 
         if self.bits == 2:
             _fused_wht_decompress_2bit_kernel[grid](
+                packed, scales, out, self.signs1, self.signs2,
+                T,
+                C=self.padded_dim,
+                LOG2_C=self.log2_dim,
+                GS=self.group_size,
+                OUT_DIM=self.hidden_dim,
+                num_warps=warps,
+            )
+        elif self.bits == 3:
+            _fused_wht_decompress_3bit_kernel[grid](
                 packed, scales, out, self.signs1, self.signs2,
                 T,
                 C=self.padded_dim,

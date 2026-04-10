@@ -71,7 +71,7 @@ class ExecutionStrategy:
 
     # TP Communication Compression
     tp_allreduce_compress: str = "none"    # "none" | "fp8" | "turboquant"
-    tp_compress_bits: int = 4              # 2 | 4  (bit-width for turboquant)
+    tp_compress_bits: int = 4              # 2 | 3 | 4  (bit-width for turboquant)
     tp_compress_group_size: int = 64       # must divide hidden_dim
     tp_compress_residual: bool = False     # step-to-step residual caching (Phase 2)
     tp_compress_rotation: str = "signperm" # "signperm" | "wht" (Phase 3)

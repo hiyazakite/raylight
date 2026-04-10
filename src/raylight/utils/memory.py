@@ -62,8 +62,12 @@ class MemoryPolicy:
         # CompactFusion cache evictor — registered via set_compact_cache_evictor().
         # Called BEFORE weight eviction (cheaper to rebuild).
         self._compact_evictor = None
-        # Guard: prevents watermark eviction while model weights are
-        # actively being read during a forward pass.
+        # Layer-aware guard: param names of the currently-executing block.
+        # When non-empty, offload_by_pressure() skips these params.
+        # When empty, eviction is fully unblocked.
+        self._protected_params: set = set()
+        # Legacy compat: binary guard for code that still checks _in_forward.
+        # True whenever _protected_params is non-empty OR set explicitly.
         self._in_forward: bool = False
 
     # ─── Intent-based API ────────────────────────────────────
@@ -178,6 +182,20 @@ class MemoryPolicy:
         """
         self._compact_evictor = evictor_fn
 
+    def protect_params(self, names: set) -> None:
+        """Mark *names* as protected — they will not be evicted.
+
+        Called by per-block pre-forward hooks (Phase 1).
+        """
+        self._protected_params |= names
+
+    def unprotect_params(self, names: set) -> None:
+        """Remove *names* from the protected set.
+
+        Called by per-block post-forward hooks (Phase 1).
+        """
+        self._protected_params -= names
+
     def relieve_pressure(self, needed_bytes: int = 0) -> int:
         """Try to free VRAM under pressure, ordered by cost.
 
@@ -218,22 +236,28 @@ class MemoryPolicy:
                 print(f"[MemoryPolicy] Compact cache eviction failed: {e}")
 
         # Step 3: Watermark partial offload (aimdo-style) — last resort
-        # BLOCKED during forward pass — can't evict weights being read.
-        if self._in_forward:
+        # When a protected set is active, evict only non-protected params.
+        # When _in_forward is True with no protected set (legacy path),
+        # block all eviction to avoid corrupting an unguarded forward.
+        if self._in_forward and not self._protected_params:
             return freed_total
 
         cache = self._pinned_cache
         module = self._offload_module
         if cache is not None and module is not None:
-            # Allow eviction when the cache is built (pinned path) OR when
-            # an mmap fallback is available (zero-alloc eviction).
-            can_evict = getattr(cache, 'built', False) or getattr(cache, 'has_mmap_fallback', False)
-            if can_evict:
-                try:
-                    freed = cache.offload_by_pressure(module, deficit)
-                    freed_total += freed
-                except Exception as e:
-                    print(f"[MemoryPolicy] Pressure offload failed: {e}")
+            try:
+                freed = cache.offload_by_pressure(
+                    module, deficit, exclude=self._protected_params,
+                )
+                freed_total += freed
+                # Flush freed blocks to the CUDA driver so the C interceptor's
+                # cuMemAlloc_v2 retry sees them.  Without this, freed storages
+                # sit in PyTorch's caching allocator and the driver-level retry
+                # fails, forcing PyTorch to nuke its ENTIRE cached pool.
+                if freed > 0:
+                    self._release_cuda_cache()
+            except Exception as e:
+                print(f"[MemoryPolicy] Pressure offload failed: {e}")
 
         return freed_total
 
@@ -288,6 +312,8 @@ class _NullPolicy(MemoryPolicy):
     def relieve_pressure(self, needed_bytes: int = 0) -> int: return 0
     def set_offload_target(self, cache, module) -> None: ...
     def set_compact_cache_evictor(self, evictor_fn) -> None: ...
+    def protect_params(self, names: set) -> None: ...
+    def unprotect_params(self, names: set) -> None: ...
 
 
 #: Module-level null fallback — importers can use as default parameter.

@@ -419,6 +419,61 @@ class RayActor:
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
 
+    def set_tp_compress_config(self, mode: str, bits: int, rotation: str, residual: bool):
+        """Update TP compression config on all TPLinear layers at runtime.
+
+        When mode="none", removes compressors (disabling compression).
+        Otherwise, rebuilds compressors with the new config.
+        """
+        from raylight.distributed_modules.tp_compress import TPCompressConfig, TPCompressor
+        from raylight.distributed_modules.tensor_parallel import TPLinear
+        from raylight.distributed_modules.tp_linear_factory import TPGGMLLinear
+
+        if self.model is None:
+            return
+
+        diffusion_model = None
+        if hasattr(self.model, "get_model_object"):
+            try:
+                diffusion_model = self.model.get_model_object("diffusion_model")
+            except Exception:
+                pass
+        if diffusion_model is None and hasattr(self.model, "model"):
+            diffusion_model = getattr(self.model.model, "diffusion_model", self.model.model)
+        if diffusion_model is None:
+            return
+
+        new_config = TPCompressConfig(
+            mode=mode,
+            bits=bits,
+            group_size=self.raylight_config.strategy.tp_compress_group_size,
+            use_residual=residual,
+            rotation=rotation,
+        )
+
+        layer_id = 0
+        for module in diffusion_model.modules():
+            if isinstance(module, (TPLinear, TPGGMLLinear)) and module.parallelism == "row":
+                if mode == "none":
+                    module.compressor = None
+                else:
+                    device = next(module.parameters()).device
+                    module.compressor = TPCompressor(
+                        new_config, module.out_features, layer_id, device,
+                    )
+                layer_id += 1
+
+        # Also update the strategy so any future TP patching is consistent
+        from dataclasses import replace
+        new_strategy = replace(
+            self.raylight_config.strategy,
+            tp_allreduce_compress=mode,
+            tp_compress_bits=bits,
+            tp_compress_residual=residual,
+            tp_compress_rotation=rotation,
+        )
+        object.__setattr__(self.raylight_config, 'strategy', new_strategy)
+
     def model_function_runner(self, fn, *args, **kwargs):
         self.model = fn(self.model, *args, **kwargs)
 
@@ -626,6 +681,10 @@ class RayActor:
         diff_model = getattr(self.model, 'model', None)
         if cache is not None and diff_model is not None:
             self.memory.set_offload_target(cache, diff_model)
+
+            # Store policy on the model patcher so per-block eviction hooks
+            # (Phase 1) can access it from forward-hook closures.
+            self.model._memory_policy = self.memory
 
             # Register mmap state dict as fallback for pressure eviction.
             # When the pinned cache isn't built yet, the interceptor can

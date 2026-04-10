@@ -153,14 +153,16 @@ class SamplerManager:
                     pass
 
                 # ── Phase 4: Restore evicted params after inference ──
-                if _needs_reload:
-                    cache = getattr(memory, '_pinned_cache', None)
-                    diff_module = getattr(work_model, 'model', None)
-                    if cache is not None and diff_module is not None:
-                        try:
-                            cache.reload_evicted(diff_module)
-                        except Exception as e:
-                            print(f"[SamplerManager] Evicted param reload failed: {e}")
+                # Covers both pre-forward evictions (_needs_reload) and
+                # mid-forward evictions (interceptor freed weights during
+                # per-block forward via layer-aware protected-set guard).
+                cache = getattr(memory, '_pinned_cache', None)
+                diff_module = getattr(work_model, 'model', None)
+                if cache is not None and diff_module is not None and cache._partial_freed:
+                    try:
+                        cache.reload_evicted(diff_module)
+                    except Exception as e:
+                        print(f"[SamplerManager] Evicted param reload failed: {e}")
 
 
                 if config.is_fsdp:

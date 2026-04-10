@@ -306,6 +306,64 @@ os.environ.setdefault('RAY_DEDUP_LOGS', '0')                  # skip log dedupli
 os.environ.setdefault('PYTHON_GIL', '1')                      # silence PEP 703 warning
 
 
+class RayTPCompress:
+    """Applies TP activation compression to loaded actors.
+
+    Place between a loader (RAY_ACTORS output) and a sampler (RAY_ACTORS input)
+    to enable compression on that branch.  Different samplers can use different
+    compression settings — or none at all — by branching the actors output.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "actors": (
+                    "RAY_ACTORS",
+                    {"tooltip": "Loaded actors from a Ray model loader."}
+                ),
+                "mode": (
+                    ["none", "fp8", "turboquant"],
+                    {"default": "turboquant",
+                     "tooltip": "Compression algorithm. 'turboquant' = rotation + quantization. 'fp8' = FP8 cast (2× reduction). 'none' = disable compression."}
+                ),
+                "bits": (
+                    ["2", "3", "4"],
+                    {"default": "4",
+                     "tooltip": "TurboQuant quantization bits. 4 = recommended (quality ≈ FP8). 3 = balanced (75% of 4-bit size). 2 = aggressive (8× compression). Ignored when mode=fp8."}
+                ),
+                "rotation": (
+                    ["signperm", "wht"],
+                    {"default": "signperm",
+                     "tooltip": "Rotation mode. 'signperm' = fast sign-flip + permutation. 'wht' = Walsh-Hadamard Transform (better quality at low bit-widths, requires Triton)."}
+                ),
+                "residual": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Step-to-step delta compression. Caches previous step's result and only transmits the change. Adds ~7.5 GB VRAM per rank but greatly improves compression quality."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("RAY_ACTORS",)
+    RETURN_NAMES = ("actors",)
+    FUNCTION = "apply_compress"
+    CATEGORY = "Raylight"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def apply_compress(self, actors: dict, mode: str, bits: str, rotation: str, residual: bool):
+        actor_list = actors["actors"]
+        futures = [
+            a.set_tp_compress_config.remote(mode, int(bits), rotation, residual)
+            for a in actor_list
+        ]
+        cancellable_get(futures)
+        print(f"[RayTPCompress] Applied TP compress: mode={mode}, bits={bits}, rotation={rotation}, residual={residual}")
+        return (actors,)
+
+
 class RayInitializer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -323,27 +381,6 @@ class RayInitializer:
                     "max": 8,
                     "tooltip": "Number of GPUs for Tensor Parallelism weight sharding (1 = disabled). Must divide GPU count evenly."
                 }),
-                "tp_compress": (
-                    ["none", "fp8", "turboquant"],
-                    {"default": "none",
-                     "tooltip": "TP all-reduce compression. 'turboquant' = rotation + quantization (4× reduction). 'fp8' = 2× reduction."}
-                ),
-                "tp_compress_bits": ("INT", {
-                    "default": 4,
-                    "min": 2,
-                    "max": 4,
-                    "step": 2,
-                    "tooltip": "TurboQuant quantization bits. 4 = recommended (quality ≈ FP8). 2 = aggressive (8× compression)."
-                }),
-                "tp_compress_residual": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Step-to-step delta compression. Caches previous step's result and only transmits the change. Adds ~7.5 GB VRAM per rank but greatly improves compression quality."
-                }),
-                "tp_compress_rotation": (
-                    ["signperm", "wht"],
-                    {"default": "signperm",
-                     "tooltip": "Rotation mode. 'signperm' = fast sign-flip + permutation. 'wht' = Walsh-Hadamard Transform (better quality at 2-bit, requires Triton)."}
-                ),
                 "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
@@ -441,10 +478,6 @@ class RayInitializer:
         ring_degree: int = 1,
         cfg_degree: int = 1,
         tensor_parallel_degree: int = 1,
-        tp_compress: str = "none",
-        tp_compress_bits: int = 4,
-        tp_compress_residual: bool = False,
-        tp_compress_rotation: str = "signperm",
         sync_ulysses: bool = False,
         FSDP: bool = False,
         FSDP_CPU_OFFLOAD: bool = False,
@@ -530,10 +563,6 @@ class RayInitializer:
                     attention_backend=attention_backend,
                     attention_type=attn_type_enum,
                     ring_impl=ring_impl_type,
-                    tp_allreduce_compress=tp_compress,
-                    tp_compress_bits=tp_compress_bits,
-                    tp_compress_residual=tp_compress_residual,
-                    tp_compress_rotation=tp_compress_rotation,
                 ),
                 compact=CompactConfig(
                     enabled=delta_compression != "IDENTITY",
@@ -691,27 +720,6 @@ class RayInitializerAdvanced(RayInitializer):
                     "max": 8,
                     "tooltip": "Number of GPUs for Tensor Parallelism weight sharding (1 = disabled). Must divide GPU count evenly."
                 }),
-                "tp_compress": (
-                    ["none", "fp8", "turboquant"],
-                    {"default": "none",
-                     "tooltip": "TP all-reduce compression. 'turboquant' = rotation + quantization (4× reduction). 'fp8' = 2× reduction."}
-                ),
-                "tp_compress_bits": ("INT", {
-                    "default": 4,
-                    "min": 2,
-                    "max": 4,
-                    "step": 2,
-                    "tooltip": "TurboQuant quantization bits. 4 = recommended (quality ≈ FP8). 2 = aggressive (8× compression)."
-                }),
-                "tp_compress_residual": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Step-to-step delta compression. Caches previous step's result and only transmits the change. Adds ~7.5 GB VRAM per rank but greatly improves compression quality."
-                }),
-                "tp_compress_rotation": (
-                    ["signperm", "wht"],
-                    {"default": "signperm",
-                     "tooltip": "Rotation mode. 'signperm' = fast sign-flip + permutation. 'wht' = Walsh-Hadamard Transform (better quality at 2-bit, requires Triton)."}
-                ),
                 "sync_ulysses": ("BOOLEAN", {"default": False}),
                 "FSDP": ("BOOLEAN", {"default": False}),
                 "FSDP_CPU_OFFLOAD": ("BOOLEAN", {"default": False}),
@@ -932,10 +940,6 @@ class RayUNETLoader:
         except:
             unet_path = folder_paths.get_full_path_or_raise("checkpoints", unet_name)
 
-
-        loaded_futures = []
-        patched_futures = []
-
         # Check for Kitchen FP8 Quantization which is memory intensive (RAM spike during conversion)
         use_kitchen = config.debug.enable_kitchen
         
@@ -946,15 +950,25 @@ class RayUNETLoader:
             # Parallel loading (4x 500MB) is perfectly safe and much faster.
             pass
 
-        # PARALLEL LOADING (Fast)
-        # Uses ModelContext with zero-copy mmap for optimal speed
-        print(f"[Raylight] Parallel Load ({'FSDP' if config.strategy.is_fsdp else 'Standard'}): Creating lazy wrappers...")
-        for actor in actors:
-            loaded_futures.append(
-                actor.load_unet.remote(unet_path, model_options=model_options)
-            )
-        cancellable_get(loaded_futures)
-        loaded_futures = []
+        # Free host-process VRAM before actors load.  ComfyUI may still
+        # hold CLIP / VAE on the same physical GPUs the actors will use.
+        # Without this, the first cold-start on a shared GPU can OOM because
+        # the host's allocations eat into the actor's available VRAM.
+        # Models are lazily reloaded when needed (e.g. CLIP encode, VAE decode).
+        _orig_unload_all_models()
+        comfy.model_management.soft_empty_cache()
+
+        # LOADING
+        # TP streaming builds pinned slab from meta then streams weights
+        # directly into slab views — peak RAM per actor = 1× shard size.
+        # All actors can safely load in parallel.
+        strategy = config.strategy
+        label = 'FSDP' if strategy.is_fsdp else 'Standard'
+        print(f"[Raylight] Parallel Load ({label}): Dispatching to {len(actors)} actors...")
+        cancellable_get([
+            a.load_unet.remote(unet_path, model_options=model_options)
+            for a in actors
+        ])
 
         # Patching: Done in small batches to limit peak RAM while still
         # overlapping work across independent GPU actors.  Each actor runs
@@ -964,7 +978,6 @@ class RayUNETLoader:
         _PATCH_BATCH = 2
         
         # Access USP/CFG degrees safely from Strategy
-        strategy = config.strategy
         if strategy.is_xdit:
             if strategy.ulysses_degree > 1 or strategy.ring_degree > 1:
                 print(f"[Raylight] Batched USP Patching ({_PATCH_BATCH} actors at a time)...")
@@ -1718,6 +1731,7 @@ NODE_CLASS_MAPPINGS = {
     "RayIDLoraKSampler": RayIDLoraKSampler,
     "RayInitializer": RayInitializer,
     "RayInitializerAdvanced": RayInitializerAdvanced,
+    "RayTPCompress": RayTPCompress,
     "DPNoiseList": DPNoiseList,
     "RayVAEDecodeDistributed": RayVAEDecodeDistributed,
     "RayOffloadModel": RayOffloadModel,
@@ -1731,6 +1745,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RayIDLoraKSampler": "Ray ID-LoRA KSampler",
     "RayInitializer": "Ray Init Actor",
     "RayInitializerAdvanced": "Ray Init Actor (Advanced)",
+    "RayTPCompress": "TP Activation Compress (Ray)",
     "DPNoiseList": "Data Parallel Noise List",
     "RayVAEDecodeDistributed": "Distributed VAE (Ray)",
     "RayOffloadModel": "Offload Model (Ray)",

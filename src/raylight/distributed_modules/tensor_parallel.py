@@ -412,6 +412,10 @@ class TPLinear(nn.Module):
         if not weight.is_floating_point():
             if _HAS_INT8_KER and hasattr(self, "weight_scale"):
                 # Native INT8 fast-path (W8A8 dynamic)
+                # Ensure weight is on the same device as input (handles
+                # zero-RAM / LowVram mode where weights may be on CPU).
+                if weight.device != x.device:
+                    weight = weight.to(x.device, non_blocking=True)
                 w_scale = self.weight_scale
                 if isinstance(w_scale, torch.Tensor):
                     w_scale = w_scale.to(x.device, non_blocking=True)
@@ -424,6 +428,9 @@ class TPLinear(nn.Module):
                 x_2d = x.reshape(-1, x_shape[-1])
                 compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
                 
+                if bias is not None and bias.device != x.device:
+                    bias = bias.to(x.device, non_blocking=True)
+
                 if x_2d.shape[0] > 16:
                     if is_per_row:
                         out = int8_forward_dynamic_per_row(x_2d, weight, w_scale, bias, compute_dtype)

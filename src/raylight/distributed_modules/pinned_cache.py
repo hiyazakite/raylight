@@ -180,7 +180,32 @@ class BasePinnedCache(ABC):
         self._mmap_sd: Optional[Dict[str, torch.Tensor]] = None
         self._mmap_key_map: Optional[Dict[str, str]] = None  # param_name -> mmap_key
 
+        # ── Phase 3: Execution-distance-aware eviction ──
+        # Per-block param name groups in execution order, and the index of
+        # the currently-executing block.  When set, offload_by_pressure()
+        # evicts blocks farthest from the cursor first (already-computed
+        # blocks before far-future blocks), rather than fixed tail-first.
+        self._block_param_groups: Optional[List[frozenset]] = None
+        self._execution_cursor: int = -1  # -1 = not in forward
+
     # -------------------------------------------------------------- public
+
+    def set_block_structure(self, groups: list) -> None:
+        """Register per-block param name groups in execution order.
+
+        Called once by ``_install_eviction_hooks()`` after discovering
+        transformer blocks.  *groups* is a list of ``frozenset[str]``
+        ordered by sequential execution (block 0 first).
+        """
+        self._block_param_groups = list(groups)
+
+    def set_execution_cursor(self, idx: int) -> None:
+        """Update the currently-executing block index.
+
+        Called by each block's pre-forward hook.  ``-1`` resets to
+        the default tail-first ordering.
+        """
+        self._execution_cursor = idx
 
     @property
     def built(self) -> bool:
@@ -651,11 +676,24 @@ class BasePinnedCache(ABC):
         cpu_params = getattr(self, "_cpu_params", {})
         return cpu_params.get(name)
 
+    def _set_cpu_buf(self, name: str, tensor: torch.Tensor) -> None:
+        """Store a pinned CPU tensor for *name*.
+
+        Used by incremental eviction to cache individual params on-the-fly
+        without building the full contiguous slab.
+        """
+        cpu_params = getattr(self, "_cpu_params", None)
+        if cpu_params is None:
+            self._cpu_params = {}
+            cpu_params = self._cpu_params
+        cpu_params[name] = tensor
+
     def offload_by_pressure(
         self,
         module: torch.nn.Module,
         target_bytes: int,
         non_blocking: bool = True,
+        exclude: Optional[set] = None,
     ) -> int:
         """Free at least *target_bytes* of VRAM by offloading tail params.
 
@@ -663,11 +701,17 @@ class BasePinnedCache(ABC):
         Stops as soon as cumulative freed bytes >= target_bytes.  Mirrors
         aimdo's watermark eviction that scans from the VBAR tail.
 
-        When the pinned cache is built, snapshots CUDA → pinned before
-        freeing.  When *not* built but an mmap fallback is registered,
-        simply frees the CUDA storage — the data is recoverable from the
-        mmap source.  This avoids allocating a pinned RAM buffer in
-        RAM-constrained settings.
+        Parameters in *exclude* (the currently-executing block) are skipped,
+        equivalent to aimdo's pinned-page guard.
+
+        Three source modes, chosen automatically:
+
+        - **built** — copies CUDA → existing pinned slab views before freeing.
+        - **mmap** — frees CUDA storage; data recoverable from mmap source.
+        - **incremental** — allocates a pinned buffer per evicted param
+          on-the-fly, copies CUDA → pinned, then frees.  Only the evicted
+          layers consume host RAM; the rest stay CUDA-only.  Pinned buffers
+          persist in ``_cpu_params`` for fast reload on subsequent cycles.
 
         Does NOT set ``_on_cuda = False`` — the model is now **partially
         resident** (some params on CUDA, some freed).
@@ -678,11 +722,12 @@ class BasePinnedCache(ABC):
             return 0
 
         use_mmap = False
+        use_incremental = False
         if not self._built:
             if self._mmap_sd is not None:
                 use_mmap = True
             else:
-                return 0
+                use_incremental = True
 
         # Lazy-init param_order if not yet populated (mmap path, no build)
         if not self._param_order:
@@ -693,10 +738,37 @@ class BasePinnedCache(ABC):
         freed = 0
         param_dict = dict(module.named_parameters())
 
-        # Walk from tail (lowest priority → evict first)
-        for name in reversed(self._param_order):
+        # ── Build eviction walk order ─────────────────────────────────
+        # Phase 3: when a block structure + cursor is active, evict by
+        # execution distance instead of fixed reverse-load-order.
+        #   Priority 1: already-computed blocks (cursor-1 → 0) — safe,
+        #               won't be needed again this timestep.
+        #   Priority 2: farthest-future blocks (N-1 → cursor+2) — not
+        #               needed for a while.
+        #   Fallback:   reverse _param_order (Phase 1 behaviour).
+        evict_order: Optional[List[str]] = None
+        groups = self._block_param_groups
+        cursor = self._execution_cursor
+        if groups is not None and 0 <= cursor < len(groups):
+            evict_order = []
+            # Already-computed blocks, most-recent first
+            for bi in range(cursor - 1, -1, -1):
+                evict_order.extend(groups[bi])
+            # Farthest-future blocks, farthest first
+            for bi in range(len(groups) - 1, cursor + 1, -1):
+                evict_order.extend(groups[bi])
+
+        walk = evict_order if evict_order else reversed(self._param_order)
+
+        print(f"[{self._tag}] Eviction starting: target={target_bytes/1e9:.2f} GB, "
+              f"already_evicted={len(self._partial_freed)}/{len(self._param_order)}")
+
+        evict_count = 0
+        for name in walk:
             if freed >= target_bytes:
                 break
+            if exclude and name in exclude:
+                continue  # protected — currently executing block
             param = param_dict.get(name)
             if param is None or param.device.type != "cuda":
                 continue
@@ -714,6 +786,13 @@ class BasePinnedCache(ABC):
                 cpu_buf = self._get_cpu_buf(name)
                 if cpu_buf is not None:
                     cpu_buf.copy_(param.data, non_blocking=non_blocking)
+                elif use_incremental:
+                    # First eviction of this param — allocate a pinned
+                    # buffer on-the-fly.  Only the evicted layers consume
+                    # host RAM; the rest stay CUDA-only.
+                    pinned = torch.empty_like(param.data, device="cpu").pin_memory()
+                    pinned.copy_(param.data, non_blocking=non_blocking)
+                    self._set_cpu_buf(name, pinned)
 
             # Free CUDA storage
             s = param.data.untyped_storage()
@@ -722,12 +801,17 @@ class BasePinnedCache(ABC):
                 self._partial_freed[name] = (s, nb)
                 s.resize_(0)
                 freed += nb
+                evict_count += 1
+                print(f"[{self._tag}]   evict [{evict_count}] {name}: "
+                      f"{nb/1e6:.1f} MB (cumulative {freed/1e9:.2f}/{target_bytes/1e9:.2f} GB)")
 
         if freed > 0:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             self._watermark = len(self._partial_freed)
-            source = "mmap" if use_mmap else "pinned"
+            source = "mmap" if use_mmap else (
+                "incremental" if use_incremental else "pinned"
+            )
             print(
                 f"[{self._tag}] Watermark offload ({source}): freed {freed / 1e9:.2f} GB "
                 f"({self._watermark}/{len(self._param_order)} params evicted)"
@@ -779,16 +863,37 @@ class BasePinnedCache(ABC):
                     param.data.copy_(mmap_tensor, non_blocking=non_blocking)
                     restored += 1
                     mmap_restored += 1
+                    continue
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
         freed_gb = sum(nb for _, nb in self._partial_freed.values()) / 1e9
+        evicted_names = set(self._partial_freed.keys())
         self._partial_freed.clear()
         self._watermark = 0
+
+        # Free incremental pinned buffers — CUDA is authoritative now.
+        # Only for unbuilt (incremental) path; built caches hold slab views
+        # that must survive for the next offload_to_cpu snapshot.
+        if not self._built:
+            cpu_params = getattr(self, '_cpu_params', None)
+            if cpu_params is not None:
+                freed_bufs = 0
+                for name in evicted_names:
+                    if cpu_params.pop(name, None) is not None:
+                        freed_bufs += 1
+                if freed_bufs > 0:
+                    print(
+                        f"[{self._tag}] Freed {freed_bufs} incremental pinned "
+                        f"buffers after reload."
+                    )
+
         source_info = ""
         if mmap_restored > 0:
-            source_info = f" ({mmap_restored} from mmap)"
+            source_info += f", {mmap_restored} from mmap"
+        if disk_restored > 0:
+            source_info += f", {disk_restored} from disk"
         print(
             f"[{self._tag}] Restored {restored} evicted params to CUDA "
             f"({freed_gb:.2f} GB){source_info}."
@@ -1197,6 +1302,10 @@ class ContiguousPinnedCache(BasePinnedCache):
         # Phase 2: allocate single contiguous pinned slab
         self._slab = torch.empty(total_bytes, dtype=torch.uint8, device="cpu").pin_memory()
 
+        # Build module map for meta→pinned swaps (param.data = view fails
+        # for meta tensors; need setattr with a new Parameter on parent).
+        module_map: Dict[str, torch.nn.Module] = dict(module.named_modules())
+
         # Phase 3: create typed views into the slab and copy data
         needs_sync = False
         param_dict = dict(module.named_parameters())
@@ -1214,7 +1323,20 @@ class ContiguousPinnedCache(BasePinnedCache):
 
             src = param_dict[name].data if is_param else buf_dict[name].data
 
-            if src.device.type == "cuda":
+            if src.device == torch.device("meta"):
+                # Meta tensor — swap param/buffer to point at pinned view.
+                # .data assignment fails for meta→CPU ("incompatible tensor
+                # type"), so replace the Parameter on the parent module.
+                parts = name.rsplit(".", 1)
+                parent_path = parts[0] if len(parts) == 2 else ""
+                attr = parts[-1]
+                parent = module_map[parent_path]
+                if is_param:
+                    setattr(parent, attr, torch.nn.Parameter(flat_view, requires_grad=False))
+                else:
+                    setattr(parent, attr, flat_view)
+                pinned_cpu += 1
+            elif src.device.type == "cuda":
                 flat_view.copy_(src, non_blocking=True)
                 needs_sync = True
             else:
@@ -1337,6 +1459,30 @@ class ContiguousPinnedCache(BasePinnedCache):
         super().cleanup()
         if gb > 0:
             print(f"[{self._tag}] Cleanup: freed {gb:.2f} GB contiguous pinned slab.")
+
+    def release_host_copy(self) -> None:
+        """Free pinned host memory after reload to CUDA.
+
+        After ``reload_to_cuda()``, both CUDA and pinned copies coexist.
+        This releases the pinned copy to reclaim host RAM.  The next
+        ``offload_to_cpu()`` will call ``build()`` to create a fresh slab
+        from live CUDA weights.
+
+        Keeps ``_param_order`` and ``_on_cuda`` intact — the model is
+        still on CUDA and future eviction walks stay valid.
+        """
+        gb = self._total_bytes / 1e9 if self._slab is not None else 0
+        buf_gb = sum(t.nbytes for t in self._cpu_params.values()) / 1e9 if self._cpu_params else 0
+        self._slab = None
+        self._cpu_params.clear()
+        self._cpu_buffers.clear()
+        self._total_bytes = 0
+        self._built = False
+        # _freed_storages now point to live CUDA storages — clear stale refs
+        self._freed_storages = []
+        total = gb + buf_gb
+        if total > 0:
+            print(f"[{self._tag}] Released {total:.2f} GB pinned host copy.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

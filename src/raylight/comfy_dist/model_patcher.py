@@ -315,6 +315,60 @@ def _decompose_lora_for_tp(module, patches):
 
 
 # ---------------------------------------------------------------------------
+# Demand-fault helper for layer-aware eviction (Phase 1)
+# ---------------------------------------------------------------------------
+
+def _demand_fault_params(cache, diff_model, names: set, sync: bool = True) -> int:
+    """Re-inflate specific evicted params from pinned cache before block forward.
+
+    Equivalent to aimdo's ``vbar_fault()`` — make specific pages resident
+    in VRAM.  Only reloads the intersection of *names* and
+    ``cache._partial_freed``; everything else is left evicted.
+
+    When *sync* is False the caller is responsible for stream
+    synchronisation (used by the prefetch pipeline on a side stream).
+
+    Returns count of params restored.
+    """
+    import torch
+
+    param_dict = dict(diff_model.named_parameters())
+    restored = 0
+
+    for name in names:
+        entry = cache._partial_freed.get(name)
+        if entry is None:
+            continue
+        storage, nbytes = entry
+        storage.resize_(nbytes)
+
+        param = param_dict.get(name)
+        if param is None:
+            continue
+
+        # Copy from pinned cache (fastest — DMA-capable)
+        cpu_buf = cache._get_cpu_buf(name)
+        if cpu_buf is not None:
+            param.data.copy_(cpu_buf, non_blocking=True)
+            restored += 1
+        elif cache._mmap_sd is not None:
+            # Fallback: copy from mmap source
+            mmap_key = cache._resolve_mmap_key(name)
+            if mmap_key is not None:
+                param.data.copy_(cache._mmap_sd[mmap_key], non_blocking=True)
+                restored += 1
+
+        del cache._partial_freed[name]
+
+    if restored > 0:
+        if sync:
+            torch.cuda.synchronize()
+        cache._watermark = len(cache._partial_freed)
+
+    return restored
+
+
+# ---------------------------------------------------------------------------
 # Activation-space LoRA for nn.Linear (LazyTensor / GGUF SP paths)
 # ---------------------------------------------------------------------------
 
@@ -446,6 +500,7 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
         "load_config",
         "vram_limit_bytes",
         "mmap_cache",
+        "_memory_policy",
     )
 
     def clone(self, *args, **kwargs):
@@ -616,7 +671,185 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
             if device_to is not None and str(device_to) != "cpu":
                 pinned_cache._on_cuda = True
 
+        # ── Phase 1: Install per-block eviction hooks ─────────────────
+        # These protect the currently-executing block from the CUDA
+        # allocator interceptor while allowing all other blocks' weights
+        # to be evicted under VRAM pressure.
+        self._install_eviction_hooks()
+
         return result
+
+    # ──────────────────────────────────────────────────────────────────
+    # Layer-aware eviction hooks (Phase 1)
+    # ──────────────────────────────────────────────────────────────────
+
+    _EVICTION_PRE_KEY = "_raylight_eviction_pre_hook"
+    _EVICTION_POST_KEY = "_raylight_eviction_post_hook"
+
+    def _install_eviction_hooks(self) -> None:
+        """Register pre/post-forward hooks on transformer blocks.
+
+        Each hook protects the block's parameter names during its forward
+        pass and demand-faults any evicted weights before compute.
+        Equivalent to aimdo's per-layer ``vbar_fault()`` / ``vbar_unpin()``.
+
+        **Phase 2 — Prefetch pipeline**:  The pre-hook of block *N* also
+        kicks off an *async* H2D copy of block *N+1*'s evicted weights on
+        a dedicated CUDA stream.  When block *N+1*'s pre-hook fires it
+        waits on the prefetch event instead of doing a synchronous
+        demand-fault, hiding H2D latency behind compute.
+        """
+        policy = getattr(self, "_memory_policy", None)
+        pinned_cache = getattr(self, "pinned_param_cache", None)
+        if policy is None or pinned_cache is None:
+            return
+        can_evict = pinned_cache.built or getattr(pinned_cache, 'has_mmap_fallback', False)
+        if not can_evict:
+            return
+
+        diff_model = getattr(self, "model", None)
+        if diff_model is None:
+            return
+
+        from raylight.nodes import _TRANSFORMER_BLOCK_NAMES
+
+        # Remove stale hooks first (idempotent re-install on re-load).
+        self._remove_eviction_hooks()
+
+        # ── Collect all transformer blocks in execution order ─────────
+        ordered_blocks = []
+        for block_attr in _TRANSFORMER_BLOCK_NAMES:
+            blocks = getattr(diff_model, block_attr, None)
+            if blocks is None:
+                continue
+            for i, block in enumerate(blocks):
+                prefix = f"diffusion_model.{block_attr}.{i}."
+                param_names = frozenset(
+                    name for name, _ in diff_model.named_parameters()
+                    if name.startswith(prefix)
+                )
+                if param_names:
+                    ordered_blocks.append((block, param_names))
+
+        if not ordered_blocks:
+            return
+
+        # ── Prefetch state — shared mutable containers for closures ───
+        pf_stream = torch.cuda.Stream()
+        pf_event = [None]       # pending prefetch CUDA event
+        pf_names = [None]       # frozenset of prefetched block's param names
+
+        installed = 0
+        for idx, (block, param_names) in enumerate(ordered_blocks):
+            next_names = (
+                ordered_blocks[idx + 1][1] if idx + 1 < len(ordered_blocks) else None
+            )
+
+            def _make_pre_hook(names, nxt_names, cache, pol, diff_mod, stream, evt, pfn, block_idx):
+                def hook(module, args):
+                    # 0. Update execution cursor for distance-aware eviction.
+                    cache.set_execution_cursor(block_idx)
+
+                    # 1. Clean up stale prefetch protection (mis-predicted order).
+                    if pfn[0] is not None and pfn[0] is not names:
+                        pol.unprotect_params(pfn[0])
+                        evt[0] = None
+                        pfn[0] = None
+
+                    # 2. Protect this block from eviction.
+                    pol.protect_params(names)
+
+                    # 3. Load this block's weights.
+                    if evt[0] is not None and pfn[0] is names:
+                        # Was prefetched — wait for async H2D to complete.
+                        torch.cuda.current_stream().wait_event(evt[0])
+                        evt[0] = None
+                        pfn[0] = None
+                    elif cache._partial_freed:
+                        # Not prefetched — demand-fault synchronously.
+                        evicted = names & cache._partial_freed.keys()
+                        if evicted:
+                            _demand_fault_params(cache, diff_mod, evicted)
+
+                    # 4. Prefetch next block on a side stream.
+                    if nxt_names is not None and cache._partial_freed:
+                        evicted_next = nxt_names & cache._partial_freed.keys()
+                        if evicted_next:
+                            pol.protect_params(nxt_names)  # guard during async copy
+                            with torch.cuda.stream(stream):
+                                _demand_fault_params(
+                                    cache, diff_mod, evicted_next, sync=False,
+                                )
+                            evt[0] = stream.record_event()
+                            pfn[0] = nxt_names
+                return hook
+
+            def _make_post_hook(names, pol):
+                def hook(module, args, output):
+                    pol.unprotect_params(names)
+                return hook
+
+            pre_h = block.register_forward_pre_hook(
+                _make_pre_hook(
+                    param_names, next_names, pinned_cache, policy,
+                    diff_model, pf_stream, pf_event, pf_names, idx,
+                )
+            )
+            post_h = block.register_forward_hook(
+                _make_post_hook(param_names, policy)
+            )
+            setattr(block, self._EVICTION_PRE_KEY, pre_h)
+            setattr(block, self._EVICTION_POST_KEY, post_h)
+            installed += 1
+
+        # Store block structure for distance-aware eviction.
+        pinned_cache.set_block_structure([names for _, names in ordered_blocks])
+
+        # Store prefetch state for cleanup.
+        self._pf_names = pf_names
+        self._pf_stream = pf_stream
+
+        if installed > 0:
+            logging.info(
+                "[RaylightModelPatcher] Installed eviction hooks with "
+                "prefetch pipeline on %d blocks.",
+                installed,
+            )
+
+    def _remove_eviction_hooks(self) -> None:
+        """Remove all eviction hooks and clean up prefetch state."""
+        # Clean up stale prefetch protection.
+        pf_names = getattr(self, "_pf_names", None)
+        if pf_names is not None and pf_names[0] is not None:
+            policy = getattr(self, "_memory_policy", None)
+            if policy is not None:
+                policy.unprotect_params(pf_names[0])
+            pf_names[0] = None
+        self._pf_names = None
+        self._pf_stream = None
+
+        # Reset execution cursor and block structure.
+        pinned_cache = getattr(self, "pinned_param_cache", None)
+        if pinned_cache is not None:
+            pinned_cache.set_execution_cursor(-1)
+            pinned_cache._block_param_groups = None
+
+        diff_model = getattr(self, "model", None)
+        if diff_model is None:
+            return
+
+        from raylight.nodes import _TRANSFORMER_BLOCK_NAMES
+
+        for block_attr in _TRANSFORMER_BLOCK_NAMES:
+            blocks = getattr(diff_model, block_attr, None)
+            if blocks is None:
+                continue
+            for block in blocks:
+                for key in (self._EVICTION_PRE_KEY, self._EVICTION_POST_KEY):
+                    handle = getattr(block, key, None)
+                    if handle is not None:
+                        handle.remove()
+                        setattr(block, key, None)
 
     # ------------------------------------------------------------- unpatch
 
@@ -628,6 +861,7 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
         if unpatch_weights:
             self.unpatch_hooks()
             self.unpin_all_weights()
+            self._remove_eviction_hooks()
             if self.model.model_lowvram:
                 for m in self.model.modules():
                     move_weight_functions(m, device_to)
@@ -663,15 +897,12 @@ class RaylightModelPatcher(comfy.model_patcher.ModelPatcher):
 
             if device_to is not None:
                 pinned_cache = getattr(self, "pinned_param_cache", None)
-                if (
-                    pinned_cache is not None
-                    and pinned_cache.built
-                    and str(device_to) == "cpu"
-                ):
+                if pinned_cache is not None and str(device_to) == "cpu":
                     if pinned_cache.params_on_cuda:
                         # Use pinned cache to offload — do NOT call model.to(cpu)
                         # which would crash on resized-to-0 storages or cause a
                         # slow full-model CPU copy.
+                        # offload_to_cpu handles _built=False by building first.
                         try:
                             pinned_cache.offload_to_cpu(self.model)
                         except Exception as e:
