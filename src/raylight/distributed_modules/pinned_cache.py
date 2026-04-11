@@ -774,6 +774,8 @@ class BasePinnedCache(ABC):
         for name in walk:
             if freed >= target_bytes:
                 break
+            if name in self._partial_freed:
+                continue
             if exclude and name in exclude:
                 continue  # protected — currently executing block
             param = param_dict.get(name)
