@@ -4,3 +4,4 @@ kernels
 huggingface_hub
 hf_transfer
 fastsafetensors
+diffusers[torch]
