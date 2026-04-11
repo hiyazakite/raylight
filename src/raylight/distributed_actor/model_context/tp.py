@@ -479,9 +479,13 @@ class TPContext(ModelContext):
                         if scale.dim() >= 1 and scale.numel() > 1:
                             # Per-row scale — shard along output dim for column-parallel
                             if tp_module.parallelism == "column":
-                                tp_rank = TensorParallelState.get_rank()
-                                shard_size = scale.shape[0] // TensorParallelState.get_world_size()
-                                scale = scale.narrow(0, tp_rank * shard_size, shard_size).contiguous()
+                                # Use QKV-aware scale loader if available (fused QKV layers)
+                                if hasattr(tp_module, "_qkv_scale_loader"):
+                                    scale = tp_module._qkv_scale_loader(scale)
+                                else:
+                                    tp_rank = TensorParallelState.get_rank()
+                                    shard_size = scale.shape[0] // TensorParallelState.get_size()
+                                    scale = scale.narrow(0, tp_rank * shard_size, shard_size).contiguous()
                             # Row-parallel: output dim is not split — keep full
                         else:
                             # Scalar per-tensor scale

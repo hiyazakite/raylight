@@ -13,7 +13,7 @@ from .base import (
 )
 
 
-def _tp_shard_lora_diff(lora_diff: torch.Tensor, weight_shape) -> torch.Tensor:
+def _tp_shard_lora_diff(lora_diff: torch.Tensor, weight_shape, weight=None) -> torch.Tensor:
     """Narrow a full-size LoRA delta to match a TP-sharded weight.
 
     When tensor parallelism is active, model weights are sharded but LoRA
@@ -24,7 +24,16 @@ def _tp_shard_lora_diff(lora_diff: torch.Tensor, weight_shape) -> torch.Tensor:
     extracts this rank's slice.
 
     When TP is inactive or shapes already match, this is a plain reshape.
+
+    If ``weight`` carries a ``_tp_lora_diff_slice`` attribute (set when
+    a LoRA offset was adjusted for TP in ``calculate_weight``), that
+    pre-computed slice is used instead of the global ``tp_rank`` heuristic.
     """
+    # Pre-computed slice from TP offset adjustment — always takes priority
+    if weight is not None and hasattr(weight, '_tp_lora_diff_slice'):
+        dim, start, length = weight._tp_lora_diff_slice
+        return lora_diff.narrow(dim, start, length).reshape(weight_shape)
+
     target_numel = 1
     for s in weight_shape:
         target_numel *= s
@@ -236,7 +245,7 @@ class LoRAAdapter(WeightAdapterBase):
             lora_diff = torch.mm(
                 mat1.flatten(start_dim=1), mat2.flatten(start_dim=1)
             )
-            lora_diff = _tp_shard_lora_diff(lora_diff, weight.shape)
+            lora_diff = _tp_shard_lora_diff(lora_diff, weight.shape, weight=weight)
             del mat1, mat2
             if dora_scale is not None:
                 weight = weight_decompose(

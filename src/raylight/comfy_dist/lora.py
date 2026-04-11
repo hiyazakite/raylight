@@ -85,9 +85,36 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
             function = lambda a: a
 
         old_weight = None
+        tp_diff_slice = None
         if offset is not None:
             old_weight = weight
+            dim, start, length = offset[0], offset[1], offset[2]
+            dim_size = weight.shape[dim]
+            if start + length > dim_size:
+                # Weight is TP column-parallel sharded — adjust offset
+                # to intersect with this rank's local shard.
+                try:
+                    from raylight.distributed_modules.tensor_parallel import TensorParallelState
+                    tp_size = TensorParallelState.get_size()
+                    tp_rank = TensorParallelState.get_rank()
+                except ImportError:
+                    tp_size = 1
+                    tp_rank = 0
+                if tp_size > 1:
+                    shard_start = tp_rank * dim_size
+                    shard_end = shard_start + dim_size
+                    inter_start = max(start, shard_start)
+                    inter_end = min(start + length, shard_end)
+                    if inter_start >= inter_end:
+                        # No overlap with this rank's shard — skip patch
+                        continue
+                    local_start = inter_start - shard_start
+                    local_length = inter_end - inter_start
+                    offset = (dim, local_start, local_length)
+                    tp_diff_slice = (dim, inter_start - start, local_length)
             weight = weight.narrow(offset[0], offset[1], offset[2])
+            if tp_diff_slice is not None:
+                weight._tp_lora_diff_slice = tp_diff_slice
 
         if strength_model != 1.0:
             weight *= strength_model
@@ -120,6 +147,9 @@ def calculate_weight(patches, weight, key, intermediate_dtype=torch.float32, ori
                 weight = pad_tensor_to_shape(weight, diff.shape)
 
             if strength != 0.0:
+                # Narrow diff to match TP-sharded weight when offset was adjusted
+                if diff.shape != weight.shape and tp_diff_slice is not None:
+                    diff = diff.narrow(tp_diff_slice[0], tp_diff_slice[1], tp_diff_slice[2])
                 if diff.shape != weight.shape:
                     logging.warning("WARNING SHAPE MISMATCH {} WEIGHT NOT MERGED {} != {}".format(key, diff.shape, weight.shape))
                 else:

@@ -112,3 +112,11 @@ if hasattr(model_base, "LTXAV"):
         from ..diffusion_models.lightricks.tp import apply_tp_to_ltxav_model
         structure_only = kwargs.pop("structure_only", False)
         apply_tp_to_ltxav_model(comfy_model.diffusion_model, tp_group=tp_group, structure_only=structure_only, **kwargs)
+
+# Phase 2.4 — Lumina (weight-only TP, gather_output=True)
+if hasattr(model_base, "Lumina2"):
+    @TPRegistry.register(model_base.Lumina2)
+    def _tp_lumina2(comfy_model, tp_group=None, **kwargs):
+        from ..diffusion_models.lumina.tp import apply_tp_to_lumina_model
+        structure_only = kwargs.pop("structure_only", False)
+        apply_tp_to_lumina_model(comfy_model.diffusion_model, tp_group=tp_group, structure_only=structure_only)
