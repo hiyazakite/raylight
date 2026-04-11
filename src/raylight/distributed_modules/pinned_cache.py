@@ -721,6 +721,13 @@ class BasePinnedCache(ABC):
         if target_bytes <= 0:
             return 0
 
+        # Pressure-driven eviction frees each CUDA storage immediately after
+        # snapshotting it. Unlike the full offload path we cannot queue async
+        # D2H copies and synchronize later, because that would let resize_(0)
+        # invalidate the source storage while the copy is still in flight.
+        # Keep these copies synchronous so repeated callback rounds remain safe.
+        copy_non_blocking = False
+
         use_mmap = False
         use_incremental = False
         if not self._built:
@@ -785,13 +792,13 @@ class BasePinnedCache(ABC):
                 # because the host data is always authoritative.
                 cpu_buf = self._get_cpu_buf(name)
                 if cpu_buf is not None:
-                    cpu_buf.copy_(param.data, non_blocking=non_blocking)
+                    cpu_buf.copy_(param.data, non_blocking=copy_non_blocking)
                 elif use_incremental:
                     # First eviction of this param — allocate a pinned
                     # buffer on-the-fly.  Only the evicted layers consume
                     # host RAM; the rest stay CUDA-only.
                     pinned = torch.empty_like(param.data, device="cpu").pin_memory()
-                    pinned.copy_(param.data, non_blocking=non_blocking)
+                    pinned.copy_(param.data, non_blocking=copy_non_blocking)
                     self._set_cpu_buf(name, pinned)
 
             # Free CUDA storage

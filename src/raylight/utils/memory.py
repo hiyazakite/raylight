@@ -11,6 +11,15 @@ import psutil
 import gc
 
 
+def _uses_cuda_malloc_async_backend() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_allocator_backend() == "cudaMallocAsync"
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # MemoryPolicy — centralised memory lifecycle decisions
 # ---------------------------------------------------------------------------
@@ -269,6 +278,8 @@ class MemoryPolicy:
 
     def _release_cuda_cache(self) -> None:
         if torch.cuda.is_available():
+            if _uses_cuda_malloc_async_backend():
+                torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
 
     def _debounced_gc(self) -> None:
