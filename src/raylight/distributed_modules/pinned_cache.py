@@ -892,8 +892,6 @@ class BasePinnedCache(ABC):
         source_info = ""
         if mmap_restored > 0:
             source_info += f", {mmap_restored} from mmap"
-        if disk_restored > 0:
-            source_info += f", {disk_restored} from disk"
         print(
             f"[{self._tag}] Restored {restored} evicted params to CUDA "
             f"({freed_gb:.2f} GB){source_info}."

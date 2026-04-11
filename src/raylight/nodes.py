@@ -244,6 +244,30 @@ def _build_local_runtime_env(module_dir: Path, repo_root: Path, runtime_workdir:
         'RAY_METRICS_EXPORT_INTERVAL_MS': '0',  # Fully disable metrics export
     }
 
+    # LD_PRELOAD: load CUDA allocator interceptor before any other library
+    # so our cudaMalloc override takes effect for PyTorch's caching allocator.
+    # Without LD_PRELOAD, loading via ctypes.CDLL after import torch doesn't
+    # override already-resolved PLT entries — the interceptor never fires.
+    alloc_so = module_dir / "lib" / "raylight_alloc.so"
+    if alloc_so.exists():
+        preload = str(alloc_so)
+        existing_preload = os.environ.get('LD_PRELOAD', '')
+        if existing_preload:
+            preload = f"{preload}:{existing_preload}"
+        env_vars['LD_PRELOAD'] = preload
+
+    # Ensure PyTorch releases its allocator lock before cudaMalloc calls
+    # so the interceptor callback can safely call storage.resize_(0) and
+    # torch.cuda.empty_cache() from within the allocation failure path.
+    alloc_conf = 'release_lock_on_cudamalloc:True'
+    existing_conf = os.environ.get('PYTORCH_ALLOC_CONF', '')
+    if existing_conf:
+        if 'release_lock_on_cudamalloc' not in existing_conf:
+            alloc_conf = f"{existing_conf},{alloc_conf}"
+        else:
+            alloc_conf = existing_conf
+    env_vars['PYTORCH_ALLOC_CONF'] = alloc_conf
+
     return {
         'env_vars': env_vars,
     }
@@ -288,6 +312,35 @@ _existing_pypath = os.environ.get('PYTHONPATH', '')
 if _existing_pypath:
     _python_path_entries.extend(p for p in _existing_pypath.split(os.pathsep) if p)
 os.environ['PYTHONPATH'] = os.pathsep.join(dict.fromkeys(_python_path_entries))
+
+# ---------------------------------------------------------------------------
+# CRITICAL: Set LD_PRELOAD in os.environ BEFORE ray.init() so that ALL Ray
+# worker processes (exec'd by the Raylet) load the CUDA allocator interceptor
+# before any other shared library.  This ensures our cudaMalloc override
+# takes effect when PyTorch's _C.so resolves the symbol at import time.
+#
+# runtime_env.env_vars only sets os.environ in the already-running Python
+# process — but ld.so reads LD_PRELOAD once at exec() time, so setting it
+# via runtime_env has no effect on dynamic linker symbol resolution.
+# ---------------------------------------------------------------------------
+_alloc_so = _RAYLIGHT_MODULE_PATH / "lib" / "raylight_alloc.so"
+if _alloc_so.exists():
+    _existing_preload = os.environ.get('LD_PRELOAD', '')
+    if str(_alloc_so) not in _existing_preload:
+        os.environ['LD_PRELOAD'] = (
+            f"{_alloc_so}:{_existing_preload}" if _existing_preload
+            else str(_alloc_so)
+        )
+
+# Ensure PyTorch releases its allocator lock before cudaMalloc calls so the
+# interceptor callback can safely call storage.resize_(0) and empty_cache().
+_existing_alloc_conf = os.environ.get('PYTORCH_ALLOC_CONF', '')
+if 'release_lock_on_cudamalloc' not in _existing_alloc_conf:
+    _new_conf = 'release_lock_on_cudamalloc:True'
+    os.environ['PYTORCH_ALLOC_CONF'] = (
+        f"{_existing_alloc_conf},{_new_conf}" if _existing_alloc_conf
+        else _new_conf
+    )
 
 _RAY_RUNTIME_ENV_LOCAL = _build_local_runtime_env(
     _RAYLIGHT_MODULE_PATH, _COMFY_ROOT_PATH, _RAYLIGHT_RUNTIME_WORKDIR
