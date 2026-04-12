@@ -60,26 +60,37 @@ New in fork. `raylight_alloc.so` is a small native shared library with a C alloc
 
 ### 3b. Pinned-cache system (`src/raylight/distributed_modules/pinned_cache/`)
 
-Five distinct cache implementations sharing a common base interface:
+**Reference baseline**: each `RayWorker` called `comfy.sd.load_diffusion_model` (or the FSDP equivalent) independently on startup. For data-parallel inference with N GPUs on the same host, this means N × model_size bytes of RAM — e.g. 4 GPUs × 32 GB model = 128 GB RAM reserved even though all replicas hold identical weights. There was no offload, no hot-reload, and no sharing.
+
+**Fork**: replaces per-worker loading with a layered pinned-RAM cache system. Pinned RAM (page-locked `cudaHostAlloc`) acts as a DMA-ready staging buffer — the CUDA driver can transfer it to device in a single DMA operation. The key primitive is `UntypedStorage.resize_(0)` to truly free the CUDA allocation while keeping the tensor's data pointer alive, and `resize_(nbytes)` to re-allocate it. All tensor views on the same storage automatically follow.
+
+Common interface:
 
 ```
-cache.build(module)          # snapshot CUDA → pinned RAM (lazy)
-cache.offload_to_cpu(module) # refresh snapshot + free VRAM storage
-cache.reload_to_cuda(module) # re-allocate VRAM + copy pinned → CUDA
-cache.built                  # bool
+cache.build(module)          # snapshot CUDA → pinned RAM (lazy, first offload)
+cache.offload_to_cpu(module) # refresh snapshot + free VRAM via storage.resize_(0)
+cache.reload_to_cuda(module) # re-allocate VRAM via storage.resize_(nbytes) + DMA from pinned
+cache.built                  # bool — False until first build
 cache.param_count()
 cache.pinned_ram_bytes()
 ```
 
-The key primitive is `UntypedStorage.resize_(0)` to truly free the CUDA allocation while keeping the tensor's data pointer alive, and `resize_(nbytes)` to re-allocate it. All views referencing the storage automatically follow.
+**Hot-reload**: after VRAM is freed by an `offload_to_cpu` call, a subsequent `reload_to_cuda` restores all parameters from pinned RAM — no disk I/O, sub-second for a typical large model.
+
+**Cache type selection** (`LazyTensorContext._make_pinned_cache`):
+- Data-parallel replicas with identical weights (`global_world_size > 1`, not FSDP, not TP): → `SharedPinnedParamCache` — all N actors share **one** `/dev/shm` buffer. Cost is 1 × model_size instead of N ×. Rank 0 creates the segment; all ranks `cudaHostRegister` it and cooperatively fill it (round-robin param assignment, no locking needed since slices are non-overlapping). Barrier before and after.
+- TP: each rank holds a different weight shard → `ContiguousPinnedCache` per rank.
+- FSDP2: each rank holds a different DTensor shard → `FSDPShardPinnedCache` per rank.
 
 | Class | Description |
 |---|---|
-| `PinnedParamCache` | Single-rank; private pinned RAM (cudaHostAlloc) per process |
-| `SharedPinnedParamCache` | Cross-process `/dev/shm` buffer + `cudaHostRegister`; useful for data-parallel replicas holding identical weights |
-| `FSDPShardPinnedCache` | FSDP2 DTensor-aware; operates on per-rank local shards extracted via `.to_local()` |
-| `ContiguousPinnedCache` | Packs all parameters into a single contiguous pinned buffer for bulk H2D transfer via a single `cudaMemcpy` |
-| `DictPinnedCache` | Dictionary-keyed variant for selective caching |
+| `PinnedParamCache` | Private pinned RAM per process; `pin_memory()` per tensor; suitable for legacy non-contiguous models |
+| `SharedPinnedParamCache` | One `/dev/shm` slab shared by all data-parallel replicas; `cudaHostRegister` exposes it to the CUDA DMA engine on each rank; parallel build distributes the D2H copy work |
+| `FSDPShardPinnedCache` | FSDP2 DTensor-aware; snapshots rank-local shards via `.to_local()`; `storage.resize_` on the flat FSDP buffer frees/restores all narrow views |
+| `ContiguousPinnedCache` | Allocates one large 512-byte-aligned slab; all params are views into it; ~40–50 % faster build than per-tensor `pin_memory()` for large models; enables single-DMA H2D reload |
+| `DictPinnedCache` | Dictionary-keyed variant for selective/partial caching |
+
+**Partial (watermark) eviction**: `BasePinnedCache` tracks a `_watermark` index into the ordered param list. When there is pressure from a VAE load or intermediate allocation, only the tail blocks of the model (those executing last) are evicted to free a configurable amount of VRAM, rather than offloading the whole model. Tail blocks are restored before the next forward pass.
 
 The cache lifecycle is integrated into `nodes.py` via `release_all_pinned_caches()`, which gracefully handles dead/crashed actors and cleans up orphaned host-memory artifacts.
 
@@ -324,7 +335,54 @@ Entirely new feature. No counterpart in the reference.
 
 ---
 
-## 19. Removed / Superseded
+## 19. CompactFusion — Activation Delta Compression (`distributed_modules/attention/backends/fusion/`)
+
+New in fork (no reference counterpart). A dedicated attention backend that compresses the all-gather communication payload for ring/Ulysses distributed attention by transmitting only the _delta_ between consecutive denoising steps instead of the full activation tensor.
+
+**Core concept:**
+- Diffusion model activations change only slightly between denoising steps.
+- Each rank maintains a `baseline` (the last reconstructed activation).
+- At each step only `delta = activation − baseline` is transmitted; the delta is highly compressible.
+- Receiver decompresses the delta and adds it to its own baseline to reconstruct the activation.
+- Both sides then update their baseline to `baseline + reconstructed_delta` (error-feedback loop that prevents drift accumulation across steps).
+
+**Compression methods** (`COMPACT_COMPRESS_TYPE` in `utils.py`):
+| Mode | Description |
+|---|---|
+| `WARMUP` | First N steps transmit the full activation to establish baselines |
+| `BINARY` / `SPARSE` | 1-bit sign encoding: sign bits packed into uint8 (N × C/8); magnitude approximated by low-rank scale U(N×K) ⊗ V(K×C) from subspace iteration |
+| `INT2`, `INT2_MINMAX`, `INT4` | Integer quantisation with minmax normalisation |
+| `LOW_RANK`, `LOW_RANK_Q` | Transmit explicit low-rank factors from subspace iteration; `LOW_RANK_AWL` adds attention-aware weighting |
+| `IDENTITY` | No-op path (pipeline testing only) |
+
+**Subspace iteration** (`compress_lowrank.py` — `_subspace_iter_compiled`):
+- `@torch.compile`-annotated power iteration to compute rank-K SVD approximation of the delta.
+- Q-matrix warm-start: the right singular-vector basis Q changes slowly between steps; cached per-layer in `_q_cache` and passed as `init_q` to halve required iterations.
+- Signature: `subspace_iter(A, rank, num_iters, cache_key)` → `(U_nk, V_t_kc, residual_norm)`.
+
+**FastPath Triton kernel** (`fastpath.py` — `_binary_quant_fastpath`):
+- Single Triton kernel that fuses: compute `delta = x − base`, 1-bit-quantise with pre-supplied U/V scale factors, optionally write the updated baseline back — all in one launch.
+- Active when `CompactConfig.fastpath=True` (requires `residual=1`, `ef=True`, no simulation).
+- `UPDATE_CACHE` is a `tl.constexpr` so the compiler elides the write-back branch entirely when not needed.
+
+**Configuration** (`CompactConfig` in `utils.py`):
+- `enabled`, `fastpath`, `residual` (0 = no cache; 1 = 1st-order delta; 2 = 2nd-order, requires EF), `comp_rank`, `ef` (error feedback), `simulate_compress` (dry-run), `quantized_cache` / `cache_quant_bits`, `delta_decay_factor`, `overlap_decomp`, `use_awl`.
+- Constructor enforces consistency: residual=0 → EF disallowed; residual=2 → EF required; fastpath → EF + residual=1 + no simulate.
+
+**Step lifecycle** (`context.py`):
+- Global singletons `_config`, `_cache`, `_step`, `_allgather_cache`, `_current_cache_key`.
+- `compact_set_step(step)` / `compact_get_step()` advance the step counter.
+- `_current_cache_key` is propagated into subspace iteration so Q-matrices warm up correctly per-layer per-step.
+
+**Integration** (`compact.py` — `CompactAttentionBackend`):
+- Implements the `AttentionBackend` interface; selected via `RaylightAttnType.COMPACT` in `RaylightConfig`.
+- Maps `RaylightConfig.compact.delta_compression` (high-level `CompactCompressType` enum) to `COMPACT_COMPRESS_TYPE` by name at runtime via `COMPACT_COMPRESS_TYPE(name.lower())`.
+- `warmup_steps` (from `RaylightConfig`) controls how many initial denoising steps use `COMPACT_COMPRESS_TYPE.WARMUP` while baselines stabilise.
+- Instantiates `RaylightAttention(use_compact_ring=True)` — the flag enables the compressed path inside the yunchang-based ring-attention kernel.
+
+---
+
+## 20. Removed / Superseded
 
 | Reference file | Status in fork |
 |---|---|

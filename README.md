@@ -20,7 +20,7 @@ The runtime is rewritten around a `distributed_actor` package replacing the old 
 
 ### Memory — Pinned Caches & Host IPC
 
-**Pinned-cache system** (`distributed_modules/pinned_cache/`): five cache implementations sharing a common `build/offload_to_cpu/reload_to_cuda` interface. Uses `UntypedStorage.resize_(0)/(nbytes)` to truly free and re-allocate the CUDA storage without moving tensor views. Variants: `PinnedParamCache` (private), `SharedPinnedParamCache` (cross-process `/dev/shm` + `cudaHostRegister`), `FSDPShardPinnedCache` (DTensor-aware), `ContiguousPinnedCache` (bulk H2D), `DictPinnedCache`.
+**RAM model copies** — the original repo loaded one full model into RAM per worker (N workers = N × model_size RAM). The fork eliminates this for data-parallel replicas: all actors on the same host share **one** `/dev/shm` pinned-RAM buffer (`SharedPinnedParamCache`), built cooperatively in parallel (round-robin param assignment, no locking). TP and FSDP workers keep private caches because their shards differ (`ContiguousPinnedCache` / `FSDPShardPinnedCache`). Model weights stay in pinned (page-locked) RAM as a DMA-ready staging buffer; VRAM is freed via `UntypedStorage.resize_(0)` and restored via `resize_(nbytes)` — all tensor views update automatically. **Hot-reload** after VRAM eviction hits pinned RAM rather than disk, restoring a multi-GB model in sub-second. Partial (watermark) eviction allows shedding only the model's tail blocks to make room for a VAE load without a full offload.
 
 **Host IPC** (`ipc/`): file-mmap and POSIX-SHM backends with a lifecycle state machine (`PENDING→WRITTEN→READY→CONSUMED→RELEASED`), per-artifact metadata, memory stats collection, and stale-artifact cleanup at startup. Used for passing VAE decode outputs between processes without going through Ray's object store.
 
@@ -98,6 +98,18 @@ Explicit frozen-dataclass hierarchy: `ExecutionStrategy` (holds all parallelism 
 - **AV bimodal guidance**: cross-modal coefficient for joint audio-video conditioning (`av_bimodal_scale`).
 - **`idlora_patches.py`**: monkey-patches `LTXAVModel._process_input` at first call to add `ref_audio` support (replicating ComfyUI PR f02190a). Idempotent — skipped automatically if the upstream PR is already merged.
 - Returns `(output, denoised_output)` as NestedTensors compatible with `LTXVSeparateAVLatent`.
+
+---
+
+### CompactFusion — Activation Delta Compression
+
+`CompactAttentionBackend` reduces ring-attention all-gather bandwidth by exploiting the slow inter-step activation changes in diffusion models:
+- **Delta transmission**: each rank caches the last reconstructed activation (`baseline`); only `delta = activation − baseline` is all-gathered and decompressed.
+- **Error-feedback loop**: both sender and receiver update their baseline with the same reconstructed delta, preventing drift accumulation across steps.
+- **Compression modes**: 1-bit binary (sign packed into uint8 + low-rank scale matrix), INT2/INT4 quantisation, explicit low-rank (`LOW_RANK` / `LOW_RANK_AWL`), or `WARMUP` (full activation for the first N steps while baselines stabilise).
+- **Triton fastpath**: a fused kernel computes delta, 1-bit-quantises with U/V scale factors, and writes back the updated baseline in a single launch (requires `fastpath=True`, `residual=1`, `ef=True`).
+- **Subspace iteration**: low-rank scale approximation uses `@torch.compile` power iteration with Q-matrix warm-start across steps.
+- Selected via `RaylightAttnType.COMPACT` in `RaylightConfig`; tunable via `RaylightConfig.compact` (`warmup_steps`, `delta_compression`, `kv_cache_quant_bits`, etc.).
 
 ---
 
