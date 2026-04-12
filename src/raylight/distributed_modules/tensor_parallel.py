@@ -195,6 +195,11 @@ def gather_tensor_along_dim(
     if group is None:
         return tensor
 
+    # Normalize negative dim — PyTorch ≥2.11 _maybe_view_chunk_cat breaks
+    # on negative gather_dim values.
+    if dim < 0:
+        dim = tensor.ndim + dim
+
     local_size = tensor.shape[dim]
     expected_full = full_size or (local_size * num_splits)
     max_local = math.ceil(expected_full / num_splits)
