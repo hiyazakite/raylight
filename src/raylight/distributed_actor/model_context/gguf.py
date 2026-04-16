@@ -384,6 +384,9 @@ class GGUFContext(ModelContext):
             setattr(ops.Linear, "cache_patched_weights", True)
             print(f"[GGUFContext] Enabling cache_patched_weights for {state.unet_path}")
 
+        # Fused CUDA kernel toggle
+        setattr(ops.Linear, "fused_cuda_kernel", model_options.get("fused_cuda_kernel", True))
+
         model = comfy.sd.load_diffusion_model_state_dict(
             isolated, model_options=model_options, **build_kwargs,
         )

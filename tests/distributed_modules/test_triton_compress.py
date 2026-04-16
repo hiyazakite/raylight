@@ -17,9 +17,11 @@ import pytest
 import torch
 
 # Skip entire module if no CUDA
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA required"
-)
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.triton,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+]
 
 # ---------------------------------------------------------------------------
 # Imports from the modules under test
@@ -373,10 +375,11 @@ class TestFusedVsNonFused:
         assert rec_nonfused.shape == (T, hidden_dim)
 
         # Both should be close (small differences from bf16 scale rounding
-        # and Triton vs PyTorch float32 arithmetic)
+        # and Triton vs PyTorch float32 arithmetic, plus bf16 output truncation)
+        atol = 0.35 if bits == 2 else 0.25
         torch.testing.assert_close(
-            rec_fused, rec_nonfused.float(),
-            atol=0.25, rtol=0.1,
+            rec_fused.float(), rec_nonfused.float(),
+            atol=atol, rtol=0.1,
         )
 
 
@@ -475,3 +478,183 @@ class TestOutputPadding:
         assert rec.shape == (T, hidden_dim), \
             f"Expected ({T}, {hidden_dim}), got {rec.shape}"
         assert_no_nan_inf(rec, f"output padding {bits}-bit dim={hidden_dim}")
+
+
+# ============================================================================
+# 10. Fused residual: base subtraction in compress, base addition in decompress
+# ============================================================================
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton required")
+class TestFusedResidual:
+    """Test that fused residual (base subtract/add inside kernel) matches
+    the non-fused path (explicit delta computation outside kernel)."""
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    @pytest.mark.parametrize("hidden_dim", [256, 3072])
+    def test_fused_residual_compress_matches_explicit(self, bits, hidden_dim):
+        """Fused compress(x, base) should produce equivalent output to
+        compress(x - base) without base. Packed bytes may differ slightly
+        because fused subtracts in fp32 while explicit subtracts in bf16;
+        we verify decompressed outputs are close instead."""
+        T = 8
+        x = make_random_input(T, hidden_dim, dtype=torch.bfloat16)
+        base = make_random_input(T, hidden_dim, dtype=torch.bfloat16) * 0.1
+
+        fc = FusedWHTCompressor(hidden_dim, group_size=64, bits=bits,
+                                seed=SEED, device=DEVICE)
+
+        # Fused path: kernel subtracts base in-register (fp32)
+        packed_fused, scales_fused, zp_fused = fc.compress(x, base=base)
+        rec_fused = fc.decompress(packed_fused, scales_fused, zp_fused)
+
+        # Explicit path: subtract base in bf16, then compress
+        delta = x - base
+        packed_explicit, scales_explicit, zp_explicit = fc.compress(delta)
+        rec_explicit = fc.decompress(packed_explicit, scales_explicit, zp_explicit)
+
+        torch.testing.assert_close(rec_fused, rec_explicit, atol=0.3 if bits <= 3 else 0.15, rtol=0.15)
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    @pytest.mark.parametrize("hidden_dim", [256, 3072])
+    def test_fused_residual_decompress_matches_explicit(self, bits, hidden_dim):
+        """Fused decompress(packed, base) should equal decompress(packed) + base."""
+        T = 8
+        x = make_random_input(T, hidden_dim, dtype=torch.bfloat16)
+        base = make_random_input(T, hidden_dim, dtype=torch.float32) * 0.1
+
+        fc = FusedWHTCompressor(hidden_dim, group_size=64, bits=bits,
+                                seed=SEED, device=DEVICE)
+        packed, scales, zp = fc.compress(x)
+
+        # Fused path: kernel adds base in-register
+        rec_fused = fc.decompress(packed, scales, zp, base=base)
+
+        # Explicit path: decompress then add base
+        rec_explicit = fc.decompress(packed, scales, zp).float() + base
+
+        # Output dtype may differ (fused stores in base.dtype directly,
+        # explicit stores in bf16 then promotes on add), so compare as float.
+        # The bf16 truncation in the explicit path introduces ~0.01 error.
+        torch.testing.assert_close(rec_fused.float(), rec_explicit.float(), atol=0.02, rtol=0.01)
+
+    @pytest.mark.parametrize("bits", [2, 4])
+    @pytest.mark.parametrize("hidden_dim", [256, 3072])
+    def test_fused_residual_round_trip(self, bits, hidden_dim):
+        """Full round-trip: compress(x, base) → decompress(packed, base)
+        should reconstruct x (with quantization error)."""
+        T = 16
+        x = make_random_input(T, hidden_dim, dtype=torch.bfloat16)
+        # Simulate a cached base that's close to x (like a previous step)
+        base = x + torch.randn_like(x) * 0.05
+
+        fc = FusedWHTCompressor(hidden_dim, group_size=64, bits=bits,
+                                seed=SEED, device=DEVICE)
+
+        # Compress delta (x - base) fused, decompress and add base fused
+        packed, scales, zp = fc.compress(x, base=base)
+        rec = fc.decompress(packed, scales, zp, base=base)
+
+        assert_no_nan_inf(rec, f"fused residual round-trip {bits}-bit")
+        assert rec.shape == (T, hidden_dim)
+
+        # Should reconstruct x with bounded error
+        mse = ((x.float() - rec) ** 2).mean().item()
+        x_var = x.float().var().item()
+        snr = x_var / max(mse, 1e-10)
+        min_snr = 3.0 if bits == 2 else 30.0
+        assert snr > min_snr, \
+            f"Fused residual SNR too low: {snr:.1f} (min {min_snr}) for {bits}-bit"
+
+    @pytest.mark.parametrize("bits", [2, 4])
+    def test_fused_no_base_unchanged(self, bits):
+        """compress/decompress without base should still work identically."""
+        T, hidden_dim = 8, 256
+        x = make_random_input(T, hidden_dim, dtype=torch.bfloat16)
+
+        fc = FusedWHTCompressor(hidden_dim, group_size=64, bits=bits,
+                                seed=SEED, device=DEVICE)
+
+        # With base=None (default)
+        packed, scales, zp = fc.compress(x)
+        rec = fc.decompress(packed, scales, zp)
+
+        # Explicit base=None
+        packed2, scales2, zp2 = fc.compress(x, base=None)
+        rec2 = fc.decompress(packed2, scales2, zp2, base=None)
+
+        assert torch.equal(packed, packed2)
+        torch.testing.assert_close(rec, rec2)
+
+
+# ============================================================================
+# 11. Decompress output dtype: should use half-precision, not fp32
+# ============================================================================
+
+@pytest.mark.skipif(not _HAS_TRITON, reason="Triton required")
+class TestDecompressOutputDtype:
+    """Verify decompress allocates output in half-precision, not fp32."""
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_decompress_no_base_returns_half(self, bits):
+        """Without base, decompress output should be bf16 (or fp16 on non-bf16 GPUs)."""
+        T, hidden_dim = 8, 256
+        x = make_random_input(T, hidden_dim, dtype=torch.bfloat16)
+
+        fc = FusedWHTCompressor(hidden_dim, group_size=64, bits=bits,
+                                seed=SEED, device=DEVICE)
+        packed, scales, zp = fc.compress(x)
+        rec = fc.decompress(packed, scales, zp)
+
+        assert rec.dtype != torch.float32, \
+            f"decompress should not return fp32, got {rec.dtype}"
+        assert rec.dtype in (torch.bfloat16, torch.float16), \
+            f"Expected bf16 or fp16, got {rec.dtype}"
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_decompress_with_bf16_base_returns_bf16(self, bits):
+        """With bf16 base, decompress should return bf16."""
+        T, hidden_dim = 8, 256
+        x = make_random_input(T, hidden_dim, dtype=torch.bfloat16)
+        base = make_random_input(T, hidden_dim, dtype=torch.bfloat16) * 0.1
+
+        fc = FusedWHTCompressor(hidden_dim, group_size=64, bits=bits,
+                                seed=SEED, device=DEVICE)
+        packed, scales, zp = fc.compress(x, base=base)
+        rec = fc.decompress(packed, scales, zp, base=base)
+
+        assert rec.dtype == torch.bfloat16, \
+            f"Expected bf16 output with bf16 base, got {rec.dtype}"
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_decompress_with_fp16_base_returns_fp16(self, bits):
+        """With fp16 base, decompress should return fp16."""
+        T, hidden_dim = 8, 256
+        x = make_random_input(T, hidden_dim, dtype=torch.float16)
+        base = torch.randn(T, hidden_dim, device=DEVICE, dtype=torch.float16) * 0.1
+
+        fc = FusedWHTCompressor(hidden_dim, group_size=64, bits=bits,
+                                seed=SEED, device=DEVICE)
+        packed, scales, zp = fc.compress(x, base=base)
+        rec = fc.decompress(packed, scales, zp, base=base)
+
+        assert rec.dtype == torch.float16, \
+            f"Expected fp16 output with fp16 base, got {rec.dtype}"
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_decompress_accuracy_preserved_in_half(self, bits):
+        """Half-precision output should still have bounded reconstruction error."""
+        T, hidden_dim = 16, 3072
+        x = make_random_input(T, hidden_dim, dtype=torch.bfloat16)
+
+        fc = FusedWHTCompressor(hidden_dim, group_size=128, bits=bits,
+                                seed=SEED, device=DEVICE)
+        packed, scales, zp = fc.compress(x)
+        rec = fc.decompress(packed, scales, zp)
+
+        assert_no_nan_inf(rec, f"half-precision decompress {bits}-bit")
+        mse = ((x.float() - rec.float()) ** 2).mean().item()
+        x_var = x.float().var().item()
+        snr = x_var / max(mse, 1e-10)
+        min_snr = 2.0 if bits == 2 else (8.0 if bits == 3 else 30.0)
+        assert snr > min_snr, \
+            f"SNR too low in half-precision: {snr:.1f} (min {min_snr}) for {bits}-bit"

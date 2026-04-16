@@ -378,10 +378,13 @@ if _HAS_TRITON:
         SCALES_ptr,     # (T, n_groups) bf16 output
         SIGNS1_ptr,     # (C_padded,) sign vector
         SIGNS2_ptr,     # (C_padded,) sign vector
+        BASE_ptr,       # (T, HIDDEN_DIM) residual base (only read when HAS_RESIDUAL)
         T,
         C: tl.constexpr,
         LOG2_C: tl.constexpr,
         GS: tl.constexpr,          # group size (constexpr for reshape)
+        HAS_RESIDUAL: tl.constexpr = False,
+        HIDDEN_DIM: tl.constexpr = 0,
     ):
         """Fused: sign1 → WHT butterfly → normalize → sign2 → 2-bit quant → pack.
 
@@ -393,8 +396,14 @@ if _HAS_TRITON:
 
         offs = tl.arange(0, C)
 
-        # --- Load and apply sign1 ---
+        # --- Load and optionally subtract residual base ---
         x = tl.load(X_ptr + row * C + offs).to(tl.float32)
+        if HAS_RESIDUAL:
+            base_mask = offs < HIDDEN_DIM
+            base = tl.load(BASE_ptr + row * HIDDEN_DIM + offs, mask=base_mask, other=0.0).to(tl.float32)
+            x = x - base
+
+        # --- Apply sign1 ---
         s1 = tl.load(SIGNS1_ptr + offs).to(tl.float32)
         x = x * s1
 
@@ -485,11 +494,13 @@ if _HAS_TRITON:
         OUT_ptr,        # (T, C_padded) output
         SIGNS1_ptr,     # (C_padded,) sign vector
         SIGNS2_ptr,     # (C_padded,) sign vector
+        BASE_ptr,       # (T, OUT_DIM) residual base (only read when HAS_RESIDUAL)
         T,
         C: tl.constexpr,
         LOG2_C: tl.constexpr,
         GS: tl.constexpr,
         OUT_DIM: tl.constexpr,   # hidden_dim (for stripping padding on write)
+        HAS_RESIDUAL: tl.constexpr = False,
     ):
         """Fused: unpack → dequant → sign2 → WHT butterfly → normalize → sign1.
 
@@ -574,9 +585,12 @@ if _HAS_TRITON:
         s1 = tl.load(SIGNS1_ptr + tl.arange(0, C)).to(tl.float32)
         x = x * s1
 
-        # --- Store (only hidden_dim elements if OUT_DIM < C) ---
+        # --- Add residual base and store ---
         out_offs = tl.arange(0, C)
         out_mask = out_offs < OUT_DIM
+        if HAS_RESIDUAL:
+            base = tl.load(BASE_ptr + row * OUT_DIM + out_offs, mask=out_mask, other=0.0).to(tl.float32)
+            x = x + base
         tl.store(OUT_ptr + row * OUT_DIM + out_offs, x, mask=out_mask)
 
     # -----------------------------------------------------------------
@@ -590,10 +604,13 @@ if _HAS_TRITON:
         SCALES_ptr,     # (T, n_groups) bf16 output
         SIGNS1_ptr,     # (C_padded,) sign vector
         SIGNS2_ptr,     # (C_padded,) sign vector
+        BASE_ptr,       # (T, HIDDEN_DIM) residual base (only read when HAS_RESIDUAL)
         T,
         C: tl.constexpr,
         LOG2_C: tl.constexpr,
         GS: tl.constexpr,
+        HAS_RESIDUAL: tl.constexpr = False,
+        HIDDEN_DIM: tl.constexpr = 0,
     ):
         """Fused: sign1 → WHT butterfly → normalize → sign2 → 3-bit quant → true 3-bit pack."""
         row = tl.program_id(0)
@@ -602,8 +619,14 @@ if _HAS_TRITON:
 
         offs = tl.arange(0, C)
 
-        # --- Load and apply sign1 ---
+        # --- Load and optionally subtract residual base ---
         x = tl.load(X_ptr + row * C + offs).to(tl.float32)
+        if HAS_RESIDUAL:
+            base_mask = offs < HIDDEN_DIM
+            base = tl.load(BASE_ptr + row * HIDDEN_DIM + offs, mask=base_mask, other=0.0).to(tl.float32)
+            x = x - base
+
+        # --- Apply sign1 ---
         s1 = tl.load(SIGNS1_ptr + offs).to(tl.float32)
         x = x * s1
 
@@ -708,11 +731,13 @@ if _HAS_TRITON:
         OUT_ptr,        # (T, OUT_DIM) output
         SIGNS1_ptr,     # (C_padded,) sign vector
         SIGNS2_ptr,     # (C_padded,) sign vector
+        BASE_ptr,       # (T, OUT_DIM) residual base (only read when HAS_RESIDUAL)
         T,
         C: tl.constexpr,
         LOG2_C: tl.constexpr,
         GS: tl.constexpr,
         OUT_DIM: tl.constexpr,
+        HAS_RESIDUAL: tl.constexpr = False,
     ):
         """Fused: true 3-bit unpack → centroid dequant → sign2 → WHT → normalize → sign1."""
         row = tl.program_id(0)
@@ -812,9 +837,12 @@ if _HAS_TRITON:
         s1 = tl.load(SIGNS1_ptr + tl.arange(0, C)).to(tl.float32)
         x = x * s1
 
-        # --- Store ---
+        # --- Add residual base and store ---
         out_offs = tl.arange(0, C)
         out_mask = out_offs < OUT_DIM
+        if HAS_RESIDUAL:
+            base = tl.load(BASE_ptr + row * OUT_DIM + out_offs, mask=out_mask, other=0.0).to(tl.float32)
+            x = x + base
         tl.store(OUT_ptr + row * OUT_DIM + out_offs, x, mask=out_mask)
 
     # -----------------------------------------------------------------
@@ -829,10 +857,13 @@ if _HAS_TRITON:
         ZP_ptr,         # (T, n_groups) bf16 output (zero points = vmin)
         SIGNS1_ptr,     # (C_padded,) sign vector
         SIGNS2_ptr,     # (C_padded,) sign vector
+        BASE_ptr,       # (T, HIDDEN_DIM) residual base (only read when HAS_RESIDUAL)
         T,
         C: tl.constexpr,
         LOG2_C: tl.constexpr,
         GS: tl.constexpr,
+        HAS_RESIDUAL: tl.constexpr = False,
+        HIDDEN_DIM: tl.constexpr = 0,
     ):
         """Fused: sign1 → WHT butterfly → normalize → sign2 → 4-bit quant → pack."""
         row = tl.program_id(0)
@@ -841,8 +872,14 @@ if _HAS_TRITON:
 
         offs = tl.arange(0, C)
 
-        # --- Load and apply sign1 ---
+        # --- Load and optionally subtract residual base ---
         x = tl.load(X_ptr + row * C + offs).to(tl.float32)
+        if HAS_RESIDUAL:
+            base_mask = offs < HIDDEN_DIM
+            base = tl.load(BASE_ptr + row * HIDDEN_DIM + offs, mask=base_mask, other=0.0).to(tl.float32)
+            x = x - base
+
+        # --- Apply sign1 ---
         s1 = tl.load(SIGNS1_ptr + offs).to(tl.float32)
         x = x * s1
 
@@ -919,11 +956,13 @@ if _HAS_TRITON:
         OUT_ptr,        # (T, OUT_DIM) output
         SIGNS1_ptr,
         SIGNS2_ptr,
+        BASE_ptr,       # (T, OUT_DIM) residual base (only read when HAS_RESIDUAL)
         T,
         C: tl.constexpr,
         LOG2_C: tl.constexpr,
         GS: tl.constexpr,
         OUT_DIM: tl.constexpr,
+        HAS_RESIDUAL: tl.constexpr = False,
     ):
         """Fused: unpack → dequant → sign2 → WHT butterfly → normalize → sign1."""
         row = tl.program_id(0)
@@ -990,8 +1029,12 @@ if _HAS_TRITON:
         s1 = tl.load(SIGNS1_ptr + tl.arange(0, C)).to(tl.float32)
         x = x * s1
 
+        # --- Add residual base and store ---
         out_offs = tl.arange(0, C)
         out_mask = out_offs < OUT_DIM
+        if HAS_RESIDUAL:
+            base = tl.load(BASE_ptr + row * OUT_DIM + out_offs, mask=out_mask, other=0.0).to(tl.float32)
+            x = x + base
         tl.store(OUT_ptr + row * OUT_DIM + out_offs, x, mask=out_mask)
 
 
@@ -1048,11 +1091,15 @@ class FusedWHTCompressor:
 
     def compress(
         self, x: torch.Tensor,
+        base: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Fused WHT rotate + quantize + pack.
 
         Args:
             x: (T, hidden_dim) input tensor.
+            base: (T, hidden_dim) optional residual base. When provided,
+                the kernel computes ``x - base`` in-register before rotation,
+                eliminating a separate subtraction kernel launch.
 
         Returns:
             2-bit: (packed, scales, None)
@@ -1062,6 +1109,10 @@ class FusedWHTCompressor:
         self._ensure_device(x.device)
         T = x.shape[0]
         C = x.shape[-1]
+
+        has_residual = base is not None
+        # base_ptr: pass x as dummy when no base (never read due to HAS_RESIDUAL=False)
+        base_ptr = base if has_residual else x
 
         if C < self.padded_dim:
             x = torch.nn.functional.pad(x, (0, self.padded_dim - C))
@@ -1075,20 +1126,26 @@ class FusedWHTCompressor:
         if self.bits == 2:
             _fused_wht_compress_2bit_kernel[grid](
                 x, packed, scales, self.signs1, self.signs2,
+                base_ptr,
                 T,
                 C=self.padded_dim,
                 LOG2_C=self.log2_dim,
                 GS=self.group_size,
+                HAS_RESIDUAL=has_residual,
+                HIDDEN_DIM=self.hidden_dim,
                 num_warps=warps,
             )
             return packed, scales, None
         elif self.bits == 3:
             _fused_wht_compress_3bit_kernel[grid](
                 x, packed, scales, self.signs1, self.signs2,
+                base_ptr,
                 T,
                 C=self.padded_dim,
                 LOG2_C=self.log2_dim,
                 GS=self.group_size,
+                HAS_RESIDUAL=has_residual,
+                HIDDEN_DIM=self.hidden_dim,
                 num_warps=warps,
             )
             return packed, scales, None
@@ -1096,10 +1153,13 @@ class FusedWHTCompressor:
             zp = torch.empty(T, self.n_groups, dtype=torch.bfloat16, device=x.device)
             _fused_wht_compress_4bit_kernel[grid](
                 x, packed, scales, zp, self.signs1, self.signs2,
+                base_ptr,
                 T,
                 C=self.padded_dim,
                 LOG2_C=self.log2_dim,
                 GS=self.group_size,
+                HAS_RESIDUAL=has_residual,
+                HIDDEN_DIM=self.hidden_dim,
                 num_warps=warps,
             )
             return packed, scales, zp
@@ -1109,6 +1169,7 @@ class FusedWHTCompressor:
         packed: torch.Tensor,
         scales: torch.Tensor,
         zero_points: Optional[torch.Tensor] = None,
+        base: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Fused unpack + dequant + inverse WHT.
 
@@ -1116,6 +1177,9 @@ class FusedWHTCompressor:
             packed: (T, packed_per_row) uint8
             scales: (T, n_groups) bf16
             zero_points: (T, n_groups) bf16 — required for 4-bit, ignored for 2-bit.
+            base: (T, hidden_dim) optional residual base. When provided,
+                the kernel adds ``base`` to the decompressed delta in-register
+                after inverse WHT, eliminating a separate addition kernel launch.
 
         Returns:
             (T, hidden_dim) reconstructed tensor.
@@ -1123,7 +1187,18 @@ class FusedWHTCompressor:
         self._ensure_device(packed.device)
         T = packed.shape[0]
 
-        out = torch.empty(T, self.hidden_dim, dtype=torch.float32, device=packed.device)
+        has_residual = base is not None
+        # Use the base tensor's dtype when available (avoids a redundant fp32
+        # allocation that doubles peak VRAM).  Triton's tl.store handles the
+        # implicit fp32→bf16/fp16 downcast automatically.
+        if has_residual:
+            out_dtype = base.dtype
+        elif torch.cuda.is_bf16_supported():
+            out_dtype = torch.bfloat16
+        else:
+            out_dtype = torch.float16
+        out = torch.empty(T, self.hidden_dim, dtype=out_dtype, device=packed.device)
+        base_ptr = base if has_residual else out
 
         grid = (T,)
         warps = max(1, self.padded_dim // 256)
@@ -1131,31 +1206,37 @@ class FusedWHTCompressor:
         if self.bits == 2:
             _fused_wht_decompress_2bit_kernel[grid](
                 packed, scales, out, self.signs1, self.signs2,
+                base_ptr,
                 T,
                 C=self.padded_dim,
                 LOG2_C=self.log2_dim,
                 GS=self.group_size,
                 OUT_DIM=self.hidden_dim,
+                HAS_RESIDUAL=has_residual,
                 num_warps=warps,
             )
         elif self.bits == 3:
             _fused_wht_decompress_3bit_kernel[grid](
                 packed, scales, out, self.signs1, self.signs2,
+                base_ptr,
                 T,
                 C=self.padded_dim,
                 LOG2_C=self.log2_dim,
                 GS=self.group_size,
                 OUT_DIM=self.hidden_dim,
+                HAS_RESIDUAL=has_residual,
                 num_warps=warps,
             )
         else:
             _fused_wht_decompress_4bit_kernel[grid](
                 packed, scales, zero_points, out, self.signs1, self.signs2,
+                base_ptr,
                 T,
                 C=self.padded_dim,
                 LOG2_C=self.log2_dim,
                 GS=self.group_size,
                 OUT_DIM=self.hidden_dim,
+                HAS_RESIDUAL=has_residual,
                 num_warps=warps,
             )
 

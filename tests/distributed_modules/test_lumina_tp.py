@@ -8,13 +8,12 @@ Run standalone:
 import sys
 import os
 import types
-import unittest
 
-_src = os.path.join(os.path.dirname(__file__), os.pardir, "src")
+_src = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "src")
 if os.path.isdir(_src) and _src not in sys.path:
     sys.path.insert(0, os.path.abspath(_src))
 
-_root_init = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+_root_init = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
 if _root_init in sys.path:
     sys.path.remove(_root_init)
 
@@ -58,16 +57,18 @@ _comfy.float = _make_mock_module("comfy.float", {
     "stochastic_rounding": lambda w, dtype, seed=None: w.to(dtype),
 })
 
-for name, mod in [
+_mock_comfy_modules = [
     ("comfy", _comfy),
     ("comfy.model_management", _comfy.model_management),
     ("comfy.weight_adapter", _comfy_wa),
     ("comfy.weight_adapter.base", _comfy_wa_base),
     ("comfy.lora", _comfy_lora),
     ("comfy.float", _comfy.float),
-]:
+]
+for name, mod in _mock_comfy_modules:
     sys.modules.setdefault(name, mod)
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -179,15 +180,14 @@ def _is_tp_linear(module):
 # Tests: JointAttention
 # ---------------------------------------------------------------------------
 
-class _TPTestCase(unittest.TestCase):
-    """Base class that resets TP state before/after each test."""
-    def setUp(self):
-        TensorParallelState.reset()
-    def tearDown(self):
-        TensorParallelState.reset()
+@pytest.fixture(autouse=True)
+def _reset_tp():
+    TensorParallelState.reset()
+    yield
+    TensorParallelState.reset()
 
 
-class TestLuminaTPAttention(_TPTestCase):
+class TestLuminaTPAttention:
     def test_qkv_column_parallel_no_gather(self):
         mock_tp(2)
         attn = StubJointAttention(dim=512, n_heads=8, n_kv_heads=8, head_dim=64)
@@ -271,17 +271,13 @@ class TestLuminaTPAttention(_TPTestCase):
             local_kv_size = (n_kv_heads // 2) * head_dim  # 128
             total_local = local_q_size + 2 * local_kv_size  # 512
 
-            self.assertEqual(w.shape[0], total_local,
-                             f"Rank {rank}: wrong local QKV size")
+            assert w.shape[0] == total_local, f"Rank {rank}: wrong local QKV size"
             # First local_q_size rows should be Q (1.0)
-            self.assertTrue(torch.all(w[:local_q_size] == 1.0),
-                            f"Rank {rank}: Q section has wrong values")
+            assert torch.all(w[:local_q_size] == 1.0), f"Rank {rank}: Q section has wrong values"
             # Next local_kv_size rows should be K (2.0)
-            self.assertTrue(torch.all(w[local_q_size:local_q_size + local_kv_size] == 2.0),
-                            f"Rank {rank}: K section has wrong values")
+            assert torch.all(w[local_q_size:local_q_size + local_kv_size] == 2.0), f"Rank {rank}: K section has wrong values"
             # Last local_kv_size rows should be V (3.0)
-            self.assertTrue(torch.all(w[local_q_size + local_kv_size:] == 3.0),
-                            f"Rank {rank}: V section has wrong values")
+            assert torch.all(w[local_q_size + local_kv_size:] == 3.0), f"Rank {rank}: V section has wrong values"
 
     def test_qkv_custom_weight_loader_installed(self):
         """QKV TPLinear must have a custom weight_loader for streaming path."""
@@ -295,7 +291,7 @@ class TestLuminaTPAttention(_TPTestCase):
         full_weight = torch.randn(8 * 64 * 3, 512)  # [full_qkv, dim]
         param = nn.Parameter(torch.zeros(8 * 64 * 3 // 2, 512))
         attn.qkv.weight_loader(param, full_weight)
-        self.assertEqual(param.shape[0], 8 * 64 * 3 // 2)
+        assert param.shape[0] == 8 * 64 * 3 // 2
 
     def test_qkv_scale_loader_installed(self):
         """QKV TPLinear must have a _qkv_scale_loader for INT8 scale sharding."""
@@ -329,14 +325,10 @@ class TestLuminaTPAttention(_TPTestCase):
             local_q = (n_heads // 2) * head_dim      # 256
             local_kv = (n_kv_heads // 2) * head_dim  # 128
             expected_size = local_q + 2 * local_kv    # 512
-            self.assertEqual(sharded.shape[0], expected_size,
-                             f"Rank {rank}: wrong sharded scale size")
-            self.assertTrue(torch.all(sharded[:local_q] == 1.0),
-                            f"Rank {rank}: Q scales wrong")
-            self.assertTrue(torch.all(sharded[local_q:local_q + local_kv] == 2.0),
-                            f"Rank {rank}: K scales wrong")
-            self.assertTrue(torch.all(sharded[local_q + local_kv:] == 3.0),
-                            f"Rank {rank}: V scales wrong")
+            assert sharded.shape[0] == expected_size, f"Rank {rank}: wrong sharded scale size"
+            assert torch.all(sharded[:local_q] == 1.0), f"Rank {rank}: Q scales wrong"
+            assert torch.all(sharded[local_q:local_q + local_kv] == 2.0), f"Rank {rank}: K scales wrong"
+            assert torch.all(sharded[local_q + local_kv:] == 3.0), f"Rank {rank}: V scales wrong"
 
     def test_qkv_scale_loader_scalar(self):
         """Scalar per-tensor scale should pass through unchanged."""
@@ -345,7 +337,7 @@ class TestLuminaTPAttention(_TPTestCase):
         apply_tp_to_lumina_attention(attn)
         scalar_scale = torch.tensor(0.5)
         result = attn.qkv._qkv_scale_loader(scalar_scale)
-        self.assertEqual(result.item(), 0.5)
+        assert result.item() == 0.5
 
     def test_int8_weight_scale_sharded_on_load(self):
         """Legacy path: weight_scale on source linear is QKV-sharded during TP."""
@@ -362,15 +354,15 @@ class TestLuminaTPAttention(_TPTestCase):
         attn.qkv.weight_scale[n_heads * head_dim:2 * n_heads * head_dim] = 2.0  # K
         attn.qkv.weight_scale[2 * n_heads * head_dim:] = 3.0  # V
         apply_tp_to_lumina_attention(attn)
-        self.assertTrue(hasattr(attn.qkv, 'weight_scale'))
+        assert hasattr(attn.qkv, 'weight_scale')
         scale = attn.qkv.weight_scale
         local_size = full_qkv // 2  # 768
-        self.assertEqual(scale.shape[0], local_size)
+        assert scale.shape[0] == local_size
         local_q = (n_heads // 2) * head_dim  # 256
         local_kv = (n_kv_heads // 2) * head_dim  # 256
-        self.assertTrue(torch.all(scale[:local_q] == 1.0))
-        self.assertTrue(torch.all(scale[local_q:local_q + local_kv] == 2.0))
-        self.assertTrue(torch.all(scale[local_q + local_kv:] == 3.0))
+        assert torch.all(scale[:local_q] == 1.0)
+        assert torch.all(scale[local_q:local_q + local_kv] == 2.0)
+        assert torch.all(scale[local_q + local_kv:] == 3.0)
 
     def test_structure_only_preserves_int8_dtype(self):
         """structure_only=True must preserve int8 dtype for streaming TP compatibility.
@@ -387,8 +379,7 @@ class TestLuminaTPAttention(_TPTestCase):
             requires_grad=False,
         )
         apply_tp_to_lumina_attention(attn, structure_only=True)
-        self.assertEqual(attn.qkv.weight.dtype, torch.int8,
-                         "QKV TPLinear must preserve int8 dtype in structure_only mode")
+        assert attn.qkv.weight.dtype == torch.int8, "QKV TPLinear must preserve int8 dtype in structure_only mode"
 
     def test_structure_only_preserves_bf16_dtype(self):
         """structure_only=True must also preserve bf16 dtype."""
@@ -399,14 +390,14 @@ class TestLuminaTPAttention(_TPTestCase):
             requires_grad=False,
         )
         apply_tp_to_lumina_attention(attn, structure_only=True)
-        self.assertEqual(attn.qkv.weight.dtype, torch.bfloat16)
+        assert attn.qkv.weight.dtype == torch.bfloat16
 
 
 # ---------------------------------------------------------------------------
 # Tests: FeedForward
 # ---------------------------------------------------------------------------
 
-class TestLuminaTPFeedForward(_TPTestCase):
+class TestLuminaTPFeedForward:
     def test_all_linears_patched(self):
         mock_tp(2)
         ff = StubFeedForward(dim=512, hidden_dim=1024)
@@ -435,7 +426,7 @@ class TestLuminaTPFeedForward(_TPTestCase):
 # Tests: JointTransformerBlock
 # ---------------------------------------------------------------------------
 
-class TestLuminaTPBlock(_TPTestCase):
+class TestLuminaTPBlock:
     def test_attention_patched(self):
         mock_tp(2)
         block = StubJointTransformerBlock(dim=512)
@@ -471,7 +462,7 @@ class TestLuminaTPBlock(_TPTestCase):
 # Tests: Full model
 # ---------------------------------------------------------------------------
 
-class TestLuminaTPModel(_TPTestCase):
+class TestLuminaTPModel:
     def test_main_layers_patched(self):
         mock_tp(2)
         model = StubNextDiT(dim=512, n_heads=8, n_layers=4)
@@ -564,7 +555,7 @@ class TestLuminaTPModel(_TPTestCase):
 # TPRegistry integration
 # ---------------------------------------------------------------------------
 
-class TestLuminaTPRegistry(_TPTestCase):
+class TestLuminaTPRegistry:
     def test_lumina2_registered(self):
         """Verify Lumina2 has a TP handler in the registry."""
         try:
@@ -573,14 +564,14 @@ class TestLuminaTPRegistry(_TPTestCase):
             if hasattr(model_base, "Lumina2"):
                 assert model_base.Lumina2 in TPRegistry._REGISTRY
         except ImportError:
-            self.skipTest("ComfyUI not available")
+            pytest.skip("ComfyUI not available")
 
 
 # ---------------------------------------------------------------------------
 # LoRA + TP offset adjustment
 # ---------------------------------------------------------------------------
 
-class TestLoraTPOffset(_TPTestCase):
+class TestLoraTPOffset:
     """Test that LoRA offsets are correctly adjusted for TP-sharded weights."""
 
     def _make_diff_patch(self, diff, offset, strength=1.0):
@@ -597,9 +588,9 @@ class TestLoraTPOffset(_TPTestCase):
         patch = self._make_diff_patch(diff, offset=(0, 512, 512))
         result = calculate_weight([patch], weight.clone(), "test.qkv.weight")
         # K region should be modified
-        self.assertTrue(result[512:1024].sum() > 0)
-        self.assertEqual(result[0:512].sum().item(), 0.0)
-        self.assertEqual(result[1024:1536].sum().item(), 0.0)
+        assert result[512:1024].sum() > 0
+        assert result[0:512].sum().item() == 0.0
+        assert result[1024:1536].sum().item() == 0.0
 
     def test_offset_tp2_rank0_full_overlap(self):
         """TP=2 rank 0: Q offset (0,0,512) fully within shard [0,768)."""
@@ -610,8 +601,8 @@ class TestLoraTPOffset(_TPTestCase):
         diff = torch.ones(512, 512)  # Q patch
         patch = self._make_diff_patch(diff, offset=(0, 0, 512))
         result = calculate_weight([patch], weight.clone(), "test.qkv.weight")
-        self.assertTrue(result[0:512].sum() > 0)
-        self.assertEqual(result[512:768].sum().item(), 0.0)
+        assert result[0:512].sum() > 0
+        assert result[512:768].sum().item() == 0.0
 
     def test_offset_tp2_rank0_partial_overlap(self):
         """TP=2 rank 0: K offset (0,512,512) partially in shard [0,768)."""
@@ -622,8 +613,8 @@ class TestLoraTPOffset(_TPTestCase):
         patch = self._make_diff_patch(diff, offset=(0, 512, 512))
         result = calculate_weight([patch], weight.clone(), "test.qkv.weight")
         # Only first 256 of K falls in this shard (rows 512..768)
-        self.assertTrue(result[512:768].sum() > 0)
-        self.assertEqual(result[0:512].sum().item(), 0.0)
+        assert result[512:768].sum() > 0
+        assert result[0:512].sum().item() == 0.0
 
     def test_offset_tp2_rank0_no_overlap(self):
         """TP=2 rank 0: V offset (0,1024,512) outside shard [0,768)."""
@@ -633,7 +624,7 @@ class TestLoraTPOffset(_TPTestCase):
         diff = torch.ones(512, 512)  # V patch
         patch = self._make_diff_patch(diff, offset=(0, 1024, 512))
         result = calculate_weight([patch], weight.clone(), "test.qkv.weight")
-        self.assertEqual(result.sum().item(), 0.0)
+        assert result.sum().item() == 0.0
 
     def test_offset_tp2_rank1_partial_overlap(self):
         """TP=2 rank 1: K offset (0,512,512) partially in shard [768,1536)."""
@@ -644,8 +635,8 @@ class TestLoraTPOffset(_TPTestCase):
         patch = self._make_diff_patch(diff, offset=(0, 512, 512))
         result = calculate_weight([patch], weight.clone(), "test.qkv.weight")
         # Second 256 of K falls here (rows 0..256 of rank 1's shard)
-        self.assertTrue(result[0:256].sum() > 0)
-        self.assertEqual(result[256:768].sum().item(), 0.0)
+        assert result[0:256].sum() > 0
+        assert result[256:768].sum().item() == 0.0
 
     def test_offset_tp2_rank1_full_overlap(self):
         """TP=2 rank 1: V offset (0,1024,512) fully within shard [768,1536)."""
@@ -656,8 +647,8 @@ class TestLoraTPOffset(_TPTestCase):
         patch = self._make_diff_patch(diff, offset=(0, 1024, 512))
         result = calculate_weight([patch], weight.clone(), "test.qkv.weight")
         # V maps to rows 256..768 of rank 1's shard
-        self.assertTrue(result[256:768].sum() > 0)
-        self.assertEqual(result[0:256].sum().item(), 0.0)
+        assert result[256:768].sum() > 0
+        assert result[0:256].sum().item() == 0.0
 
     def test_offset_tp4_partial_overlap_correct_slice(self):
         """TP=4: verify the correct PORTION of the diff is used, not tp_rank-based."""
@@ -675,8 +666,8 @@ class TestLoraTPOffset(_TPTestCase):
         result = calculate_weight([patch], weight.clone(), "test.qkv.weight")
         # Rows 128..384 of result should have diff rows 0..256
         expected = diff[0:256]
-        self.assertTrue(torch.allclose(result[128:384], expected))
-        self.assertEqual(result[0:128].sum().item(), 0.0)
+        assert torch.allclose(result[128:384], expected)
+        assert result[0:128].sum().item() == 0.0
 
     def test_multiple_qkv_patches_tp2(self):
         """TP=2: all three Q/K/V patches applied correctly to rank 0."""
@@ -694,11 +685,11 @@ class TestLoraTPOffset(_TPTestCase):
         ]
         result = calculate_weight(patches, weight.clone(), "test.qkv.weight")
         # Rank 0 shard [0,768): Q=[0,512) val=1, K=[512,768) val=2, V=skipped
-        self.assertTrue(torch.allclose(result[0:512], torch.ones(512, 512) * 1.0))
-        self.assertTrue(torch.allclose(result[512:768], torch.ones(256, 512) * 2.0))
+        assert torch.allclose(result[0:512], torch.ones(512, 512) * 1.0)
+        assert torch.allclose(result[512:768], torch.ones(256, 512) * 2.0)
 
 
-class TestLoraTPDiffShard(_TPTestCase):
+class TestLoraTPDiffShard:
     """Test _tp_shard_lora_diff with pre-computed offset slice info."""
 
     def test_shard_with_slice_attr(self):
@@ -711,7 +702,7 @@ class TestLoraTPDiffShard(_TPTestCase):
         weight._tp_lora_diff_slice = (0, 100, 256)
         result = _tp_shard_lora_diff(lora_diff, weight.shape, weight=weight)
         expected = lora_diff[100:356].reshape(256, 128)
-        self.assertTrue(torch.allclose(result, expected))
+        assert torch.allclose(result, expected)
 
     def test_shard_without_slice_attr_fallback(self):
         """Without _tp_lora_diff_slice, falls back to existing tp_rank logic."""
@@ -722,7 +713,7 @@ class TestLoraTPDiffShard(_TPTestCase):
         result = _tp_shard_lora_diff(lora_diff, weight.shape, weight=weight)
         # tp_rank=1, column-parallel: takes second half
         expected = lora_diff[256:512].reshape(256, 128)
-        self.assertTrue(torch.allclose(result, expected))
+        assert torch.allclose(result, expected)
 
     def test_shard_matching_shapes(self):
         """When shapes match, no narrowing needed."""
@@ -731,8 +722,7 @@ class TestLoraTPDiffShard(_TPTestCase):
         lora_diff = torch.ones(256, 128)
         weight = torch.zeros(256, 128)
         result = _tp_shard_lora_diff(lora_diff, weight.shape, weight=weight)
-        self.assertEqual(result.shape, (256, 128))
+        assert result.shape == (256, 128)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+

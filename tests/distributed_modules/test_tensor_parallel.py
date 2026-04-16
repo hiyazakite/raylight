@@ -13,18 +13,19 @@ import os
 
 # Ensure src/ is on the path so `raylight.distributed_modules` is importable
 # even when running standalone outside the full ComfyUI environment.
-_src = os.path.join(os.path.dirname(__file__), os.pardir, "src")
+_src = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "src")
 if os.path.isdir(_src) and _src not in sys.path:
     sys.path.insert(0, os.path.abspath(_src))
 
 # Block the ComfyUI root __init__.py from loading (it tries to import
 # raylight.nodes which is unavailable in a standalone test environment).
 # We only need the src/raylight package.
-_root_init = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+_root_init = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
 if _root_init in sys.path:
     sys.path.remove(_root_init)
 
 import pytest  # noqa: E402
+import builtins  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
@@ -35,6 +36,15 @@ from raylight.distributed_modules.tensor_parallel import (  # noqa: E402
     TPMLP,
     TPRMSNormAcrossHeads,
     split_tensor_along_dim,
+    _DeferredGather,
+    _is_collective_deferred,
+    defer_tp_collectives,
+    gather_tensor_along_dim_async,
+)
+
+import raylight.distributed_modules.tp_linear_factory as _tplf  # noqa: E402
+from raylight.distributed_modules.tp_linear_factory import (  # noqa: E402
+    warmup_scratch_buffer,
 )
 
 
@@ -257,6 +267,221 @@ class TestSplitTensor:
         parts = split_tensor_along_dim(t, dim=1, num_splits=1)
         assert len(parts) == 1
         assert torch.equal(parts[0], t)
+
+
+# ---------------------------------------------------------------------------
+# _DeferredGather
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredGather:
+    def test_wait_returns_tensor(self):
+        t = torch.randn(2, 8)
+        dg = _DeferredGather(t, work=None, full_size=None, dim=0)
+        assert torch.equal(dg.wait(), t)
+
+    def test_wait_trims_to_full_size(self):
+        # Simulate padded gather output (12 cols) that should be trimmed to 10.
+        t = torch.randn(2, 12)
+        dg = _DeferredGather(t, work=None, full_size=10, dim=1)
+        result = dg.wait()
+        assert result.shape == (2, 10)
+        assert torch.equal(result, t[:, :10])
+
+    def test_wait_trims_dim0(self):
+        t = torch.randn(12, 4)
+        dg = _DeferredGather(t, work=None, full_size=10, dim=0)
+        result = dg.wait()
+        assert result.shape == (10, 4)
+
+    def test_no_trim_when_exact(self):
+        t = torch.randn(2, 10)
+        dg = _DeferredGather(t, work=None, full_size=10, dim=1)
+        assert torch.equal(dg.wait(), t)
+
+
+# ---------------------------------------------------------------------------
+# defer_tp_collectives context manager
+# ---------------------------------------------------------------------------
+
+
+class TestDeferTPCollectives:
+    def test_default_not_deferred(self):
+        assert not _is_collective_deferred()
+
+    def test_deferred_inside_context(self):
+        with defer_tp_collectives():
+            assert _is_collective_deferred()
+        assert not _is_collective_deferred()
+
+    def test_nesting_restores_outer_state(self):
+        assert not _is_collective_deferred()
+        with defer_tp_collectives():
+            assert _is_collective_deferred()
+            with defer_tp_collectives():
+                assert _is_collective_deferred()
+            assert _is_collective_deferred()
+        assert not _is_collective_deferred()
+
+    def test_restores_on_exception(self):
+        with pytest.raises(RuntimeError):
+            with defer_tp_collectives():
+                assert _is_collective_deferred()
+                raise RuntimeError("boom")
+        assert not _is_collective_deferred()
+
+
+# ---------------------------------------------------------------------------
+# gather_tensor_along_dim_async (single-process / tp_size=1)
+# ---------------------------------------------------------------------------
+
+
+class TestGatherTensorAlongDimAsync:
+    def test_noop_when_tp1(self):
+        """With tp_size=1 (default), async gather is a passthrough."""
+        t = torch.randn(2, 8)
+        handle = gather_tensor_along_dim_async(t, dim=-1, num_splits=1)
+        result = handle.wait()
+        assert torch.equal(result, t)
+
+    def test_noop_when_explicit_splits1(self):
+        t = torch.randn(3, 4, 6)
+        handle = gather_tensor_along_dim_async(t, dim=1, num_splits=1)
+        assert torch.equal(handle.wait(), t)
+
+
+# ---------------------------------------------------------------------------
+# TPLinear defer integration (single-process)
+# ---------------------------------------------------------------------------
+
+
+class TestTPLinearDefer:
+    """Verify that TPLinear.forward skips the collective when deferred."""
+
+    def test_column_forward_deferred_returns_local_shard(self):
+        mock_tp(2)
+        layer = TPLinear(16, 8, bias=False, parallelism="column")
+        x = torch.randn(1, 4, 16)
+
+        # Normal forward: output dim should be local (no real group → no gather)
+        normal_out = layer(x)
+
+        # Deferred forward: same shape since tp_group is None (no gather anyway)
+        with defer_tp_collectives():
+            deferred_out = layer(x)
+
+        assert normal_out.shape == deferred_out.shape
+        assert torch.equal(normal_out, deferred_out)
+
+    def test_row_forward_deferred_returns_local_shard(self):
+        mock_tp(2)
+        layer = TPLinear(16, 8, bias=False, parallelism="row")
+        x = torch.randn(1, 4, 8)  # row-parallel expects sharded input
+
+        normal_out = layer(x)
+        with defer_tp_collectives():
+            deferred_out = layer(x)
+
+        assert normal_out.shape == deferred_out.shape
+        assert torch.equal(normal_out, deferred_out)
+
+
+# ---------------------------------------------------------------------------
+# warmup_scratch_buffer
+# ---------------------------------------------------------------------------
+
+
+class _FakeTPGGMLLinear(nn.Module):
+    """Minimal stand-in for TPGGMLLinear — only ``shard_shape`` is needed."""
+
+    def __init__(self, shard_shape):
+        super().__init__()
+        self.shard_shape = shard_shape
+
+    # So isinstance() check works in warmup_scratch_buffer
+    pass
+
+
+class TestWarmupScratchBuffer:
+    @pytest.fixture(autouse=True)
+    def _reset_scratch(self):
+        """Clear module-level scratch state before/after each test."""
+        _tplf._shared_dequant_scratch = None
+        _tplf._scratch_pinned_dtype = None
+        yield
+        _tplf._shared_dequant_scratch = None
+        _tplf._scratch_pinned_dtype = None
+
+    def _patch_isinstance(self, monkeypatch):
+        """Make _FakeTPGGMLLinear pass isinstance checks in warmup."""
+        real_isinstance = builtins.isinstance
+
+        def _patched(obj, cls):
+            if cls is _tplf.TPGGMLLinear and type(obj) is _FakeTPGGMLLinear:
+                return True
+            return real_isinstance(obj, cls)
+
+        monkeypatch.setattr(builtins, "isinstance", _patched)
+
+    def test_warmup_finds_max_shard(self, monkeypatch):
+        self._patch_isinstance(monkeypatch)
+        parent = nn.Sequential(
+            _FakeTPGGMLLinear(torch.Size((1024, 512))),    # 524_288
+            _FakeTPGGMLLinear(torch.Size((4096, 3072))),   # 12_582_912  ← max
+            _FakeTPGGMLLinear(torch.Size((3072, 1024))),   # 3_145_728
+        )
+        result = warmup_scratch_buffer(parent, dtype=torch.float16, device=torch.device("cpu"))
+        assert result == 4096 * 3072
+        assert _tplf._shared_dequant_scratch is not None
+        assert _tplf._shared_dequant_scratch.numel() == 4096 * 3072
+        assert _tplf._shared_dequant_scratch.dtype == torch.float16
+        assert _tplf._scratch_pinned_dtype == torch.float16
+
+    def test_warmup_no_modules_returns_zero(self, monkeypatch):
+        self._patch_isinstance(monkeypatch)
+        parent = nn.Sequential(nn.Linear(16, 8), nn.Linear(8, 4))
+        result = warmup_scratch_buffer(parent, dtype=torch.float16, device=torch.device("cpu"))
+        assert result == 0
+        assert _tplf._shared_dequant_scratch is None
+
+    def test_warmup_unwraps_model_patcher(self, monkeypatch):
+        """Simulate ComfyUI ModelPatcher → BaseModel → diffusion_model chain."""
+        self._patch_isinstance(monkeypatch)
+        diff_model = nn.Sequential(_FakeTPGGMLLinear(torch.Size((512, 256))))
+
+        class FakeBaseModel:
+            diffusion_model = diff_model
+
+        class FakePatcher:
+            model = FakeBaseModel()
+
+        result = warmup_scratch_buffer(FakePatcher(), dtype=torch.float16, device=torch.device("cpu"))
+        assert result == 512 * 256
+        assert _tplf._shared_dequant_scratch is not None
+
+    def test_warmup_skips_none_shard_shape(self, monkeypatch):
+        self._patch_isinstance(monkeypatch)
+        m = _FakeTPGGMLLinear(None)
+        parent = nn.Sequential(m)
+        result = warmup_scratch_buffer(parent, dtype=torch.float16, device=torch.device("cpu"))
+        assert result == 0
+
+    def test_warmup_dtype_bf16(self, monkeypatch):
+        self._patch_isinstance(monkeypatch)
+        parent = nn.Sequential(_FakeTPGGMLLinear(torch.Size((256, 128))))
+        result = warmup_scratch_buffer(parent, dtype=torch.bfloat16, device=torch.device("cpu"))
+        assert result == 256 * 128
+        assert _tplf._shared_dequant_scratch.dtype == torch.bfloat16
+        assert _tplf._scratch_pinned_dtype == torch.bfloat16
+
+    def test_warmup_default_dtype_is_bf16(self, monkeypatch):
+        """Default dtype should be bfloat16 (matches modern diffusion models)."""
+        self._patch_isinstance(monkeypatch)
+        parent = nn.Sequential(_FakeTPGGMLLinear(torch.Size((256, 128))))
+        result = warmup_scratch_buffer(parent, device=torch.device("cpu"))
+        assert result == 256 * 128
+        assert _tplf._shared_dequant_scratch.dtype == torch.bfloat16
+        assert _tplf._scratch_pinned_dtype == torch.bfloat16
 
 
 if __name__ == "__main__":

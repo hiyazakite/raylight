@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 import torch
+import pytest
 from raylight.distributed_modules.attention.backends.standard import StandardAttentionBackend
+
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+]
 
 def run_test():
     print("Testing StandardAttentionBackend with a mask...")

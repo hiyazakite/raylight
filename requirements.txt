@@ -1,3 +1,6 @@
+# Runtime dependencies — required by ComfyUI node manager.
+# SOURCE OF TRUTH: [project.dependencies] in pyproject.toml
+# This file MUST mirror pyproject.toml. Edit there first, then update here.
 ray>=2.48.0
 xfuser>=0.4.4
 kernels

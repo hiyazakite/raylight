@@ -53,10 +53,19 @@ class TPCompressConfig:
     group_size: int = 64
     use_residual: bool = False
     rotation: str = "signperm"  # "signperm" | "wht"
+    residual_bits: Optional[int] = None  # None = same as bits; set lower for more compression on deltas
+    residual_skip_threshold: float = 0.0  # relative delta norm below which layer is skipped (0 = disabled)
 
     @property
     def enabled(self) -> bool:
         return self.mode != "none"
+
+    @property
+    def effective_residual_bits(self) -> int:
+        """Bit-width used for compressing deltas.  Falls back to ``bits``."""
+        if self.residual_bits is not None:
+            return self.residual_bits
+        return self.bits
 
 
 # =============================================================================
@@ -519,14 +528,18 @@ class TPResidualCache:
     feedback (caching the reconstructed value, not the true value) prevents
     quantization error from accumulating across steps.
 
-    Bases are stored in FP8 E4M3 to limit memory overhead (~20 MB per base
-    instead of ~40 MB at BF16 for a 6820×3072 activation).
+    Bases are stored in TurboQuant INT4 group quantization (group_size=64)
+    which uses ~12 MB per base for a 6820×3072 activation — 44% less than
+    FP8 (~21 MB) — while preserving per-group detail better than a single
+    global FP8 scale.
     """
 
+    _BASE_GROUP_SIZE = 64
+    _BASE_BITS = 4
+
     def __init__(self) -> None:
-        # key → (fp8_tensor, scale) — one entry per rank in the TP group.
-        # Indexed as _bases[(layer_key, rank)].
-        self._bases: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        # key → (packed, scales, zero_points, orig_shape, group_size)
+        self._bases: dict[tuple[str, int], tuple] = {}
         _ALL_RESIDUAL_CACHES.append(self)
 
     # ----- public API -------------------------------------------------------
@@ -538,20 +551,21 @@ class TPResidualCache:
         entry = self._bases.get((key, rank))
         if entry is None:
             return None
-        fp8_tensor, scale = entry
-        if fp8_tensor.shape != expected_shape:
+        packed, scales, zp, orig_shape, gs = entry
+        if orig_shape != expected_shape:
             return None
-        return (fp8_tensor.to(expected_dtype) * scale).to(expected_dtype)
+        return _dequantize_and_unpack(
+            packed, scales, zp, orig_shape, gs, self._BASE_BITS, expected_dtype,
+        )
 
     def put_base(
         self, key: str, rank: int, reconstructed: torch.Tensor
     ) -> None:
-        """Store *reconstructed* in FP8 (error-feedback: cache the lossy value)."""
-        amax = reconstructed.abs().amax()
-        # fp8 e4m3 max representable value is 448
-        scale = (amax / 448.0).clamp(min=1e-12)
-        fp8 = (reconstructed / scale).to(torch.float8_e4m3fn)
-        self._bases[(key, rank)] = (fp8, scale)
+        """Store *reconstructed* in INT4 group quantization (error-feedback: cache the lossy value)."""
+        packed, scales, zp, gs = _quantize_and_pack(
+            reconstructed, self._BASE_GROUP_SIZE, self._BASE_BITS,
+        )
+        self._bases[(key, rank)] = (packed, scales, zp, reconstructed.shape, gs)
 
     def clear(self) -> None:
         """Call at start of new generation (new prompt / image)."""
@@ -620,9 +634,13 @@ class TPCompressor:
                         seed=seed, device=device,
                     )
                     quant_dim = self._fused_compressor.padded_dim
-                    logger.info(
-                        "Using fused WHT+compress Triton kernel (%d-bit).",
-                        config.bits,
+                    # Also create a standalone WHT rotation for the fallback
+                    # path when residual_bits differs from bits (the fused
+                    # compressor is compiled for a fixed bit-width).
+                    self._wht = WHTRotation(hidden_dim, seed=seed, device=device)
+                    logger.debug(
+                        "Using fused WHT+compress Triton kernel (%d-bit) for layer %d.",
+                        config.bits, layer_id,
                     )
                 else:
                     logger.warning(
@@ -708,35 +726,81 @@ class TPCompressor:
         cache = self._residual_cache
         cache_key = self._cache_key
 
-        # --- Residual: compute delta if we have a warm base ---
-        to_compress = x_2d
+        # --- Residual: check if we have a warm base ---
         is_delta = False
+        my_base = None
         if cache is not None:
             my_base = cache.get_base(cache_key, my_rank, (T, C), orig_dtype)
             if my_base is not None:
-                to_compress = x_2d - my_base
                 is_delta = True
+            else:
+                # Warmup: no base cached yet.  Send the full uncompressed
+                # activation via all_gather so every rank initialises its
+                # base from the exact (lossless) value.  This avoids
+                # polluting the base with TurboQuant quantisation noise on
+                # the very first step, which would inflate all subsequent
+                # deltas.
+                warmup_gathered = [torch.empty_like(x_2d) for _ in range(tp_size)]
+                dist.all_gather(warmup_gathered, x_2d.contiguous(), group=group)
+                result = torch.zeros(T, C, dtype=orig_dtype, device=x.device)
+                for rank_i, buf in enumerate(warmup_gathered):
+                    result += buf
+                    cache.put_base(cache_key, rank_i, buf)
+                return result.reshape(orig_shape)
+
+        # --- Skip check: if ALL ranks have negligible deltas, reuse cache ---
+        skip_threshold = self.config.residual_skip_threshold
+        if is_delta and skip_threshold > 0:
+            base_norm = my_base.norm().clamp(min=1e-12)
+            relative_norm = (x_2d - my_base).norm() / base_norm
+            want_skip = relative_norm < skip_threshold
+            # Cheap 1-element all_reduce so all ranks agree (skip only if unanimous)
+            skip_vote = torch.tensor(
+                [1.0 if want_skip else 0.0], device=x.device, dtype=torch.float32,
+            )
+            dist.all_reduce(skip_vote, op=dist.ReduceOp.MIN, group=group)
+            if skip_vote.item() > 0.5:
+                # All ranks' deltas are negligible — reuse cached bases.
+                result = torch.zeros(T, C, dtype=orig_dtype, device=x.device)
+                for rank_i in range(tp_size):
+                    rank_base = cache.get_base(cache_key, rank_i, (T, C), orig_dtype)
+                    if rank_base is not None:
+                        result += rank_base
+                return result.reshape(orig_shape)
+
+        # --- Select bit-width: lower for deltas → smaller payload ---
+        effective_bits = self.config.effective_residual_bits if is_delta else self.bits
 
         use_wht = self._rotation_mode == "wht" and self._wht is not None
         use_fused = self._rotation_mode == "wht" and self._fused_compressor is not None
+        # Fused compressor is compiled for self.bits; fall back if bits differ.
+        if use_fused and effective_bits != self.bits:
+            use_fused = False
+            use_wht = True  # self._wht is always set when rotation == "wht"
 
         if use_fused:
-            # Fused path: single Triton kernel does WHT + quant + pack
+            # Fused path: single Triton kernel does WHT + quant + pack.
+            # When is_delta, the kernel subtracts base in-register — no
+            # separate delta tensor materialised.
             fc = self._fused_compressor
             Q = self._quant_dim
             gs = fc.group_size
-            packed, scales, zp = fc.compress(to_compress)
-            payload = _serialize_compressed(packed, scales, zp, T, Q, gs, self.bits)
+            packed, scales, zp = fc.compress(
+                x_2d, base=my_base if is_delta else None,
+            )
+            payload = _serialize_compressed(packed, scales, zp, T, Q, gs, effective_bits)
         elif use_wht:
             # WHT rotation → quantize directly (no identity sign/perm overhead)
+            to_compress = (x_2d - my_base) if is_delta else x_2d
             rotated = self._wht.rotate_forward(to_compress)  # (T, padded_dim)
             Q = self._quant_dim
             packed, scales, zp, gs = _quantize_and_pack(
-                rotated, self.group_size, self.bits
+                rotated, self.group_size, effective_bits
             )
-            payload = _serialize_compressed(packed, scales, zp, T, Q, gs, self.bits)
+            payload = _serialize_compressed(packed, scales, zp, T, Q, gs, effective_bits)
         else:
             # Signed permutation: rotation embedded in compress
+            to_compress = (x_2d - my_base) if is_delta else x_2d
             if self._buffers_device != x.device:
                 self.signs = self.signs.to(device=x.device)
                 self.perm = self.perm.to(device=x.device)
@@ -745,34 +809,63 @@ class TPCompressor:
             signs = self.signs.to(dtype=x.dtype)
             Q = C
             packed, scales, zp, gs = _turboquant_compress(
-                to_compress, signs, self.perm, self.group_size, self.bits
+                to_compress, signs, self.perm, self.group_size, effective_bits
             )
-            payload = _serialize_compressed(packed, scales, zp, T, Q, gs, self.bits)
+            payload = _serialize_compressed(packed, scales, zp, T, Q, gs, effective_bits)
 
         # All-gather
         gathered = [torch.empty_like(payload) for _ in range(tp_size)]
         dist.all_gather(gathered, payload.contiguous(), group=group)
 
-        # Decompress each rank's contribution and sum
+        # Decompress the sender's own contribution directly from the local
+        # compressed tensors (before serialization) so that the cached base
+        # matches exactly what the compress path produced.  Other ranks go
+        # through the serialize→deserialize round-trip as before.
+        if use_fused:
+            # Fused: kernel adds base in-register when is_delta
+            my_decompressed = self._fused_compressor.decompress(
+                packed, scales, zp, base=my_base if is_delta else None,
+            ).to(orig_dtype)
+        elif use_wht:
+            my_decompressed_rot = _dequantize_and_unpack(
+                packed, scales, zp, (T, Q), gs, effective_bits, orig_dtype,
+            )
+            my_decompressed = self._wht.rotate_inverse(my_decompressed_rot).to(orig_dtype)
+        else:
+            my_decompressed = _turboquant_decompress(
+                packed, scales, zp, signs, self.perm_inv,
+                (T, C), gs, effective_bits, orig_dtype,
+            )
+
         result = torch.zeros(T, C, dtype=orig_dtype, device=x.device)
         for rank_i, buf in enumerate(gathered):
-            if use_fused:
-                fc = self._fused_compressor
-                p, s, z = _deserialize_compressed(buf, Q, gs, self.bits)
-                decompressed = fc.decompress(p, s, z).to(orig_dtype)
-            elif use_wht:
-                # Dequantize directly, then inverse WHT
-                decompressed_rotated = _dequantize_and_unpack(
-                    p, s, z, (T, Q), gs, self.bits, orig_dtype,
-                )
-                decompressed = self._wht.rotate_inverse(decompressed_rotated).to(orig_dtype)
+            if rank_i == my_rank:
+                # Use locally decompressed result to keep sender/receiver
+                # bases identical (error-feedback invariant).
+                decompressed = my_decompressed
             else:
-                decompressed = _turboquant_decompress(
-                    p, s, z, signs, self.perm_inv,
-                    (T, C), gs, self.bits, orig_dtype,
-                )
+                if use_fused:
+                    fc = self._fused_compressor
+                    p, s, z = _deserialize_compressed(buf, Q, gs, effective_bits)
+                    # Fused: kernel adds base in-register when is_delta
+                    rank_base_fused = cache.get_base(cache_key, rank_i, (T, C), orig_dtype) if (cache is not None and is_delta) else None
+                    decompressed = fc.decompress(p, s, z, base=rank_base_fused).to(orig_dtype)
+                elif use_wht:
+                    p, s, z = _deserialize_compressed(buf, Q, gs, effective_bits)
+                    decompressed_rotated = _dequantize_and_unpack(
+                        p, s, z, (T, Q), gs, effective_bits, orig_dtype,
+                    )
+                    decompressed = self._wht.rotate_inverse(decompressed_rotated).to(orig_dtype)
+                else:
+                    p, s, z = _deserialize_compressed(buf, Q, gs, effective_bits)
+                    decompressed = _turboquant_decompress(
+                        p, s, z, signs, self.perm_inv,
+                        (T, C), gs, effective_bits, orig_dtype,
+                    )
 
-            if cache is not None and is_delta:
+            # Non-fused paths: add base explicitly (fused paths already
+            # include base via the kernel).
+            if not use_fused and cache is not None and is_delta:
                 rank_base = cache.get_base(cache_key, rank_i, (T, C), orig_dtype)
                 if rank_base is not None:
                     decompressed = decompressed + rank_base

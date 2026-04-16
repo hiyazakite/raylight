@@ -1,4 +1,5 @@
 """Tests for the CacheDiT lightweight cache (replaces old test_dit_fast_attn.py)."""
+import os
 import sys
 import types
 import torch
@@ -7,6 +8,7 @@ import torch
 for name in ("comfy", "comfy.model_patcher", "comfy.patcher_extension"):
     if name not in sys.modules:
         mod = types.ModuleType(name)
+        mod.__path__ = []  # Mark as package so sub-imports work
         sys.modules[name] = mod
 
 # Provide the minimal stubs needed
@@ -20,7 +22,7 @@ if not hasattr(_cpe, "WrappersMP"):
         DIFFUSION_MODEL = "diffusion_model"
     _cpe.WrappersMP = _WMP
 
-sys.path.insert(0, "/root/ComfyUI/custom_nodes/raylight/src")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
 from raylight.comfy_extra_dist.nodes_cachedit import (
     _enable_lightweight_cache,

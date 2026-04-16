@@ -27,8 +27,10 @@ Network Trash Folder
 Temporary Items
 .apdisk
 
-# C extensions
+# C extensions (blanket exclude, then allow prebuilt native extensions)
 *.so
+!src/raylight/expansion/comfyui_gguf/_C_gguf*.so
+!src/raylight/lib/raylight_alloc.so
 
 # Distribution / packaging
 .Python
@@ -98,6 +100,15 @@ cookiecutter-pypackage-env/
 
 # vscode settings
 .history/
+
+# Build logs
+build_error.log
+build_gguf_error.log
+build_raylight_alloc_error.log
+build_alloc_error.log
+
+# Backup files from restructuring
+*.bak
 *.code-workspace
 
 # Frontend extension

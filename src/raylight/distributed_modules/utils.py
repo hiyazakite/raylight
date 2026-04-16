@@ -81,3 +81,26 @@ def align_model_to_cuda(model):
     # Single sync point for all async H2D transfers
     if needs_sync:
         torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Denoising step counter (general, model-agnostic)
+# ---------------------------------------------------------------------------
+# A single per-process integer tracking the current denoising step.
+# Updated by the sampler callback via set_denoising_step() after each step.
+# Read by optimizations (e.g. KV cache) to determine whether to reuse cached
+# tensors.  Value is None before the first generation begins.
+
+from typing import Optional as _Optional
+_denoising_step: _Optional[int] = None
+
+
+def get_denoising_step() -> _Optional[int]:
+    """Return the current denoising step index, or None if not yet started."""
+    return _denoising_step
+
+
+def set_denoising_step(step: _Optional[int]) -> None:
+    """Set the current denoising step index.  Pass None to reset."""
+    global _denoising_step
+    _denoising_step = step

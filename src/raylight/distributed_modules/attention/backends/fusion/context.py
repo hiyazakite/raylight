@@ -4,7 +4,9 @@ from raylight.distributed_modules.attention.backends.fusion.patchpara.df_cache i
 
 _config: Optional[CompactConfig] = None
 _cache: Optional[CompactCache] = None
-_step: Optional[int] = None
+# _step is now backed by the general denoising step counter in utils.py.
+# compact_get_step / compact_set_step are kept for backward compatibility.
+from raylight.distributed_modules.utils import get_denoising_step as _get_denoising_step, set_denoising_step as _set_denoising_step
 _allgather_cache: Optional[AllGatherCache] = None
 _current_cache_key: Optional[str] = None
 
@@ -17,12 +19,10 @@ def compact_cache():
     return _cache
 
 def compact_get_step():
-    global _step
-    return _step
+    return _get_denoising_step()
 
 def compact_set_step(step):
-    global _step
-    _step = step
+    _set_denoising_step(step)
 
 def allgather_cache():
     global _allgather_cache

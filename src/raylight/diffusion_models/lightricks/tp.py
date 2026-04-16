@@ -25,6 +25,8 @@ except ImportError:
     except ImportError:
         apply_rotary_emb = None
 
+from raylight.diffusion_models.lightricks.optimizations import get_cross_kv_cached
+
 from raylight.distributed_modules.tensor_parallel import (
     TPLinear,
     TPRMSNormAcrossHeads,
@@ -197,11 +199,18 @@ def apply_tp_to_ltxav_cross_attention(
             
         q = self.to_q(x)            # [B, T, local_inner_dim]
         ctx = x if context is None else context
-        k = self.to_k(ctx)
-        v = self.to_v(ctx)
+
+        # K/V cache: only for text cross-attention (attn2/audio_attn2, flagged
+        # with _cache_kv=True).  k is returned already normed on cache hit.
+        if getattr(self, '_cache_kv', False):
+            k, v = get_cross_kv_cached(self, ctx)
+        else:
+            k = self.to_k(ctx)
+            v = self.to_v(ctx)
 
         q = self.q_norm(q)
-        k = self.k_norm(k)
+        if not getattr(self, '_cache_kv', False):
+            k = self.k_norm(k)
 
         if pe is not None and apply_rotary_emb is not None:
             pe_local = _slice_rope_for_tp(pe, self._tp_rank, self._tp_size, self._tp_local_heads)
@@ -320,6 +329,13 @@ def apply_tp_to_ltxav_block(
             compress_config=compress_config, block_idx=block_idx * 100 + 51,
             structure_only=structure_only,
         )
+
+    # Enable K/V projection cache for text cross-attention modules.
+    # Context is constant across denoising steps so to_k + k_norm + to_v
+    # results can be reused after the first step (see get_cross_kv_cached).
+    for _ca_attr in ("attn2", "audio_attn2"):
+        if hasattr(block, _ca_attr):
+            getattr(block, _ca_attr)._cache_kv = True
 
     # Note: We keep AdaLN tables and block-level norms replicated because 
     # activations are gathered between blocks in this TP implementation.

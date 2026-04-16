@@ -7,9 +7,8 @@ import comfy.model_patcher
 from contextlib import contextmanager
 from typing import Optional, Tuple, Any, TYPE_CHECKING
 from raylight.utils.memory import monitor_memory, MemoryPolicy, NULL_POLICY
-from raylight.utils.common import Noise_RandomNoise, patch_ray_tqdm
+from raylight.utils.common import Noise_RandomNoise, patch_ray_tqdm, force_malloc_trim
 from raylight.comfy_dist.quant_ops import patch_temp_fix_ck_ops
-import time
 import os
 from raylight.utils.profiler import CProfileContext
 
@@ -59,12 +58,6 @@ class SamplerManager:
             work_model.load_device = config.device
             
         noise_mask = latent.get("noise_mask", None)
-
-        # DEBUG: Verify GGUF Ops State
-        # if getattr(work_model, "gguf_metadata", None):
-        #      ops = work_model.model_options.get("custom_operations")
-        #      if ops and hasattr(ops, "Linear"):
-        #           print(f"[RayActor {config.local_rank}] SAMPLING START | GGUF Config verified: Dequant={getattr(ops.Linear, 'dequant_dtype', 'None')}, Patch={getattr(ops.Linear, 'patch_dtype', 'None')}")
 
         return work_model, latent_image, noise_mask, disable_pbar, model_was_modified
     
@@ -146,11 +139,7 @@ class SamplerManager:
                     pass
 
                 # Stabilize CPU heap to prevent progressive slowdown from fragmentation
-                try:
-                    import ctypes
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
+                force_malloc_trim()
 
                 # ── Phase 4: Restore evicted params after inference ──
                 # Covers both pre-forward evictions (_needs_reload) and
@@ -229,18 +218,10 @@ class SamplerManager:
 
 
                  # Stats + Compact Callback
-                 last_step_time = time.perf_counter()
                  last_denoised = None
 
                  def sampling_callback(step, x0, x, total_steps):
-                    nonlocal last_step_time, last_denoised
-                    current_time = time.perf_counter()
-
-                    last_step_time = current_time
-                    
-                    # Record step time (approximate, excludes callback overhead for next step)
-                    # Step timing available via duration variable if needed
-                    
+                    nonlocal last_denoised
                     try:
                         from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step
                         # Always set step to reset the global ATTN_LAYER_IDX counter
@@ -345,17 +326,10 @@ class SamplerManager:
                     pass
                 
                 # Stats + Compact Callback
-                last_step_time = time.perf_counter()
                 last_denoised = None
 
                 def sampling_callback(step, x0, x, total_steps):
-                    nonlocal last_step_time, last_denoised
-                    current_time = time.perf_counter()
-
-                    last_step_time = current_time
-                    # Step timing is now logged inline if needed
-                    pass
-
+                    nonlocal last_denoised
                     try:
                         from raylight.distributed_modules.attention.backends.fusion.main import compact_set_step
                         # Always set step to reset the global ATTN_LAYER_IDX counter

@@ -4,7 +4,7 @@ import sys
 from dataclasses import asdict
 
 # Add src to path
-sys.path.insert(0, os.path.abspath("src"))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
 from raylight.config import (
     RaylightConfig, 

@@ -142,6 +142,11 @@ def apply_tp_to_flux_double_block(
             continue
         _replace_mlp_linears(mlp, tp_group=tp_group, structure_only=structure_only)
 
+    # Mark as TP-patched so _discover_compile_keys skips this block.
+    # TPLinear.forward has @torch.compiler.disable which causes graph-break
+    # storms when torch.compile tries to trace a TP-patched block.
+    block._tp_patched = True
+
 
 # ---------------------------------------------------------------------------
 # Single-stream block
@@ -161,6 +166,9 @@ def apply_tp_to_flux_single_block(
     """
     _replace_linear(block, "linear1", tp_group=tp_group, structure_only=structure_only)
     _replace_linear(block, "linear2", tp_group=tp_group, structure_only=structure_only)
+
+    # Mark as TP-patched so _discover_compile_keys skips this block.
+    block._tp_patched = True
 
 
 # ---------------------------------------------------------------------------

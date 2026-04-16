@@ -419,7 +419,8 @@ class RayActor:
     def set_parallel_dict(self, parallel_dict):
         self.parallel_dict = parallel_dict
 
-    def set_tp_compress_config(self, mode: str, bits: int, rotation: str, residual: bool):
+    def set_tp_compress_config(self, mode: str, bits: int, rotation: str, residual: bool,
+                               residual_bits: int | None = None, skip_threshold: float = 0.0):
         """Update TP compression config on all TPLinear layers at runtime.
 
         When mode="none", removes compressors (disabling compression).
@@ -449,6 +450,8 @@ class RayActor:
             group_size=self.raylight_config.strategy.tp_compress_group_size,
             use_residual=residual,
             rotation=rotation,
+            residual_bits=residual_bits,
+            residual_skip_threshold=skip_threshold,
         )
 
         layer_id = 0
@@ -463,6 +466,12 @@ class RayActor:
                     )
                 layer_id += 1
 
+        if mode != "none":
+            print(f"[RayActor] TP compress: {mode} {bits}-bit {rotation}, {layer_id} layers"
+                  f"{', residual' if residual else ''}"
+                  f"{f', delta={residual_bits}-bit' if residual_bits else ''}"
+                  f"{f', skip={skip_threshold}' if skip_threshold > 0 else ''}")
+
         # Also update the strategy so any future TP patching is consistent
         from dataclasses import replace
         new_strategy = replace(
@@ -471,6 +480,8 @@ class RayActor:
             tp_compress_bits=bits,
             tp_compress_residual=residual,
             tp_compress_rotation=rotation,
+            tp_compress_residual_bits=residual_bits,
+            tp_compress_skip_threshold=skip_threshold,
         )
         object.__setattr__(self.raylight_config, 'strategy', new_strategy)
 

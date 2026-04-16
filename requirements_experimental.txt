@@ -1,6 +1,7 @@
-pip install "yunchang @ git+https://github.com/feifeibear/long-context-attention.git@a52d85007ced2065dd71c498be65a02d62b51cac"
-
-# Optional: enables Tier-2 CacheDiT (DBCache + TaylorSeer adaptive caching)
-# for Wan, HunyuanVideo, LTX, Chroma, Kandinsky, Cosmos, HiDream, Lumina, etc.
-# Without this, the always-available Tier-1 lightweight cache is used for all models.
-pip install "cache-dit>=1.2.0"
+# Optional / experimental dependencies — install manually.
+#
+# Long-context attention (pinned commit):
+#   pip install "yunchang @ git+https://github.com/feifeibear/long-context-attention.git@a52d85007ced2065dd71c498be65a02d62b51cac"
+#
+# CacheDiT (Tier-2 adaptive caching for Wan, HunyuanVideo, LTX, Chroma, etc.):
+#   pip install "cache-dit>=1.2.0"

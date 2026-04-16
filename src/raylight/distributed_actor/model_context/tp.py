@@ -223,6 +223,8 @@ class TPContext(ModelContext):
             group_size=_strategy.tp_compress_group_size,
             use_residual=_strategy.tp_compress_residual,
             rotation=_strategy.tp_compress_rotation,
+            residual_bits=_strategy.tp_compress_residual_bits,
+            residual_skip_threshold=_strategy.tp_compress_skip_threshold,
         )
         TPRegistry.apply(
             model,
@@ -572,6 +574,8 @@ class TPContext(ModelContext):
                 group_size=_strategy.tp_compress_group_size,
                 use_residual=_strategy.tp_compress_residual,
                 rotation=_strategy.tp_compress_rotation,
+                residual_bits=_strategy.tp_compress_residual_bits,
+                residual_skip_threshold=_strategy.tp_compress_skip_threshold,
             )
             TPRegistry.apply(
                 model,

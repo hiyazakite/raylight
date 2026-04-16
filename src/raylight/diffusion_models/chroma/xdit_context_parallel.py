@@ -10,6 +10,12 @@ from xfuser.core.distributed import (
 )
 import raylight.distributed_modules.attention as xfuser_attn
 from ..utils import pad_to_world_size
+from raylight.distributed_modules.tensor_parallel import (
+    defer_tp_collectives,
+    gather_tensor_along_dim,
+    gather_tensor_along_dim_async,
+    get_tp_size,
+)
 xfuser_optimized_attention = xfuser_attn.make_lazy_attention()
 
 
@@ -270,13 +276,40 @@ def usp_double_stream_forward(self, img: Tensor, txt: Tensor, pe: Tensor, vec: T
 
     txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
-    # calculate the img bloks
-    img.addcmul_(img_mod1.gate, self.img_attn.proj(img_attn))
-    img.addcmul_(img_mod2.gate, self.img_mlp(torch.addcmul(img_mod2.shift, 1 + img_mod2.scale, self.img_norm2(img))))
+    _tp_active = getattr(self, "_tp_patched", False) and get_tp_size() > 1
+    if _tp_active:
+        from ..flux.xdit_context_parallel import _gather_tp_output, _gather_tp_output_async
 
-    # calculate the txt bloks
-    txt.addcmul_(txt_mod1.gate, self.txt_attn.proj(txt_attn))
-    txt.addcmul_(txt_mod2.gate, self.txt_mlp(torch.addcmul(txt_mod2.shift, 1 + txt_mod2.scale, self.txt_norm2(txt))))
+        # ── proj phase with overlap ──
+        with defer_tp_collectives():
+            img_proj_local = self.img_attn.proj(img_attn)
+            txt_proj_local = self.txt_attn.proj(txt_attn)
+
+        img_proj_handle = _gather_tp_output_async(img_proj_local, self.img_attn.proj)
+        txt_proj = _gather_tp_output(txt_proj_local, self.txt_attn.proj)
+        del txt_proj_local
+        img_proj = img_proj_handle.wait()
+        del img_proj_local
+
+        img.addcmul_(img_mod1.gate, img_proj)
+        del img_proj
+        txt.addcmul_(txt_mod1.gate, txt_proj)
+        del txt_proj
+
+        # ── MLP phase: interleave without defer ──
+        img_mlp_out = self.img_mlp(torch.addcmul(img_mod2.shift, 1 + img_mod2.scale, self.img_norm2(img)))
+        txt_mlp_out = self.txt_mlp(torch.addcmul(txt_mod2.shift, 1 + txt_mod2.scale, self.txt_norm2(txt)))
+        img.addcmul_(img_mod2.gate, img_mlp_out)
+        del img_mlp_out
+        txt.addcmul_(txt_mod2.gate, txt_mlp_out)
+        del txt_mlp_out
+    else:
+        # ── Original serial path ──
+        img.addcmul_(img_mod1.gate, self.img_attn.proj(img_attn))
+        img.addcmul_(img_mod2.gate, self.img_mlp(torch.addcmul(img_mod2.shift, 1 + img_mod2.scale, self.img_norm2(img))))
+
+        txt.addcmul_(txt_mod1.gate, self.txt_attn.proj(txt_attn))
+        txt.addcmul_(txt_mod2.gate, self.txt_mlp(torch.addcmul(txt_mod2.shift, 1 + txt_mod2.scale, self.txt_norm2(txt))))
 
     if txt.dtype == torch.float16:
         txt = torch.nan_to_num(txt, nan=0.0, posinf=65504, neginf=-65504)

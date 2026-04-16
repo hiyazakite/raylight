@@ -7,11 +7,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-_src = os.path.join(os.path.dirname(__file__), os.pardir, "src")
+_src = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "src")
 if os.path.isdir(_src) and _src not in sys.path:
     sys.path.insert(0, os.path.abspath(_src))
 
-_comfy_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir))
+_comfy_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, os.pardir))
 if os.path.isdir(_comfy_root) and _comfy_root not in sys.path:
     sys.path.insert(0, _comfy_root)
 

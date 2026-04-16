@@ -88,10 +88,35 @@ def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
         return torch.from_numpy(new).to(tensor.device, dtype=dtype)
 
 
+# Lazy-cached CUDA dequant function (avoid import-in-hot-loop overhead)
+_cuda_dequantize_fn = None
+_cuda_dequantize_checked = False
+
+def _get_cuda_dequantize():
+    global _cuda_dequantize_fn, _cuda_dequantize_checked
+    if not _cuda_dequantize_checked:
+        _cuda_dequantize_checked = True
+        try:
+            from raylight.expansion.comfyui_gguf.fused_kernels import cuda_dequantize
+            _cuda_dequantize_fn = cuda_dequantize
+        except ImportError:
+            pass
+    return _cuda_dequantize_fn
+
+
 def dequantize(data, qtype, oshape, dtype=None):
     """
     Dequantize tensor back to usable shape/dtype
     """
+    # Fast path: CUDA dequant kernel (avoids PyTorch tensor-op overhead)
+    if data.is_cuda:
+        _cuda_dq = _get_cuda_dequantize()
+        if _cuda_dq is not None:
+            m, n = oshape[0], oshape[1] if len(oshape) > 1 else 1
+            result = _cuda_dq(data, qtype, m, n, dtype)
+            if result is not None:
+                return result
+
     block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
     dequantize_blocks = dequantize_functions[qtype]
 

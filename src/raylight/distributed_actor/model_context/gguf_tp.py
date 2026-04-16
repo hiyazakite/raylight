@@ -68,6 +68,8 @@ class GGUFTPContext(GGUFContext):
             group_size=_strategy.tp_compress_group_size,
             use_residual=_strategy.tp_compress_residual,
             rotation=_strategy.tp_compress_rotation,
+            residual_bits=_strategy.tp_compress_residual_bits,
+            residual_skip_threshold=_strategy.tp_compress_skip_threshold,
         )
 
         print("[GGUFTPContext] Applying TP patching to GGUF model...")
@@ -82,6 +84,11 @@ class GGUFTPContext(GGUFContext):
         target_device = config.device
         print(f"[GGUFTPContext] Moving quantised shards to {target_device}...")
         self._move_model_to_device(model, target_device)
+
+        # 3b. Pre-size the shared dequant scratch buffer to the largest shard.
+        # Must run after weights are on CUDA so the buffer is on the right device.
+        from raylight.distributed_modules.tp_linear_factory import warmup_scratch_buffer
+        warmup_scratch_buffer(model, device=target_device)
 
         # 4. Finalise
         model.__class__ = RaylightModelPatcher

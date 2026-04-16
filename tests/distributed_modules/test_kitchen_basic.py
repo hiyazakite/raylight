@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 
 # Mock comfy_kitchen
 mock_kitchen = MagicMock()
-mock_kitchen.tensor.base.QuantizedTensor = MagicMock
-mock_kitchen.tensor.fp8.TensorCoreFP8Layout = MagicMock
+mock_kitchen.tensor.base.QuantizedTensor = MagicMock()
+mock_kitchen.tensor.fp8.TensorCoreFP8Layout = MagicMock()
 sys.modules["comfy_kitchen"] = mock_kitchen
 sys.modules["comfy_kitchen.tensor.base"] = mock_kitchen.tensor.base
 sys.modules["comfy_kitchen.tensor.fp8"] = mock_kitchen.tensor.fp8

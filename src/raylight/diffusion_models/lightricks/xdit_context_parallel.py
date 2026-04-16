@@ -8,7 +8,7 @@ import raylight.distributed_modules.attention as xfuser_attn
 from raylight.distributed_modules.sequence_parallel import extract_local_tensor
 from comfy.ldm.lightricks.model import apply_rotary_emb
 from ..utils import pad_to_world_size
-from .optimizations import prepare_pe_cached, RAYLIGHT_DEBUG, logger
+from .optimizations import prepare_pe_cached, get_cross_kv_cached, RAYLIGHT_DEBUG, logger
 
 # LTX is non-causal, so we force "basic" ring implementation to avoid zigzag overhead
 ring_impl_type = "basic"
@@ -291,11 +291,19 @@ def usp_cross_attn_forward(
 ):
     q = self.to_q(x)
     context = x if context is None else context
-    k = self.to_k(context)
-    v = self.to_v(context)
+
+    # K/V cache: only for text cross-attention (attn2/audio_attn2, flagged with
+    # _cache_kv=True).  Text context is constant across denoising steps so K/V
+    # projections + K norm can be reused.  k is returned already normed.
+    if getattr(self, '_cache_kv', False):
+        k, v = get_cross_kv_cached(self, context)
+    else:
+        k = self.to_k(context)
+        v = self.to_v(context)
 
     q = self.q_norm(q)
-    k = self.k_norm(k)
+    if not getattr(self, '_cache_kv', False):
+        k = self.k_norm(k)
 
     if pe is not None:
         q = apply_rotary_emb(q, pe)

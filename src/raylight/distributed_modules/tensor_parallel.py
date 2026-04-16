@@ -243,6 +243,167 @@ def all_reduce_tensor(tensor: torch.Tensor) -> torch.Tensor:
 
 
 # =============================================================================
+# Async gather for comm/compute overlap
+# =============================================================================
+
+
+class _DeferredGather:
+    """Wraps the result of an async all-gather.
+
+    Calling ``wait()`` blocks until the collective completes and returns
+    the gathered tensor (trimmed to *full_size* if needed).
+
+    When functional collectives are available the wrapped tensor is
+    already an ``AsyncCollectiveTensor`` and ``wait()`` simply returns it
+    (materialization happens lazily on first data access).
+    """
+
+    __slots__ = ("_tensor", "_work", "_full_size", "_dim")
+
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        work: Optional["dist.Work"],
+        full_size: Optional[int],
+        dim: int,
+    ):
+        self._tensor = tensor
+        self._work = work
+        self._full_size = full_size
+        self._dim = dim
+
+    def wait(self) -> torch.Tensor:
+        if self._work is not None:
+            self._work.wait()
+            self._work = None
+        result = self._tensor
+        if self._full_size is not None and result.shape[self._dim] != self._full_size:
+            idx = [slice(None)] * result.ndim
+            idx[self._dim] = slice(0, self._full_size)
+            result = result[tuple(idx)]
+        return result
+
+
+def gather_tensor_along_dim_async(
+    tensor: torch.Tensor,
+    dim: int = -1,
+    num_splits: Optional[int] = None,
+    full_size: Optional[int] = None,
+) -> _DeferredGather:
+    """Launch an all-gather and return a :class:`_DeferredGather` handle.
+
+    The caller must invoke ``handle.wait()`` before consuming the result.
+    This allows interleaving independent compute while the collective is
+    in flight.
+
+    Falls back to synchronous gather and wraps the result in a trivial
+    ``_DeferredGather`` when async is not possible.
+    """
+    if num_splits is None:
+        num_splits = get_tp_size()
+    if num_splits == 1:
+        return _DeferredGather(tensor, work=None, full_size=None, dim=0)
+
+    group = get_tp_group()
+    if group is None:
+        return _DeferredGather(tensor, work=None, full_size=None, dim=0)
+
+    if dim < 0:
+        dim = tensor.ndim + dim
+
+    local_size = tensor.shape[dim]
+    expected_full = full_size or (local_size * num_splits)
+    max_local = math.ceil(expected_full / num_splits)
+
+    if local_size < max_local:
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = max_local - local_size
+        tensor = torch.cat(
+            [tensor, torch.zeros(pad_shape, device=tensor.device, dtype=tensor.dtype)],
+            dim=dim,
+        )
+
+    if _HAS_FUNCOL:
+        # funcol returns an AsyncCollectiveTensor — materialized lazily on
+        # first data access.  Wrap in _DeferredGather for uniform API.
+        result = funcol_all_gather(tensor.contiguous(), dim, group)
+        return _DeferredGather(result, work=None, full_size=full_size, dim=dim)
+
+    # Non-funcol: use dist.all_gather with async_op=True.
+    tensor_list = [torch.empty_like(tensor) for _ in range(num_splits)]
+    work = dist.all_gather(tensor_list, tensor.contiguous(), group=group, async_op=True)
+    # Pre-concatenate into a single tensor — the data won't be valid until
+    # work.wait() completes, but creating the view is cheap.
+    # NOTE: torch.cat requires data to be populated, so we defer it to wait().
+    # Instead, store the list and cat in wait().
+
+    class _ListGather:
+        """Adapter that cats the list on wait()."""
+        __slots__ = ("_parts", "_work", "_full_size", "_dim")
+
+        def __init__(self, parts, work, full_size, dim):
+            self._parts = parts
+            self._work = work
+            self._full_size = full_size
+            self._dim = dim
+
+        def wait(self) -> torch.Tensor:
+            if self._work is not None:
+                self._work.wait()
+                self._work = None
+            result = torch.cat(self._parts, dim=self._dim)
+            if self._full_size is not None and result.shape[self._dim] != self._full_size:
+                idx = [slice(None)] * result.ndim
+                idx[self._dim] = slice(0, self._full_size)
+                result = result[tuple(idx)]
+            return result
+
+    return _ListGather(tensor_list, work, full_size, dim)  # type: ignore[return-value]
+
+
+# =============================================================================
+# Deferred-collective context manager
+# =============================================================================
+
+import threading as _threading
+
+_local = _threading.local()
+
+
+def _is_collective_deferred() -> bool:
+    return getattr(_local, "defer_collective", False)
+
+
+class defer_tp_collectives:
+    """Context manager that defers TP collectives in linear forward passes.
+
+    Inside this context, :class:`TPLinear` and :class:`TPGGMLLinear` skip
+    the post-matmul all-gather / all-reduce.  The caller is responsible for
+    applying the collective afterwards via :func:`gather_tensor_along_dim`
+    or :func:`gather_tensor_along_dim_async`.
+
+    Usage in double-stream blocks::
+
+        with defer_tp_collectives():
+            img_proj_local = self.img_attn.proj(img_attn)  # no gather
+            txt_proj_local = self.txt_attn.proj(txt_attn)  # no gather
+
+        # Now apply gathers with overlap
+        img_handle = gather_tensor_along_dim_async(img_proj_local, ...)
+        txt_proj = gather_tensor_along_dim(txt_proj_local, ...)
+        img_proj = img_handle.wait()
+    """
+
+    def __enter__(self):
+        self._prev = getattr(_local, "defer_collective", False)
+        _local.defer_collective = True
+        return self
+
+    def __exit__(self, *exc):
+        _local.defer_collective = self._prev
+
+
+# =============================================================================
 # TPLinear
 # =============================================================================
 
@@ -508,6 +669,8 @@ class TPLinear(nn.Module):
                     out = out + act_delta.to(out.dtype)
 
         # 4. Post-matmul communication
+        if _is_collective_deferred():
+            return out
         if self.parallelism == "column":
             if self.gather_output and self._tp_size_runtime > 1:
                 out = gather_tensor_along_dim(out, dim=-1, full_size=self.out_features)

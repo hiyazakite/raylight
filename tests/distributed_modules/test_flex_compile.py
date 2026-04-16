@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 import torch
 import time
-from raylight.distributed_modules.attention.xfuser_ring_patch import manual_block_attention
+import pytest
+from raylight.distributed_modules.attention.backends.xfuser_ring_patch import manual_block_attention
 import logging
+
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+]
 
 logging.basicConfig(level=logging.INFO)
 

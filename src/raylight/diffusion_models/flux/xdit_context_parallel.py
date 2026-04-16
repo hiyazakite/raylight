@@ -11,6 +11,12 @@ from xfuser.core.distributed import (
 from ..utils import pad_to_world_size
 import raylight.distributed_modules.attention as xfuser_attn
 from raylight.distributed_modules.sequence_parallel import extract_local_tensor
+from raylight.distributed_modules.tensor_parallel import (
+    defer_tp_collectives,
+    gather_tensor_along_dim,
+    gather_tensor_along_dim_async,
+    get_tp_size,
+)
 xfuser_optimized_attention = xfuser_attn.make_lazy_attention()
 
 
@@ -353,6 +359,29 @@ def usp_single_stream_forward(
     return x
 
 
+def _gather_tp_output(tensor: Tensor, layer) -> Tensor:
+    """Synchronously gather a deferred TP-linear output shard."""
+    if hasattr(layer, "out_features") and hasattr(layer, "gather_output"):
+        if layer.gather_output and getattr(layer, "_tp_size_runtime", 1) > 1:
+            return gather_tensor_along_dim(tensor, dim=-1, full_size=layer.out_features)
+    return tensor
+
+
+def _gather_tp_output_async(tensor: Tensor, layer):
+    """Launch an async gather for a deferred TP-linear output shard.
+
+    Returns a handle whose ``.wait()`` yields the gathered tensor.
+    """
+    if hasattr(layer, "out_features") and hasattr(layer, "gather_output"):
+        if layer.gather_output and getattr(layer, "_tp_size_runtime", 1) > 1:
+            return gather_tensor_along_dim_async(tensor, dim=-1, full_size=layer.out_features)
+    # No gather needed — wrap in a trivial handle.
+    class _NoOp:
+        def wait(self):
+            return tensor
+    return _NoOp()
+
+
 def usp_double_stream_forward(
     self,
     img: Tensor,
@@ -423,15 +452,61 @@ def usp_double_stream_forward(
 
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
-    # calculate the img bloks
-    img += apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
-    del img_attn
-    img += apply_mod(self.img_mlp(apply_mod(self.img_norm2(img), (1 + img_mod2.scale), img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+    # ── Post-attention: proj + MLP for img and txt streams ──
+    # When TP is active the proj layers contain allgather collectives.
+    # By deferring the collective on the proj layers and interleaving the
+    # two independent streams we overlap compute with communication:
+    #
+    #   1. Compute img_proj shard  (no gather yet)
+    #   2. Compute txt_proj shard  (GEMM overlaps with img gather launch)
+    #   3. Async-gather img_proj while synchronously gathering txt_proj
+    #   4. Wait for img_proj gather, apply both residuals
+    #
+    # The MLP phase is NOT deferred because MLPs contain internal linear
+    # layers whose gathers must complete before intermediate activations.
+    # Instead we simply interleave: launch img_mlp (its internal gathers
+    # are synchronous), then launch txt_mlp.
+    #
+    _tp_active = getattr(self, "_tp_patched", False) and get_tp_size() > 1
+    if _tp_active:
+        # ── proj phase with overlap ──
+        with defer_tp_collectives():
+            img_proj_local = self.img_attn.proj(img_attn)
+            del img_attn
+            txt_proj_local = self.txt_attn.proj(txt_attn)
+            del txt_attn
 
-    # calculate the txt bloks
-    txt += apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)
-    del txt_attn
-    txt += apply_mod(self.txt_mlp(apply_mod(self.txt_norm2(txt), (1 + txt_mod2.scale), txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
+        # Launch async gather for img; synchronously gather txt.
+        # The txt gather compute overlaps with the img async gather.
+        img_proj_handle = _gather_tp_output_async(img_proj_local, self.img_attn.proj)
+        txt_proj = _gather_tp_output(txt_proj_local, self.txt_attn.proj)
+        del txt_proj_local
+        img_proj = img_proj_handle.wait()
+        del img_proj_local
+
+        img += apply_mod(img_proj, img_mod1.gate, None, modulation_dims_img)
+        del img_proj
+        txt += apply_mod(txt_proj, txt_mod1.gate, None, modulation_dims_txt)
+        del txt_proj
+
+        # ── MLP phase: no defer, but interleave for NCCL overlap ──
+        img_mlp_out = self.img_mlp(apply_mod(self.img_norm2(img), (1 + img_mod2.scale), img_mod2.shift, modulation_dims_img))
+        txt_mlp_out = self.txt_mlp(apply_mod(self.txt_norm2(txt), (1 + txt_mod2.scale), txt_mod2.shift, modulation_dims_txt))
+        img += apply_mod(img_mlp_out, img_mod2.gate, None, modulation_dims_img)
+        del img_mlp_out
+        txt += apply_mod(txt_mlp_out, txt_mod2.gate, None, modulation_dims_txt)
+        del txt_mlp_out
+    else:
+        # ── Original serial path (no TP or TP size 1) ──
+        # calculate the img bloks
+        img += apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
+        del img_attn
+        img += apply_mod(self.img_mlp(apply_mod(self.img_norm2(img), (1 + img_mod2.scale), img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+
+        # calculate the txt bloks
+        txt += apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)
+        del txt_attn
+        txt += apply_mod(self.txt_mlp(apply_mod(self.txt_norm2(txt), (1 + txt_mod2.scale), txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
 
     if txt.dtype == torch.float16:
         txt = torch.nan_to_num(txt, nan=0.0, posinf=65504, neginf=-65504)

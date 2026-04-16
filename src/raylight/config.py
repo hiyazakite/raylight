@@ -75,6 +75,8 @@ class ExecutionStrategy:
     tp_compress_group_size: int = 64       # must divide hidden_dim
     tp_compress_residual: bool = False     # step-to-step residual caching (Phase 2)
     tp_compress_rotation: str = "signperm" # "signperm" | "wht" (Phase 3)
+    tp_compress_residual_bits: Optional[int] = None  # None = same as bits; lower for more delta compression
+    tp_compress_skip_threshold: float = 0.0  # relative delta norm below which layer is skipped (0=disabled)
 
     @property
     def is_fsdp(self) -> bool:

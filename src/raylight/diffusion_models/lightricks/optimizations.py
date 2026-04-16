@@ -123,3 +123,54 @@ def patch_ada_caching(block):
 
         block.forward = clearing_forward
         block._ada_cache_forward_patched = True
+
+
+# ---------------------------------------------------------------------------
+# Cross-Attention K/V Projection Cache
+# ---------------------------------------------------------------------------
+
+def get_cross_kv_cached(attn, context):
+    """Cache K/V projections (including K normalization) for constant context.
+
+    For text cross-attention in LTX models, the text context does not change
+    across denoising steps of a single generation.  Caching to_k + k_norm +
+    to_v eliminates 3 operations per block per step after the first step.
+
+    Cache invalidation is step-counter based, NOT data_ptr based.
+
+    Why not data_ptr: _prepare_context calls caption_projection(context) which
+    allocates a NEW tensor on every denoising step.  With TP=2, each rank is a
+    separate process with an independent CUDA allocator.  Python's memory
+    recycler can hand the same virtual address to one rank's new context while
+    the other rank gets a fresh address — producing a cache HIT on one rank and
+    a MISS on the other.  That asymmetry skips k_norm's all_reduce on one side
+    only, which deadlocks NCCL.
+
+    Why step-counter is safe: the step counter (set_denoising_step) is updated by
+    the sampling callback which runs AFTER each NCCL-synchronized denoising
+    step.  Both TP ranks always have the same step value because they cannot
+    advance past a denoising step without completing the same NCCL calls.
+
+    Returns (k_normed, v) — k already has k_norm applied, so the caller must
+    NOT apply k_norm again on cache hits.  This is signalled by the _cache_kv
+    flag on the attention module.
+
+    IMPORTANT: Only call for cross-attention to a constant context (attn2 /
+    audio_attn2).  Do NOT call for self-attention or AV cross-attention whose
+    context changes every step.
+    """
+    from raylight.distributed_modules.utils import get_denoising_step
+    step = get_denoising_step()
+
+    # Use cached K/V for step > 0 only.
+    # step == 0: always recompute — refreshes cache for new generation AND ensures
+    #            all TP ranks call k_norm's all_reduce symmetrically.
+    # step == None: compact not initialised, treat as step 0 (recompute, safe).
+    cache = getattr(attn, '_cross_kv_cache', None)
+    if cache is not None and step is not None and step != 0:
+        return cache[0], cache[1]
+
+    k = attn.k_norm(attn.to_k(context))
+    v = attn.to_v(context)
+    attn._cross_kv_cache = (k, v)
+    return k, v

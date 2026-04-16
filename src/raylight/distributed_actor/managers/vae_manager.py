@@ -229,7 +229,7 @@ class VaeManager:
             if not skip_offload:
                 from raylight.distributed_actor.model_context import VAEContext
                 vae_ctx = VAEContext(use_mmap=config.raylight_config.device.use_mmap)
-                vae_ctx.offload(self.vae_model, lora_manager, {}, config)
+                vae_ctx.offload(self.vae_model, lora_manager, {}, config, memory=memory)
                 print(f"[RayActor {config.local_rank}] VAE Offload in finally block complete.")
                 force_malloc_trim()
 

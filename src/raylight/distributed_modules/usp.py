@@ -301,6 +301,11 @@ if hasattr(model_base, "LTXAV"):
             block.audio_attn2.forward = types.MethodType(usp_cross_attn_forward, block.audio_attn2)
             block.audio_to_video_attn.forward = types.MethodType(usp_cross_attn_forward, block.audio_to_video_attn)
             block.video_to_audio_attn.forward = types.MethodType(usp_cross_attn_forward, block.video_to_audio_attn)
+            # Enable K/V projection cache for text cross-attention: context is
+            # constant across denoising steps so to_k + k_norm + to_v can be
+            # reused after the first step.
+            block.attn2._cache_kv = True
+            block.audio_attn2._cache_kv = True
             patch_ada_caching(block)
 
         # Patch Embedding Connectors (LTXAV-specific)
@@ -330,6 +335,8 @@ if hasattr(model_base, "LTXV"):
         for block in model.transformer_blocks:
             block.attn1.forward = types.MethodType(usp_cross_attn_forward, block.attn1)
             block.attn2.forward = types.MethodType(usp_cross_attn_forward, block.attn2)
+            # Enable K/V projection cache for text cross-attention.
+            block.attn2._cache_kv = True
 
         model._forward = types.MethodType(usp_dit_forward, model)
         model._usp_injected = True

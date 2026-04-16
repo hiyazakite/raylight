@@ -394,6 +394,18 @@ class RayTPCompress:
                     "default": False,
                     "tooltip": "Step-to-step delta compression. Caches previous step's result and only transmits the change. Adds ~7.5 GB VRAM per rank but greatly improves compression quality."
                 }),
+                "residual_bits": (
+                    ["auto", "2", "3"],
+                    {"default": "auto",
+                     "tooltip": "Bit-width for compressing residual deltas. 'auto' = same as bits. Set lower (e.g. 2) for up to 2× less communication when residual is on."}
+                ),
+                "skip_threshold": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 0.2,
+                    "step": 0.005,
+                    "tooltip": "Relative delta-norm threshold below which a layer's all_gather is skipped entirely (0 = disabled). Suggested range: 0.01-0.05."
+                }),
             }
         }
 
@@ -406,14 +418,15 @@ class RayTPCompress:
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
 
-    def apply_compress(self, actors: dict, mode: str, bits: str, rotation: str, residual: bool):
+    def apply_compress(self, actors: dict, mode: str, bits: str, rotation: str, residual: bool, residual_bits: str, skip_threshold: float):
         actor_list = actors["actors"]
+        rb = None if residual_bits == "auto" else int(residual_bits)
         futures = [
-            a.set_tp_compress_config.remote(mode, int(bits), rotation, residual)
+            a.set_tp_compress_config.remote(mode, int(bits), rotation, residual, rb, skip_threshold)
             for a in actor_list
         ]
         cancellable_get(futures)
-        print(f"[RayTPCompress] Applied TP compress: mode={mode}, bits={bits}, rotation={rotation}, residual={residual}")
+        print(f"[RayTPCompress] Applied TP compress: mode={mode}, bits={bits}, rotation={rotation}, residual={residual}, residual_bits={residual_bits}, skip_threshold={skip_threshold}")
         return (actors,)
 
 

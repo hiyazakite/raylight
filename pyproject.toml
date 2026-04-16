@@ -1,5 +1,8 @@
+# =============================================================================
+# pyproject.toml — Single source of truth for raylight metadata & tooling
+# =============================================================================
 [build-system]
-requires = ["setuptools>=70.0"]
+requires = ["setuptools>=70.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,90 +10,108 @@ name = "raylight"
 version = "0.16.0"
 description = "Enable tensor split multi gpu capability in Comfy UI"
 authors = [
-  {name = "Micko Lesmana", email = "mickolesmana@gmail.com"}
+    { name = "Micko Lesmana", email = "mickolesmana@gmail.com" },
 ]
 readme = "README.md"
-license = {file = "LICENSE"}
-classifiers = []
-dependencies = [
-"ray>=2.48.0", "xfuser>=0.4.4"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-
-
+dependencies = [
+    "ray>=2.48.0",
+    "xfuser>=0.4.4",
+    "kernels",
+    "huggingface_hub",
+    "hf_transfer",
+    "fastsafetensors",
+    "diffusers[torch]",
+]
 
 [project.optional-dependencies]
 dev = [
+    "pytest>=8.0",
+    "coverage",
+    "mypy",
+    "ruff",
+    "pre-commit",
     "bump-my-version",
-    "coverage",  # testing
-    "mypy",  # linting
-    "pre-commit", # runs linting on commit
-    "pytest",  # testing
-    "ruff",  # linting
 ]
 
 [project.urls]
-bugs = "https://github.com/komikndr/raylight/issues"
-homepage = "https://github.com/komikndr/raylight"
+Homepage = "https://github.com/komikndr/raylight"
 Repository = "https://github.com/komikndr/raylight"
+Issues = "https://github.com/komikndr/raylight/issues"
 
-
+# =============================================================================
+# ComfyUI registry metadata (read by Comfy-Org/publish-node-action)
+# =============================================================================
 [tool.comfy]
 PublisherId = "komikndr"
 DisplayName = "raylight"
 repository = "https://github.com/komikndr/raylight"
 Icon = "https://github.com/komikndr/raylight/blob/main/icon.png?raw=true"
 
+# =============================================================================
+# Setuptools — src layout, include prebuilt native extensions in wheels
+# =============================================================================
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
-"*" = ["*.*"]
+"raylight.lib" = ["*.so"]
+"raylight.expansion.comfyui_gguf" = ["*.so"]
 
+# =============================================================================
+# Testing
+# =============================================================================
 [tool.pytest.ini_options]
 minversion = "8.0"
-testpaths = [
-    "tests",
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "gpu: requires CUDA GPU",
+    "triton: requires Triton compiler",
+    "slow: long-running tests",
 ]
 
+# =============================================================================
+# Type checking
+# =============================================================================
 [tool.pyright]
-#typeCheckingMode = "strict"
 reportMissingImports = false
 
 [tool.mypy]
-files = "."
-
-# Use strict defaults
+files = "src"
 strict = true
 warn_unreachable = true
 warn_no_return = true
 
 [[tool.mypy.overrides]]
-# Don't require test functions to include types
 module = "tests.*"
 allow_untyped_defs = true
 disable_error_code = "attr-defined"
 
+# =============================================================================
+# Linting / formatting
+# =============================================================================
 [tool.ruff]
 line-length = 140
-select = ["E", "F"]
-ignore = [
-  # Whitespace / indentation – let Black handle this
-  "E101", "E111", "E114", "E117",
-  "E201", "E202", "E203", "E211",
-  "E221", "E222", "E225", "E231",
-  "E241", "E251", "E261", "E262",
-  "E265", "E266", "E271", "E272",
-  "E273", "E274", "E275",
-  "E301", "E302", "E303",
-  "W191", "W293",
-]
+src = ["src", "tests"]
 
-# Add rules to ban exec/eval
 [tool.ruff.lint]
 select = [
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
     "S102",  # exec-builtin
     "S307",  # eval-used
-    "W293",
-    "F",  # The "F" series in Ruff stands for "Pyflakes" rules, which catch various Python syntax errors and undefined names.
-    # See all rules here: https://docs.astral.sh/ruff/rules/#pyflakes-f
+]
+ignore = [
+    "E501",  # line-too-long (handled by formatter)
 ]
 
 [tool.ruff.lint.flake8-quotes]

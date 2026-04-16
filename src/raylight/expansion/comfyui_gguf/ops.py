@@ -113,6 +113,7 @@ class GGMLLayer(torch.nn.Module):
     comfy_cast_weights = True
     dequant_dtype = None
     patch_dtype = None
+    fused_cuda_kernel = True
     largest_layer = False
     dequant_cache = {}
     cache_patched_weights = False # Strictly optional, disabled by default

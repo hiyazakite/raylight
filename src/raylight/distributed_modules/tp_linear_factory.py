@@ -25,6 +25,7 @@ import torch.distributed as dist
 from typing import Literal, Optional, TYPE_CHECKING
 
 import gguf
+import logging
 
 from raylight.expansion.comfyui_gguf.dequant import (
     dequantize,
@@ -32,6 +33,69 @@ from raylight.expansion.comfyui_gguf.dequant import (
     is_quantized,
     is_torch_compatible,
 )
+from raylight.expansion.comfyui_gguf.fused_kernels import (
+    HAS_FUSED_GGUF_CUDA,
+    fused_ggml_gemm,
+)
+
+logger = logging.getLogger(__name__)
+_fallback_logged = False
+
+# Shared scratch buffer for CUDA dequant — only one layer executes at a time,
+# so a single buffer (sized to the largest layer) avoids per-module allocation
+# that would duplicate the entire model's weights in VRAM.
+_shared_dequant_scratch: Optional[torch.Tensor] = None
+_scratch_pinned_dtype: Optional[torch.dtype] = None  # set by warmup; inhibits realloc on dtype drift
+
+
+def warmup_scratch_buffer(
+    model,
+    dtype: torch.dtype = torch.bfloat16,
+    device: Optional[torch.device] = None,
+) -> int:
+    """Pre-allocate the shared dequant scratch to the largest shard size.
+
+    Call this **once** after model loading and TP patching completes (i.e.
+    after quantized weights have been loaded into TPGGMLLinear modules and
+    moved to the target device).
+
+    *model* can be an ``nn.Module`` or a ComfyUI ``ModelPatcher`` wrapper
+    (the inner ``nn.Module`` is extracted automatically via
+    ``model.model.diffusion_model``).
+
+    Returns the buffer size in elements (0 if no TPGGMLLinear modules found).
+    """
+    global _shared_dequant_scratch, _scratch_pinned_dtype
+
+    # Unwrap ComfyUI ModelPatcher → BaseModel → diffusion_model
+    root = model
+    if not isinstance(root, nn.Module):
+        root = getattr(root, "model", root)
+    if not isinstance(root, nn.Module):
+        root = getattr(root, "diffusion_model", root)
+    if not isinstance(root, nn.Module):
+        logger.warning("warmup_scratch_buffer: could not find nn.Module inside %s", type(model).__name__)
+        return 0
+
+    max_needed = 0
+    for m in root.modules():
+        if isinstance(m, TPGGMLLinear) and m.shard_shape is not None:
+            max_needed = max(max_needed, m.shard_shape[0] * m.shard_shape[1])
+    if max_needed > 0:
+        if device is None:
+            device = torch.device("cuda")
+        _shared_dequant_scratch = torch.empty(max_needed, dtype=dtype, device=device)
+        _scratch_pinned_dtype = dtype
+        logger.debug(
+            "Scratch buffer warmed up: %d elements, %.1f MiB (%s on %s)",
+            max_needed,
+            max_needed * dtype.itemsize / (1024 * 1024),
+            dtype,
+            device,
+        )
+    return max_needed
+
+
 from raylight.distributed_modules.tensor_parallel import (
     TPLinear,
     TensorParallelState,
@@ -40,6 +104,19 @@ from raylight.distributed_modules.tensor_parallel import (
     get_tp_group,
     get_tp_size,
 )
+
+# Lazy-cached import for LoRA extraction (avoids import lock on every forward)
+_extract_lora_ab = None
+
+def _get_extract_lora_ab():
+    global _extract_lora_ab
+    if _extract_lora_ab is None:
+        try:
+            from raylight.comfy_dist.model_patcher import _extract_lora_ab as fn
+            _extract_lora_ab = fn
+        except ImportError:
+            _extract_lora_ab = False  # sentinel: not available
+    return _extract_lora_ab if _extract_lora_ab is not False else None
 
 if TYPE_CHECKING:
     from raylight.expansion.comfyui_gguf.ops import GGMLTensor
@@ -167,10 +244,15 @@ class TPGGMLLinear(nn.Module):
         self.register_buffer("quantized_weight", None)
         self.tensor_type: Optional[gguf.GGMLQuantizationType] = None
         self.shard_shape: Optional[torch.Size] = None
+        self._tensor_type_int: Optional[int] = None  # cached for hot-path
 
         # User-selectable dequant precision (mirrors GGMLOps dequant_dtype).
         # None = native quant precision, "target" = match input dtype.
         self.dequant_dtype = None
+        self.fused_cuda_kernel = True  # can be disabled from node UI
+
+        # Pre-allocated scratch buffer for CUDA dequant (avoids malloc per forward).
+        # Uses a module-level shared buffer — see _shared_dequant_scratch.
 
         # Zero-element weight so state_dict() exposes "*.weight" keys.
         # ComfyUI's model_lora_keys_unet() and add_patches() both require
@@ -247,6 +329,8 @@ class TPGGMLLinear(nn.Module):
         self.register_buffer("quantized_weight", shard_data)
         self.tensor_type = tensor_type
         self.shard_shape = shard_shape
+        # Cache for hot-path dispatch (avoids enum .value on every forward)
+        self._tensor_type_int = tensor_type.value if hasattr(tensor_type, "value") else int(tensor_type)
 
     def load_bias(self, bias_tensor: torch.Tensor) -> None:
         """Load and optionally shard bias."""
@@ -270,25 +354,6 @@ class TPGGMLLinear(nn.Module):
             out_dim = self.local_out_features if self.parallelism == "column" else self.out_features
             return torch.empty(*x.shape[:-1], out_dim, dtype=x.dtype, device=x.device)
 
-        # 1. Dequantise shard on-the-fly.
-        #    Honour user-selected dequant_dtype (from GGUF loader node).
-        #    "target" → use input dtype for internal scale arithmetic.
-        #    None     → native quant precision (float16 for K-quants).
-        #    explicit → that dtype (e.g. torch.float32).
-        qw = self.quantized_weight
-        if hasattr(qw, "as_subclass"):
-            qw = qw.as_subclass(torch.Tensor)
-        _dq = self.dequant_dtype
-        _internal_dtype = x.dtype if _dq == "target" else _dq
-        weight = dequantize(
-            qw,
-            self.tensor_type,
-            self.shard_shape,
-            dtype=_internal_dtype,
-        )
-        if weight.dtype != x.dtype:
-            weight = weight.to(x.dtype)
-
         # 2. Input / bias selection
         if self.parallelism == "row":
             if not self.input_is_parallel:
@@ -299,6 +364,112 @@ class TPGGMLLinear(nn.Module):
 
         if bias is not None:
             bias = bias.to(x.dtype)
+
+        # ── Fast path: fused CUDA kernel (no dequant materialisation) ──
+        #
+        # For standard LoRA (no DoRA / LoHa / LoKr), we can keep the fused
+        # path and compute the LoRA contribution as a cheap residual:
+        #   out = fused_gemm(W_q, x) + B @ (A @ x)
+        # This avoids materialising the full FP16 weight.
+        # If the user requested fused kernels but the extension isn't
+        # available, log once and fall back to the dequant path.
+        global _fallback_logged
+        if self.fused_cuda_kernel and not HAS_FUSED_GGUF_CUDA:
+            if not _fallback_logged:
+                logger.info(
+                    "Fused CUDA kernels requested but not available — falling back to dequant path."
+                )
+                _fallback_logged = True
+
+        if HAS_FUSED_GGUF_CUDA and self.fused_cuda_kernel:
+            lora_residual_ok, lora_ab = self._try_extract_lora_ab()
+
+            if lora_residual_ok:
+                # Resolve dequant_dtype for the fused path.
+                _dq = self.dequant_dtype
+                _fused_dq = x.dtype if _dq == "target" else _dq
+
+                # Shared scratch buffer for CUDA dequant (large-batch path).
+                # A single buffer is reused across ALL TPGGMLLinear modules
+                # since only one layer executes at a time.  If warmup_scratch_buffer()
+                # was called at model load, the buffer is already correctly sized
+                # and typed.  The fallback allocation here handles the no-warmup
+                # case and genuinely undersized buffers.
+                global _shared_dequant_scratch
+                rows, cols = self.shard_shape
+                needed = rows * cols
+                # The C++ kernel requires scratch.dtype == X.dtype.
+                # After the dequant_dtype cast in fused_ggml_gemm, X will be
+                # in _fused_dq (or x.dtype if _fused_dq is None).  Match that.
+                _kernel_dtype = _fused_dq if _fused_dq is not None else x.dtype
+                s = _shared_dequant_scratch
+                if s is None or s.numel() < needed or s.device != x.device:
+                    # Cold start or genuinely undersized — allocate.
+                    if _scratch_pinned_dtype is not None:
+                        logger.warning(
+                            "Scratch buffer realloc despite warmup "
+                            "(had %s, need %d on %s) — check warmup_scratch_buffer() call.",
+                            "None" if s is None else f"{s.numel()} elems on {s.device}",
+                            needed,
+                            x.device,
+                        )
+                    _shared_dequant_scratch = torch.empty(
+                        needed, dtype=_kernel_dtype, device=x.device,
+                    )
+                    s = _shared_dequant_scratch
+                else:
+                    s = _shared_dequant_scratch[:needed]
+
+                # The kernel checks scratch.dtype == X.dtype.  If the warmup
+                # dtype doesn't match the runtime dtype, view-cast the buffer
+                # (zero-cost: same memory, different interpretation) so the
+                # kernel sees the correct dtype.  Both fp16 and bf16 are 2
+                # bytes, so numel() is preserved.
+                if s.dtype != _kernel_dtype:
+                    s = s.view(_kernel_dtype)
+
+                fused_out = fused_ggml_gemm(
+                    x, self.quantized_weight, self.tensor_type,
+                    self.shard_shape, bias,
+                    type_int=self._tensor_type_int,
+                    scratch=s,
+                    dequant_dtype=_fused_dq,
+                )
+                if fused_out is not None:
+                    # Add LoRA residual: sum of B_i @ (A_i @ x) for each adapter
+                    if lora_ab is not None:
+                        fused_out = fused_out + self._compute_lora_residual(
+                            x, lora_ab,
+                        )
+                    # TP collective
+                    fused_out = self._apply_tp_collective(fused_out)
+                    return fused_out
+                else:
+                    # fused_ggml_gemm returned None — log details for debugging
+                    logger.debug(
+                        "fused_ggml_gemm fall-through: type=%r rows=%r batch=%d requested_fused=%s",
+                        getattr(self.tensor_type, 'name', self.tensor_type),
+                        None if self.shard_shape is None else self.shard_shape[0],
+                        x.shape[0],
+                        self.fused_cuda_kernel,
+                    )
+
+        # ── Fallback: dequant → F.linear ──
+        # 1. Dequantise shard on-the-fly.
+        #    Honour user-selected dequant_dtype (from GGUF loader node).
+        #    "target" → use input dtype for internal scale arithmetic.
+        #    None     → native quant precision (float16 for K-quants).
+        #    explicit → that dtype (e.g. torch.float32).
+        _dq = self.dequant_dtype
+        _internal_dtype = x.dtype if _dq == "target" else _dq
+        weight = dequantize(
+            self.quantized_weight,
+            self.tensor_type,
+            self.shard_shape,
+            dtype=_internal_dtype,
+        )
+        if weight.dtype != x.dtype:
+            weight = weight.to(x.dtype)
 
         # 3. Apply LoRA patches (if any).
         #    ComfyUI attaches weight_function via LowVramPatch when LoRA
@@ -313,6 +484,105 @@ class TPGGMLLinear(nn.Module):
         out = F.linear(x, weight, bias)
 
         # 5. TP collective
+        out = self._apply_tp_collective(out)
+        return out
+
+    # ── LoRA residual helpers ────────────────────────────────
+
+    def _try_extract_lora_ab(self):
+        """Check whether active patches can use the residual LoRA path.
+
+        Returns ``(can_use_fused, lora_ab_or_none)`` where:
+        - ``(True, None)``       — no patches at all, fused path is fine
+        - ``(True, (As, Bs))``   — standard LoRA, residual approach works
+        - ``(False, None)``      — DoRA / LoHa / unsupported, need dequant fallback
+        """
+        wf = getattr(self, "weight_function", None)
+        if not wf:
+            return True, None  # no LoRA — fused path is fine
+
+        extract_fn = _get_extract_lora_ab()
+        if extract_fn is None:
+            return False, None
+
+        # Get the raw patch list from LowVramPatch
+        for fn in wf:
+            if not hasattr(fn, "patches") or not hasattr(fn, "key"):
+                return False, None  # unknown callback type
+            if fn.key not in fn.patches:
+                continue  # no active patches for this key
+            patch_list = fn.patches[fn.key]
+            try:
+                all_A, all_B, dora_scale = extract_fn(patch_list)
+            except Exception:
+                return False, None
+
+            if all_A is None:
+                return False, None  # unsupported patch type (LoHa/LoKr/mid/offset)
+            if dora_scale is not None:
+                return False, None  # DoRA needs full weight for norm
+
+            return True, (all_A, all_B)
+
+        return True, None  # all patches were inactive
+
+    @torch.no_grad()
+    def _compute_lora_residual(self, x, lora_ab):
+        """Compute sum_i B_i @ (A_i @ x^T) with TP-aware sharding.
+
+        A_i has shape [rank, full_in], B_i has shape [full_out, rank].
+        For column-parallel: shard B on dim 0 (output).
+        For row-parallel: shard A on dim 1 (input).
+        """
+        all_A, all_B = lora_ab
+        tp_rank = self._tp_rank
+        residual = None
+
+        for A, B in zip(all_A, all_B):
+            A = A.to(device=x.device, dtype=x.dtype)
+            B = B.to(device=x.device, dtype=x.dtype)
+
+            # TP shard the LoRA matrices (stored at full size)
+            if self._tp_size_runtime > 1:
+                if self.parallelism == "column":
+                    # Output dim is sharded — narrow B on dim 0
+                    local_out = self.local_out_features
+                    if B.shape[0] != local_out:
+                        B = B.narrow(0, tp_rank * local_out, local_out)
+                else:
+                    # Input dim is sharded — narrow A on dim 1
+                    local_in = self.local_in_features
+                    if A.shape[1] != local_in:
+                        A = A.narrow(1, tp_rank * local_in, local_in)
+
+            # x: (*, in) → x_2d: (batch, in)
+            orig_shape = x.shape
+            x_2d = x.reshape(-1, x.shape[-1])
+
+            # LoRA residual: B @ (A @ x^T) → (out, batch) → transpose → (batch, out)
+            Ax = torch.mm(A, x_2d.t())   # [rank, batch]
+            BAx = torch.mm(B, Ax)          # [local_out, batch]
+            delta = BAx.t()                # [batch, local_out]
+
+            # Restore leading dims
+            delta = delta.reshape(*orig_shape[:-1], delta.shape[-1])
+
+            if residual is None:
+                residual = delta
+            else:
+                residual = residual + delta
+
+        return residual
+
+    def _apply_tp_collective(self, out):
+        """Apply the TP collective (gather or all-reduce) to the output.
+
+        When :func:`defer_tp_collectives` context is active, returns *out*
+        unchanged — the caller handles the collective manually.
+        """
+        from raylight.distributed_modules.tensor_parallel import _is_collective_deferred
+        if _is_collective_deferred():
+            return out
         if self.parallelism == "column":
             if self.gather_output and self._tp_size_runtime > 1:
                 out = gather_tensor_along_dim(
@@ -326,7 +596,6 @@ class TPGGMLLinear(nn.Module):
                     )
                 else:
                     out = all_reduce_tensor(out)
-
         return out
 
     # ── Factory ──────────────────────────────────────────────
@@ -360,8 +629,9 @@ class TPGGMLLinear(nn.Module):
             compressor=compressor,
         )
 
-        # Carry over dequant_dtype from the source GGMLOps.Linear
+        # Carry over settings from the source GGMLOps.Linear
         tp_ggml.dequant_dtype = getattr(linear, "dequant_dtype", None)
+        tp_ggml.fused_cuda_kernel = getattr(linear, "fused_cuda_kernel", True)
 
         # Shard and store quantised weight
         tp_ggml.load_quantized_weight(weight)

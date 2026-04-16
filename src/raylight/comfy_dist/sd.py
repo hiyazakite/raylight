@@ -185,6 +185,9 @@ def gguf_load_diffusion_model(unet_path, model_options={}, dequant_dtype=None, p
     else:
         ops.Linear.patch_dtype = getattr(torch, patch_dtype)
 
+    # Fused CUDA kernel toggle (passed via model_options)
+    ops.Linear.fused_cuda_kernel = model_options.get("fused_cuda_kernel", True)
+
     # init model
     sd, extra = gguf_sd_loader(unet_path)
     

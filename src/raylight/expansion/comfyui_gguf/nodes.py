@@ -407,6 +407,7 @@ class RayGGUFLoader:
                     ["auto", "true", "false"],
                     {"default": "auto", "tooltip": "Dynamic shape tracing. 'auto': starts static, switches to dynamic on shape change. 'true': always symbolic shapes (avoids recompiles but slightly slower kernels). 'false': always static (fastest kernels, recompiles on any shape change)."},
                 ),
+                "fused_cuda_kernel": ("BOOLEAN", {"default": True, "tooltip": "Use fused CUDA kernels for GGUF dequant+GEMM. Disable to fall back to the PyTorch dequant path for comparison."}),
             },
         }
 
@@ -425,13 +426,15 @@ class RayGGUFLoader:
         cache_patched_weights=False,
         torch_compile="disabled",
         torch_compile_dynamic="auto",
+        fused_cuda_kernel=True,
     ):
         actors, actors, config = ActorPool.ensure_fresh(actors_init)
         
         model_options = {
             "dequant_dtype": dequant_dtype,
             "patch_dtype": patch_dtype,
-            "cache_patched_weights": cache_patched_weights
+            "cache_patched_weights": cache_patched_weights,
+            "fused_cuda_kernel": fused_cuda_kernel,
         }
         
         unet_path = folder_paths.get_full_path_or_raise("unet", unet_name)
