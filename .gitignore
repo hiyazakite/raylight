@@ -43,6 +43,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!src/raylight/lib/
+src/raylight/lib/*.so
 lib64/
 parts/
 sdist/
