@@ -116,10 +116,13 @@ class TestLTXAVTensorParallel:
         assert attn.to_k.weight.shape == (256, 128)
         assert attn.to_v.weight.shape == (256, 128)
         
-        # Check norm sharding
-        assert attn.q_norm.full_hidden_size == 512
-        assert attn.q_norm.local_hidden_size == 256
-        assert attn.q_norm.weight.shape == (256,)
+        # Check norm sharding (fused QK norm)
+        assert attn._fused_qk_norm.full_hidden_size == 512
+        assert attn._fused_qk_norm.local_hidden_size == 256
+        assert attn._fused_qk_norm.q_weight.shape == (256,)
+        assert attn._fused_qk_norm.k_weight.shape == (256,)
+        assert attn.q_norm is None
+        assert attn.k_norm is None
         
         # Check out sharding (row)
         assert attn.to_out[0].local_in_features == 256

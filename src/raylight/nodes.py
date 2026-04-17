@@ -376,14 +376,14 @@ class RayTPCompress:
                     {"tooltip": "Loaded actors from a Ray model loader."}
                 ),
                 "mode": (
-                    ["none", "fp8", "turboquant"],
+                    ["none", "int8", "fp8", "turboquant"],
                     {"default": "turboquant",
-                     "tooltip": "Compression algorithm. 'turboquant' = rotation + quantization. 'fp8' = FP8 cast (2× reduction). 'none' = disable compression."}
+                     "tooltip": "Compression algorithm. 'turboquant' = rotation + quantization. 'int8' = INT8 symmetric (2× reduction, Ampere+). 'fp8' = FP8 E4M3 (2× reduction, Ada+). 'none' = disable compression."}
                 ),
                 "bits": (
                     ["2", "3", "4"],
                     {"default": "4",
-                     "tooltip": "TurboQuant quantization bits. 4 = recommended (quality ≈ FP8). 3 = balanced (75% of 4-bit size). 2 = aggressive (8× compression). Ignored when mode=fp8."}
+                     "tooltip": "TurboQuant quantization bits. 4 = recommended. 3 = balanced (75% of 4-bit size). 2 = aggressive (8× compression). Ignored when mode=int8/fp8."}
                 ),
                 "rotation": (
                     ["signperm", "wht"],

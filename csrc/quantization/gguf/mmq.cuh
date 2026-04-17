@@ -1,4 +1,9 @@
 // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmq.cu
+// cp.async (SM80+, Ampere): global→shared bypassing register file
+#if !defined(USE_ROCM)
+#include <cuda_pipeline.h>
+#endif
+
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
               allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
 static __device__ __forceinline__ void mul_mat_q(
@@ -42,9 +47,49 @@ static __device__ __forceinline__ void mul_mat_q(
             const auto kqs = ir*WARP_SIZE_GGUF + threadIdx.x;
             const int kbxd = kqs / QI8_1;
 
+#if !defined(USE_ROCM) && __CUDA_ARCH__ >= 800
+            // ---- Ampere+ path: cp.async bypasses register file for Y tile loads ----
+
 #pragma unroll
             for (int i = 0; i < mmq_x; i += nwarps) {
-                const int col_y_eff = min(col_y_0 + threadIdx.y + i, ncols_y-1); // to prevent out-of-bounds memory accesses
+                const int col_y_eff = min(col_y_0 + threadIdx.y + i, ncols_y-1);
+                const block_q8_1 * by0 = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + kbxd];
+                const int index_y = (threadIdx.y + i) * WARP_SIZE_GGUF + kqs % WARP_SIZE_GGUF;
+                // 4-byte async copy: global qs → shared tile_y_qs (no register intermediary)
+                __pipeline_memcpy_async(
+                    &tile_y_qs[index_y],
+                    by0->qs + sizeof(int) * (threadIdx.x % QI8_1),
+                    sizeof(int));
+            }
+
+#pragma unroll
+            for (int ids0 = 0; ids0 < mmq_x; ids0 += nwarps * QI8_1) {
+                const int ids = (ids0 + threadIdx.y * QI8_1 + threadIdx.x / (WARP_SIZE_GGUF/QI8_1)) % mmq_x;
+                const auto kby = threadIdx.x % (WARP_SIZE_GGUF/QI8_1);
+                const int col_y_eff = min(col_y_0 + ids, ncols_y-1);
+
+                const half2 * dsi_src = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + ir*(WARP_SIZE_GGUF/QI8_1) + kby].ds;
+                half2       * dsi_dst = &tile_y_ds[ids * (WARP_SIZE_GGUF/QI8_1) + kby];
+                if (need_sum) {
+                    // direct 4-byte copy: async global → shared
+                    __pipeline_memcpy_async(dsi_dst, dsi_src, sizeof(half2));
+                } else {
+                    // needs fp16→fp32 conversion, must go through registers
+                    float * dfi_dst = (float *) dsi_dst;
+                    *dfi_dst = __low2float(*dsi_src);
+                }
+            }
+
+            __pipeline_commit();
+            __pipeline_wait_prior(0);
+            __syncthreads();
+
+#else
+            // ---- Pre-Ampere / ROCm path: synchronous loads through registers ----
+
+#pragma unroll
+            for (int i = 0; i < mmq_x; i += nwarps) {
+                const int col_y_eff = min(col_y_0 + threadIdx.y + i, ncols_y-1);
                 const block_q8_1 * by0 = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + kbxd];
                 const int index_y = (threadIdx.y + i) * WARP_SIZE_GGUF + kqs % WARP_SIZE_GGUF;
                 tile_y_qs[index_y] = get_int_from_int8_aligned(by0->qs, threadIdx.x % QI8_1);
@@ -56,7 +101,6 @@ static __device__ __forceinline__ void mul_mat_q(
                 const auto kby = threadIdx.x % (WARP_SIZE_GGUF/QI8_1);
                 const int col_y_eff = min(col_y_0 + ids, ncols_y-1);
 
-                // if the sum is not needed it's faster to transform the scale to f32 ahead of time
                 const half2 * dsi_src = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + ir*(WARP_SIZE_GGUF/QI8_1) + kby].ds;
                 half2       * dsi_dst = &tile_y_ds[ids * (WARP_SIZE_GGUF/QI8_1) + kby];
                 if (need_sum) {
@@ -68,6 +112,7 @@ static __device__ __forceinline__ void mul_mat_q(
             }
 
             __syncthreads();
+#endif
 
 // #pragma unroll // unrolling this loop causes too much register pressure
             for (int k = ir*WARP_SIZE_GGUF/qr; k < (ir+1)*WARP_SIZE_GGUF/qr; k += vdr) {

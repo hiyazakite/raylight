@@ -25,10 +25,9 @@ except ImportError:
     except ImportError:
         apply_rotary_emb = None
 
-from raylight.diffusion_models.lightricks.optimizations import get_cross_kv_cached
-
 from raylight.distributed_modules.tensor_parallel import (
     TPLinear,
+    TPFusedQKNorm,
     TPRMSNormAcrossHeads,
     TensorParallelState,
     get_tp_group,
@@ -137,27 +136,23 @@ def apply_tp_to_ltxav_cross_attention(
     attn.to_k = new_to_k
     attn.to_v = new_to_v
 
-    # 2. Replace QK norms with distributed variant
-    new_q_norm = TPRMSNormAcrossHeads(
+    # 2. Replace QK norms with a fused distributed variant (single all-reduce
+    #    for both Q and K sum-of-squares instead of two separate calls).
+    fused_qk_norm = TPFusedQKNorm(
         full_hidden_size=inner_dim,
         local_hidden_size=local_inner_dim,
         tp_group=tp_group,
-        eps=attn.q_norm.eps
+        eps=attn.q_norm.eps,
     )
-    new_k_norm = TPRMSNormAcrossHeads(
-        full_hidden_size=inner_dim,
-        local_hidden_size=local_inner_dim,
-        tp_group=tp_group,
-        eps=attn.k_norm.eps
-    )
-    
-    # QK Norm parameter loading (not sharded inherently in weight loader but internally handles local vs full)
-    if not structure_only:
-        new_q_norm.weight_loader(new_q_norm.weight, attn.q_norm.weight.data)
-        new_k_norm.weight_loader(new_k_norm.weight, attn.k_norm.weight.data)
 
-    attn.q_norm = new_q_norm
-    attn.k_norm = new_k_norm
+    if not structure_only:
+        fused_qk_norm.weight_loader(fused_qk_norm.q_weight, attn.q_norm.weight.data)
+        fused_qk_norm.weight_loader(fused_qk_norm.k_weight, attn.k_norm.weight.data)
+
+    attn._fused_qk_norm = fused_qk_norm
+    # Remove the old separate norms — forward no longer calls them.
+    attn.q_norm = None
+    attn.k_norm = None
 
     # 3. Replace output projection
     out_dim    = attn.to_out[0].out_features     # query_dim (output of to_out)
@@ -203,14 +198,24 @@ def apply_tp_to_ltxav_cross_attention(
         # K/V cache: only for text cross-attention (attn2/audio_attn2, flagged
         # with _cache_kv=True).  k is returned already normed on cache hit.
         if getattr(self, '_cache_kv', False):
-            k, v = get_cross_kv_cached(self, ctx)
+            from raylight.distributed_modules.utils import get_denoising_step
+            step = get_denoising_step()
+            cache = getattr(self, '_cross_kv_cache', None)
+            if cache is not None and step is not None and step != 0:
+                # Cache hit: k is pre-normed, only normalise q.
+                k, v = cache
+                (q,) = self._fused_qk_norm(q)
+            else:
+                # Cache miss (step 0): project, fused norm both, cache result.
+                k = self.to_k(ctx)
+                v = self.to_v(ctx)
+                q, k = self._fused_qk_norm(q, k)
+                self._cross_kv_cache = (k, v)
         else:
             k = self.to_k(ctx)
             v = self.to_v(ctx)
-
-        q = self.q_norm(q)
-        if not getattr(self, '_cache_kv', False):
-            k = self.k_norm(k)
+            # Fused path: single all-reduce for both Q and K sumsq.
+            q, k = self._fused_qk_norm(q, k)
 
         if pe is not None and apply_rotary_emb is not None:
             pe_local = _slice_rope_for_tp(pe, self._tp_rank, self._tp_size, self._tp_local_heads)
@@ -462,7 +467,7 @@ def load_tp_ltxav_weights(
             # If the parent is a TP layer, use its weight_loader
             if isinstance(parent, TPLinear) or (hasattr(parent, "weight_loader") and callable(parent.weight_loader)):
                  parent.weight_loader(param, loaded_weight)
-            elif isinstance(parent, TPRMSNormAcrossHeads):
+            elif isinstance(parent, (TPRMSNormAcrossHeads, TPFusedQKNorm)):
                  parent.weight_loader(param, loaded_weight)
             else:
                  # Standard non-TP parameter

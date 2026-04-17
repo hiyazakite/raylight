@@ -745,6 +745,109 @@ class TPRMSNormAcrossHeads(nn.Module):
 
 
 # =============================================================================
+# TPFusedQKNorm
+# =============================================================================
+
+
+class TPFusedQKNorm(nn.Module):
+    """Fused Q+K RMSNorm with a single all-reduce for both.
+
+    Halves the number of NCCL collectives compared to two separate
+    :class:`TPRMSNormAcrossHeads` calls by batching the sum-of-squares
+    into a single 2-element all-reduce.
+
+    When *k* is ``None`` (e.g. cross-attention cache hit where K is
+    already normalised), falls back to a single-element all-reduce
+    for Q only — no wasted bandwidth or extra collectives.
+
+    Args:
+        full_hidden_size: The *unsharded* feature dimension.
+        local_hidden_size: Features on this rank (``full_hidden_size // tp_size``).
+        eps: Layer norm epsilon.
+        tp_group: Process group for the all-reduce.
+    """
+
+    def __init__(
+        self,
+        full_hidden_size: int,
+        local_hidden_size: int,
+        eps: float = 1e-5,
+        tp_group: Optional[dist.ProcessGroup] = None,
+    ):
+        super().__init__()
+        self.full_hidden_size = full_hidden_size
+        self.local_hidden_size = local_hidden_size
+        self.eps = eps
+        self._tp_group = tp_group
+        self.q_weight = nn.Parameter(torch.ones(local_hidden_size))
+        self.k_weight = nn.Parameter(torch.ones(local_hidden_size))
+
+    @property
+    def _resolved_group(self) -> Optional[dist.ProcessGroup]:
+        return self._tp_group if self._tp_group is not None else get_tp_group()
+
+    @torch.compiler.disable
+    def forward(
+        self, q: torch.Tensor, k: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Normalise *q* (and optionally *k*) with a single all-reduce.
+
+        Returns:
+            ``(q_normed,)`` when *k* is ``None``, otherwise
+            ``(q_normed, k_normed)``.
+        """
+        group = self._resolved_group
+
+        q_sumsq = q.float().pow(2).sum(dim=-1, keepdim=True)
+
+        if k is not None:
+            # Fused path: batch both sumsqs into one all-reduce.
+            k_sumsq = k.float().pow(2).sum(dim=-1, keepdim=True)
+            # q and k may have different seq lengths (cross-attention),
+            # so flatten before cat and restore shapes after.
+            q_shape = q_sumsq.shape
+            k_shape = k_sumsq.shape
+            q_flat = q_sumsq.reshape(-1)
+            k_flat = k_sumsq.reshape(-1)
+            fused = torch.cat([q_flat, k_flat])
+            if _HAS_FUNCOL:
+                fused = funcol_all_reduce(fused, "sum", group)
+            else:
+                dist.all_reduce(fused, op=dist.ReduceOp.SUM, group=group)
+            q_sumsq = fused[: q_flat.numel()].reshape(q_shape)
+            k_sumsq = fused[q_flat.numel() :].reshape(k_shape)
+        else:
+            # Q-only path (cross-attention cache hit).
+            if _HAS_FUNCOL:
+                q_sumsq = funcol_all_reduce(q_sumsq, "sum", group)
+            else:
+                dist.all_reduce(q_sumsq, op=dist.ReduceOp.SUM, group=group)
+
+        denom = float(self.full_hidden_size)
+        q_w = self.q_weight if self.q_weight.device == q.device else self.q_weight.to(q.device, non_blocking=True)
+        q_normed = (q.float() * torch.rsqrt(q_sumsq / denom + self.eps)).to(q.dtype) * q_w
+
+        if k is not None:
+            k_w = self.k_weight if self.k_weight.device == k.device else self.k_weight.to(k.device, non_blocking=True)
+            k_normed = (k.float() * torch.rsqrt(k_sumsq / denom + self.eps)).to(k.dtype) * k_w
+            return q_normed, k_normed
+
+        return (q_normed,)
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        """Load and shard weights for Q or K norm."""
+        tp_rank = TensorParallelState.get_rank()
+        shard = loaded_weight.narrow(
+            0, tp_rank * self.local_hidden_size, self.local_hidden_size
+        )
+        param.data.copy_(shard)
+
+
+# =============================================================================
 # TPAttention
 # =============================================================================
 

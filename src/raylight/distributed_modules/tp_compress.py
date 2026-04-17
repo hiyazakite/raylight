@@ -48,7 +48,7 @@ class TPCompressConfig:
     instances.
     """
 
-    mode: str = "none"  # "none" | "fp8" | "turboquant"
+    mode: str = "none"  # "none" | "int8" | "fp8" | "turboquant"
     bits: int = 4  # 2 | 3 | 4
     group_size: int = 64
     use_residual: bool = False
@@ -718,8 +718,8 @@ class TPCompressor:
         x_2d = x.reshape(-1, C)
         T = x_2d.shape[0]
 
-        if self.config.mode == "fp8":
-            return self._fp8_all_reduce(x, group)
+        if self.config.mode in ("int8", "fp8"):
+            return self._8bit_all_reduce(x, group)
 
         # --- TurboQuant path ---
         my_rank = dist.get_rank(group)
@@ -813,14 +813,15 @@ class TPCompressor:
             )
             payload = _serialize_compressed(packed, scales, zp, T, Q, gs, effective_bits)
 
-        # All-gather
+        # Async all-gather: launch NCCL on its comm stream so the local
+        # decompression below overlaps with the network transfer.
         gathered = [torch.empty_like(payload) for _ in range(tp_size)]
-        dist.all_gather(gathered, payload.contiguous(), group=group)
+        gather_work = dist.all_gather(gathered, payload.contiguous(), group=group, async_op=True)
 
         # Decompress the sender's own contribution directly from the local
         # compressed tensors (before serialization) so that the cached base
-        # matches exactly what the compress path produced.  Other ranks go
-        # through the serialize→deserialize round-trip as before.
+        # matches exactly what the compress path produced.  This runs on the
+        # default CUDA stream while the all-gather proceeds on NCCL's stream.
         if use_fused:
             # Fused: kernel adds base in-register when is_delta
             my_decompressed = self._fused_compressor.decompress(
@@ -836,6 +837,9 @@ class TPCompressor:
                 packed, scales, zp, signs, self.perm_inv,
                 (T, C), gs, effective_bits, orig_dtype,
             )
+
+        # Wait for all-gather to complete before reading other ranks' data.
+        gather_work.wait()
 
         result = torch.zeros(T, C, dtype=orig_dtype, device=x.device)
         for rank_i, buf in enumerate(gathered):
@@ -877,33 +881,44 @@ class TPCompressor:
         return result.reshape(orig_shape)
 
     @torch.no_grad()
-    def _fp8_all_reduce(
+    def _8bit_all_reduce(
         self,
         x: torch.Tensor,
         group: dist.ProcessGroup,
     ) -> torch.Tensor:
-        """FP8 E4M3 quantized all-reduce (2× bandwidth reduction).
+        """8-bit quantized all-reduce (2× bandwidth reduction).
 
-        Falls back to standard bf16 all-reduce with fp8 cast if native
-        fp8 collectives are not available.
+        Supports two quantization modes selected by ``self.config.mode``:
+
+        - ``"int8"``: Symmetric INT8 (Ampere / SM80+).
+        - ``"fp8"``:  FP8 E4M3 (Ada Lovelace / SM89+).
+
+        At tp_size >= 4, native bf16 all-reduce is at least as
+        bandwidth-efficient as 8-bit all-gather and avoids quant error
+        + O(tp_size) decompress compute + 2 NCCL kernel launches, so
+        we fall back to native all-reduce.
         """
-        orig_dtype = x.dtype
-        scale = x.abs().amax() / 448.0
-        scale = scale.clamp(min=1e-12)
-        x_fp8 = (x / scale).to(torch.float8_e4m3fn)
-
-        # NCCL doesn't support fp8 all-reduce natively in all PyTorch versions.
-        # Use all_gather of fp8 + local sum as the reliable path.
         tp_size = dist.get_world_size(group)
-        gathered = [torch.empty_like(x_fp8) for _ in range(tp_size)]
 
-        # Gather scales separately (one scalar per rank)
+        if tp_size >= 4:
+            dist.all_reduce(x, group=group)
+            return x
+
+        orig_dtype = x.dtype
+
+        if self.config.mode == "fp8":
+            scale = (x.abs().amax() / 448.0).clamp(min=1e-12)
+            x_q = (x / scale).to(torch.float8_e4m3fn)
+        else:  # int8
+            scale = (x.abs().amax() / 127.0).clamp(min=1e-12)
+            x_q = (x / scale).round().clamp(-128, 127).to(torch.int8)
+
+        gathered = [torch.empty_like(x_q) for _ in range(tp_size)]
         scale_list = [torch.empty(1, dtype=torch.float32, device=x.device) for _ in range(tp_size)]
         dist.all_gather(scale_list, scale.float().reshape(1), group=group)
-        dist.all_gather(gathered, x_fp8.contiguous(), group=group)
+        dist.all_gather(gathered, x_q.contiguous(), group=group)
 
-        result = torch.zeros_like(x, dtype=orig_dtype)
-        for i in range(tp_size):
-            result += gathered[i].to(orig_dtype) * scale_list[i].item()
-
-        return result
+        stacked = torch.stack(gathered).to(orig_dtype)
+        scales = torch.stack(scale_list).to(dtype=orig_dtype)
+        scales = scales.view(tp_size, *([1] * x.ndim))
+        return (stacked * scales).sum(dim=0)
