@@ -317,7 +317,18 @@ class TPContext(ModelContext):
             raise RuntimeError(f"[TPContext] Could not detect model from: {state.unet_path}")
 
         if cast_dtype and hasattr(model, "model"):
-            model.model.manual_cast_dtype = cast_dtype
+            # FP8 weights are handled by TPLinear.forward() which upcasts
+            # to the activation dtype.  Setting manual_cast_dtype to an FP8
+            # type would cause ComfyUI's apply_model to cast all inputs and
+            # conditioning to FP8 *before* entering the model, destroying
+            # precision and producing NaN (especially in audio latents).
+            _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
+            for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz"):
+                _dt = getattr(torch, _n, None)
+                if _dt is not None:
+                    _FP8_DTYPES.add(_dt)
+            if cast_dtype not in _FP8_DTYPES:
+                model.model.manual_cast_dtype = cast_dtype
 
         model.__class__ = RaylightModelPatcher
         return model
@@ -620,7 +631,13 @@ class TPContext(ModelContext):
             raise RuntimeError(f"Could not load model: {state.unet_path}")
 
         if cast_dtype and hasattr(model, "model"):
-            model.model.manual_cast_dtype = cast_dtype
+            _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
+            for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz"):
+                _dt = getattr(torch, _n, None)
+                if _dt is not None:
+                    _FP8_DTYPES.add(_dt)
+            if cast_dtype not in _FP8_DTYPES:
+                model.model.manual_cast_dtype = cast_dtype
 
         # The state dict has been consumed by load_diffusion_model_state_dict;
         # weights now live in model parameters.  Do NOT retain the full dict

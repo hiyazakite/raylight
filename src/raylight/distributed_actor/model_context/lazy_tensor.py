@@ -102,7 +102,13 @@ class LazyTensorContext(ModelContext):
             raise RuntimeError(f"Could not load model: {state.unet_path}")
 
         if cast_dtype and hasattr(model, "model"):
-            model.model.manual_cast_dtype = cast_dtype
+            _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
+            for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz"):
+                _dt = getattr(torch, _n, None)
+                if _dt is not None:
+                    _FP8_DTYPES.add(_dt)
+            if cast_dtype not in _FP8_DTYPES:
+                model.model.manual_cast_dtype = cast_dtype
 
         model.mmap_cache = sd
         model.__class__ = RaylightModelPatcher
@@ -164,7 +170,13 @@ class LazyTensorContext(ModelContext):
             raise RuntimeError(f"Could not load model: {state.unet_path}")
 
         if cast_dtype and hasattr(model, "model"):
-            model.model.manual_cast_dtype = cast_dtype
+            _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
+            for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz"):
+                _dt = getattr(torch, _n, None)
+                if _dt is not None:
+                    _FP8_DTYPES.add(_dt)
+            if cast_dtype not in _FP8_DTYPES:
+                model.model.manual_cast_dtype = cast_dtype
 
         model.__class__ = RaylightModelPatcher
         model.pinned_param_cache = self._make_pinned_cache(config, state.unet_path)

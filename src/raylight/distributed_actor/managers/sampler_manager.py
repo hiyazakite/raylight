@@ -17,6 +17,25 @@ if TYPE_CHECKING:
     from raylight.distributed_actor.actor_config import ActorConfig
 
 
+def _sanitize_samples(t):
+    """Replace NaN/Inf in sampler output to prevent downstream codec crashes (e.g. AAC)."""
+    import comfy.nested_tensor
+    if isinstance(t, comfy.nested_tensor.NestedTensor):
+        parts = t.unbind()
+        needs_fix = any(torch.isnan(p).any() or torch.isinf(p).any() for p in parts)
+        if not needs_fix:
+            return t
+        sanitized = tuple(
+            torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0) for p in parts
+        )
+        print(f"[SamplerManager] WARNING: Sanitized NaN/Inf in NestedTensor output ({len(parts)} components)")
+        return comfy.nested_tensor.NestedTensor(sanitized)
+    if torch.isnan(t).any() or torch.isinf(t).any():
+        print("[SamplerManager] WARNING: Sanitized NaN/Inf in sampler output")
+        return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+    return t
+
+
 class SamplerManager:
     """
     Stateless manager for sampling operations.
@@ -249,6 +268,9 @@ class SamplerManager:
                           seed=noise_seed,
                           callback=sampling_callback,
                       )
+                 samples = _sanitize_samples(samples)
+                 if last_denoised is not None:
+                     last_denoised = _sanitize_samples(last_denoised)
                  samples_cpu = samples.to("cpu")
                  denoised_cpu = last_denoised.to("cpu") if last_denoised is not None else samples_cpu
 
@@ -380,6 +402,9 @@ class SamplerManager:
                                 callback=sampling_callback,
                             )
                 
+            samples = _sanitize_samples(samples)
+            if last_denoised is not None:
+                last_denoised = _sanitize_samples(last_denoised)
             samples_cpu = samples.to("cpu")
             denoised_cpu = last_denoised.to("cpu") if last_denoised is not None else samples_cpu
 

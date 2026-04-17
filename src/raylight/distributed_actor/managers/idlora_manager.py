@@ -449,7 +449,14 @@ class IDLoraManager:
                     # Repack for next step
                     packed, _ = comfy.utils.pack_latents([v_noisy, a_noisy])
 
+            # Sanitize NaN/Inf from TP quantization noise before returning to CPU.
+            def _sanitize(t):
+                if torch.isnan(t).any() or torch.isinf(t).any():
+                    print(f"[IDLoraManager] WARNING: Sanitized NaN/Inf in output tensor {t.shape}")
+                    return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+                return t
+
             return (
-                (v_noisy.cpu(), a_noisy.cpu()),
-                (v_x0_last.cpu(), a_x0_last.cpu()),
+                (_sanitize(v_noisy).cpu(), _sanitize(a_noisy).cpu()),
+                (_sanitize(v_x0_last).cpu(), _sanitize(a_x0_last).cpu()),
             )
