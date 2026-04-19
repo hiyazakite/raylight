@@ -48,7 +48,7 @@ class TPCompressConfig:
     instances.
     """
 
-    mode: str = "none"  # "none" | "int8" | "fp8" | "turboquant"
+    mode: str = "none"  # "none" | "fp8" | "turboquant"
     bits: int = 4  # 2 | 3 | 4
     group_size: int = 64
     use_residual: bool = False
@@ -278,7 +278,7 @@ def _quantize_and_pack(
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int]:
     """Quantize and pack a (pre-rotated) tensor — no sign/perm applied.
 
-    Used directly by the WHT path to avoid identity multiply overhead.
+    Used directly by the WHT path to avoid identity permute/multiply overhead.
     """
     orig_shape = x.shape
     C = orig_shape[-1]
