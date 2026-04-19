@@ -4,7 +4,8 @@ All package metadata lives in pyproject.toml. This file ONLY handles
 compilation of the GGUF fused CUDA kernels (_C_gguf extension).
 
 The standalone allocator (raylight_alloc.so) is built via ``make build-alloc``
-since it uses gcc directly and is not a Python extension.
+from ``csrc/alloc/raylight_alloc.c`` since it uses gcc directly and is not a
+Python extension.
 
 Usage:
     make build                            # build all native extensions

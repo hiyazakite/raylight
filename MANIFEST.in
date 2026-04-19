@@ -2,7 +2,7 @@ include LICENSE
 include README.md
 
 # Native extension sources (needed to build from sdist)
-recursive-include csrc *.cu *.cuh *.h
+recursive-include csrc *.c *.cu *.cuh *.h
 
 # Prebuilt native extensions (included in wheels)
 include src/raylight/expansion/comfyui_gguf/_C_gguf*.so

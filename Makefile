@@ -14,7 +14,7 @@ SRC_DIR  := src
 CSRC_DIR := csrc/quantization/gguf
 
 # Allocator paths
-ALLOC_SRC := $(SRC_DIR)/raylight/lib/src/raylight_alloc.c
+ALLOC_SRC := csrc/alloc/raylight_alloc.c
 ALLOC_DST := $(SRC_DIR)/raylight/lib/raylight_alloc.so
 
 # CUDA include path (override with: make build-alloc CUDA_HOME=/opt/cuda)

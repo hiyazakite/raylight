@@ -322,8 +322,8 @@ class TPContext(ModelContext):
             # type would cause ComfyUI's apply_model to cast all inputs and
             # conditioning to FP8 *before* entering the model, destroying
             # precision and producing NaN (especially in audio latents).
-            _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
-            for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz"):
+            _FP8_DTYPES = set()
+            for _n in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
                 _dt = getattr(torch, _n, None)
                 if _dt is not None:
                     _FP8_DTYPES.add(_dt)
@@ -631,8 +631,8 @@ class TPContext(ModelContext):
             raise RuntimeError(f"Could not load model: {state.unet_path}")
 
         if cast_dtype and hasattr(model, "model"):
-            _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
-            for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz"):
+            _FP8_DTYPES = set()
+            for _n in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
                 _dt = getattr(torch, _n, None)
                 if _dt is not None:
                     _FP8_DTYPES.add(_dt)

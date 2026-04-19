@@ -89,21 +89,29 @@ if hasattr(model_base, "Flux"):
         apply_tp_to_flux_model(comfy_model.diffusion_model, tp_group=tp_group, structure_only=structure_only)
 
 # Phase 2.2 — Wan (true head-sharded TP)
-if hasattr(model_base, "WAN21"):
-    @TPRegistry.register(model_base.WAN21)
-    def _tp_wan21(comfy_model, tp_group=None, **kwargs):
-        raise NotImplementedError(
-            "Wan TP not yet implemented (Phase 2.2). "
-            "Set tensor_parallel_degree=1 for Wan models."
-        )
+# Register child classes BEFORE WAN21 so isinstance() dispatch is correct.
 
-if hasattr(model_base, "WAN22"):
-    @TPRegistry.register(model_base.WAN22)
-    def _tp_wan22(comfy_model, tp_group=None, **kwargs):
-        raise NotImplementedError(
-            "Wan TP not yet implemented (Phase 2.2). "
-            "Set tensor_parallel_degree=1 for Wan models."
-        )
+def _tp_wan_common(comfy_model, tp_group=None, **kwargs):
+    """Shared TP handler for all WAN variants."""
+    from ..diffusion_models.wan.tp import apply_tp_to_wan_model
+    structure_only = kwargs.pop("structure_only", False)
+    apply_tp_to_wan_model(
+        comfy_model.diffusion_model, tp_group=tp_group,
+        structure_only=structure_only, **kwargs,
+    )
+
+# --- child classes first ---
+for _wan_cls_name in (
+    "WAN21_Vace", "WAN21_Camera", "WAN21_HuMo",
+    "WAN21_FlowRVS", "WAN21_SCAIL",
+    "WAN22_Animate", "WAN22_S2V", "WAN22",
+):
+    if hasattr(model_base, _wan_cls_name):
+        TPRegistry.register(getattr(model_base, _wan_cls_name))(_tp_wan_common)
+
+# --- base class last ---
+if hasattr(model_base, "WAN21"):
+    TPRegistry.register(model_base.WAN21)(_tp_wan_common)
 
 # Phase 2.3 — LTXAV (true head-sharded TP + distributed QK-norm + RoPE slicing)
 if hasattr(model_base, "LTXAV"):

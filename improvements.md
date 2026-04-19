@@ -56,7 +56,7 @@ Entirely new. Zero counterpart in the reference.
 
 ### 3a. Native allocator (`src/raylight/lib/`)
 
-New in fork. `raylight_alloc.so` is a small native shared library with a C allocator-interceptor (`src/raylight_alloc.c`) controlled by `alloc_interceptor.py`. Its purpose is to redirect large host-memory allocations to RAM-backed paths (e.g. `/dev/shm`) to give the OS better placement control and reduce NUMA-crossing copies on multi-socket machines.
+New in fork. `raylight_alloc.so` is a small native shared library with a C allocator-interceptor (`csrc/alloc/raylight_alloc.c`) controlled by `alloc_interceptor.py`. Its purpose is to redirect large host-memory allocations to RAM-backed paths (e.g. `/dev/shm`) to give the OS better placement control and reduce NUMA-crossing copies on multi-socket machines.
 
 ### 3b. Pinned-cache system (`src/raylight/distributed_modules/pinned_cache/`)
 

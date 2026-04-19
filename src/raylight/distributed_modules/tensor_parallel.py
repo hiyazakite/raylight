@@ -801,23 +801,32 @@ class TPFusedQKNorm(nn.Module):
         q_sumsq = q.float().pow(2).sum(dim=-1, keepdim=True)
 
         if k is not None:
-            # Fused path: batch both sumsqs into one all-reduce.
+            # Compute K sumsq
             k_sumsq = k.float().pow(2).sum(dim=-1, keepdim=True)
-            # q and k may have different seq lengths (cross-attention),
-            # so flatten before cat and restore shapes after.
-            q_shape = q_sumsq.shape
-            k_shape = k_sumsq.shape
+
+            # If flattened sizes match we can safely concatenate and do one
+            # all-reduce (fused path). If not, fall back to two separate
+            # all-reduces to avoid shape/ordering mistakes when restoring.
             q_flat = q_sumsq.reshape(-1)
             k_flat = k_sumsq.reshape(-1)
-            fused = torch.cat([q_flat, k_flat])
-            if _HAS_FUNCOL:
-                fused = funcol_all_reduce(fused, "sum", group)
+            if q_flat.numel() == k_flat.numel():
+                fused = torch.cat([q_flat, k_flat])
+                if _HAS_FUNCOL:
+                    fused = funcol_all_reduce(fused, "sum", group)
+                else:
+                    dist.all_reduce(fused, op=dist.ReduceOp.SUM, group=group)
+                q_sumsq = fused[: q_flat.numel()].reshape(q_sumsq.shape)
+                k_sumsq = fused[q_flat.numel() :].reshape(k_sumsq.shape)
             else:
-                dist.all_reduce(fused, op=dist.ReduceOp.SUM, group=group)
-            q_sumsq = fused[: q_flat.numel()].reshape(q_shape)
-            k_sumsq = fused[q_flat.numel() :].reshape(k_shape)
+                # Safe fallback: two collectives to preserve ordering and shapes.
+                if _HAS_FUNCOL:
+                    q_sumsq = funcol_all_reduce(q_sumsq, "sum", group)
+                    k_sumsq = funcol_all_reduce(k_sumsq, "sum", group)
+                else:
+                    dist.all_reduce(q_sumsq, op=dist.ReduceOp.SUM, group=group)
+                    dist.all_reduce(k_sumsq, op=dist.ReduceOp.SUM, group=group)
         else:
-            # Q-only path (cross-attention cache hit).
+            # Q-only path (cache-hit). Single collective.
             if _HAS_FUNCOL:
                 q_sumsq = funcol_all_reduce(q_sumsq, "sum", group)
             else:
