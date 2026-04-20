@@ -128,3 +128,11 @@ if hasattr(model_base, "Lumina2"):
         from ..diffusion_models.lumina.tp import apply_tp_to_lumina_model
         structure_only = kwargs.pop("structure_only", False)
         apply_tp_to_lumina_model(comfy_model.diffusion_model, tp_group=tp_group, structure_only=structure_only)
+
+# Phase 2.5 — QwenImage (true head-sharded TP, dual-stream)
+if hasattr(model_base, "QwenImage"):
+    @TPRegistry.register(model_base.QwenImage)
+    def _tp_qwen_image(comfy_model, tp_group=None, **kwargs):
+        from ..diffusion_models.qwen_image.tp import apply_tp_to_qwen_image_model
+        structure_only = kwargs.pop("structure_only", False)
+        apply_tp_to_qwen_image_model(comfy_model.diffusion_model, tp_group=tp_group, structure_only=structure_only)

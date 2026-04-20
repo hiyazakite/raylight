@@ -21,6 +21,25 @@ export CUDA_VISIBLE_DEVICES=0
 python3.13 -m pytest tests/ -v
 ```
 
+> **Note:** pytest must be invoked from the raylight directory with `-c pyproject.toml`
+> to avoid picking up `/root/ComfyUI/pytest.ini` as the rootdir.  Use absolute paths:
+
+```bash
+PYTHONPATH=/root/ComfyUI/custom_nodes/raylight/src:$PYTHONPATH \
+  python3.13 -m pytest \
+  -c /root/ComfyUI/custom_nodes/raylight/pyproject.toml \
+  /root/ComfyUI/custom_nodes/raylight/tests/ -v
+```
+
+To run a single test file:
+
+```bash
+PYTHONPATH=/root/ComfyUI/custom_nodes/raylight/src:$PYTHONPATH \
+  python3.13 -m pytest \
+  -c /root/ComfyUI/custom_nodes/raylight/pyproject.toml \
+  /root/ComfyUI/custom_nodes/raylight/tests/distributed_modules/test_qwen_image_tp.py -v
+```
+
 ## Prerequisites
 
 - Python 3.13 with torch 2.11+ (CUDA 13)
