@@ -40,6 +40,7 @@ __all__ = [
     "compute_fp8_int8_scales",
     "compute_fp8_scales",
     "repack_fp8_for_marlin",
+    "repack_fp8_for_mma",
     "narrow_fp8_weight_for_tp",
 ]
 
@@ -137,18 +138,21 @@ def repack_fp8_for_marlin(
     weight_u8: torch.Tensor,
     weight_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, int, int]:
-    """Repack FP8 weight [N,K] → Marlin format with alignment padding.
+    """Repack FP8 weight [N,K] → tiled-permuted format for mma fragment loads.
 
-    The Marlin kernel requires N % 256 == 0 and K % 64 == 0.  This function
-    pads the weight (with zeros) to meet alignment, then permutes into the
-    m16n8k16 tensor core fragment layout.
+    The v5 kernel requires bytes rearranged within [BLOCK_K=32, BLOCK_N=128]
+    tiles so that each thread can load its 4 FP8 values for mma.m16n8k16 via
+    a single uint32 read.  Also requires K % 32 == 0 and N % 128 == 0.
+
+    This function tries the native C++ permutation (fast), falling back to a
+    pure-Python implementation if the extension is not available.
 
     Args:
         weight_u8   : Tensor[N, K] uint8 (FP8 E4M3 bit-patterns).
         weight_scale: Tensor[N] bfloat16 (optional).
 
     Returns:
-        packed      : Tensor[K, N] uint8 (transposed).
+        packed      : Tensor[K*N] uint8 (tiled-permuted flat buffer).
         scale       : Tensor[N] bfloat16 (or None).
         orig_N      : int — original N.
         orig_K      : int — original K.
@@ -158,12 +162,95 @@ def repack_fp8_for_marlin(
 
     N, K = weight_u8.shape
 
-    # Simple transpose [N, K] → [K, N]
-    packed = weight_u8.t().contiguous()
+    # Padded dimensions (must match kernel tile sizes)
+    N_pad = _ceildiv(N, _BLOCK_N) * _BLOCK_N
 
-    scale = weight_scale.contiguous() if weight_scale is not None else None
+    # Try native C++ permutation
+    try:
+        from raylight.distributed_modules.fp8_ampere import _C_fp8ampere  # type: ignore[import]
+        packed = _C_fp8ampere.repack_fp8_for_mma(weight_u8)
+    except (ImportError, AttributeError):
+        packed = _repack_fp8_for_mma_python(weight_u8)
+
+    # Pad scale to N_pad so kernel sees N divisible by BLOCK_N (128)
+    if weight_scale is not None:
+        if N_pad != N:
+            scale = torch.ones(N_pad, dtype=weight_scale.dtype, device=weight_scale.device)
+            scale[:N] = weight_scale
+        else:
+            scale = weight_scale.contiguous()
+    else:
+        scale = None
 
     return packed, scale, N, K
+
+
+# Tile constants matching the kernel
+_BLOCK_K = 32
+_BLOCK_N = 128
+_MMA_K = 16
+_MMA_N = 8
+
+
+def _repack_fp8_for_mma_python(weight_u8: torch.Tensor) -> torch.Tensor:
+    """Pure-Python fallback for the FP8 mma permutation.
+
+    Input: weight_u8 [N, K] uint8 (FP8 E4M3 bit-patterns).
+    Output: flat uint8 tensor with tiled-permuted layout.
+
+    Uses vectorized numpy fancy indexing — no Python-level loops.
+    """
+    import numpy as np
+
+    N_orig, K_orig = weight_u8.shape
+
+    # Pad to tile boundaries
+    K = _ceildiv(K_orig, _BLOCK_K) * _BLOCK_K
+    N = _ceildiv(N_orig, _BLOCK_N) * _BLOCK_N
+
+    # Pad the [N, K] source with zeros (handles out-of-bounds as zero)
+    src_np = weight_u8.cpu().numpy()
+    if N != N_orig or K != K_orig:
+        src = np.zeros((N, K), dtype=np.uint8)
+        src[:N_orig, :K_orig] = src_np
+    else:
+        src = src_np
+
+    K_tiles = K // _BLOCK_K
+    N_tiles = N // _BLOCK_N
+    n_mma_n = _BLOCK_N // _MMA_N  # 16
+
+    # Build all index arrays via broadcasting: [K_tiles, N_tiles, 2, 16, 32]
+    kt = np.arange(K_tiles).reshape(-1, 1, 1, 1, 1)
+    nt = np.arange(N_tiles).reshape(1, -1, 1, 1, 1)
+    ks = np.arange(_BLOCK_K // _MMA_K).reshape(1, 1, -1, 1, 1)  # 0..1
+    ns = np.arange(n_mma_n).reshape(1, 1, 1, -1, 1)              # 0..15
+    T  = np.arange(32).reshape(1, 1, 1, 1, -1)
+
+    # Source coordinates (reading from [N, K] layout)
+    abs_n = nt * _BLOCK_N + ns * _MMA_N + T // 4
+    abs_k = kt * _BLOCK_K + ks * _MMA_K + (T % 4) * 2
+
+    # Gather the 4 values per thread
+    v0 = src[abs_n, abs_k]
+    v2 = src[abs_n, abs_k + 8]
+    v1 = src[abs_n, abs_k + 1]
+    v3 = src[abs_n, abs_k + 9]
+
+    # Destination offsets
+    tile_off = (kt * N_tiles + nt) * (_BLOCK_K * _BLOCK_N)
+    sub_off  = tile_off + (ks * n_mma_n + ns) * 128
+    d = sub_off + T * 4
+
+    # Scatter into flat output
+    dst = np.zeros(K * N, dtype=np.uint8)
+    d_flat = d.ravel()
+    dst[d_flat]     = v0.ravel()
+    dst[d_flat + 1] = v2.ravel()
+    dst[d_flat + 2] = v1.ravel()
+    dst[d_flat + 3] = v3.ravel()
+
+    return torch.from_numpy(dst).to(device=weight_u8.device)
 
 
 def narrow_fp8_weight_for_tp(
@@ -214,3 +301,7 @@ def narrow_fp8_weight_for_tp(
         s_shard = weight_scale
 
     return w_shard.contiguous(), s_shard.contiguous()
+
+
+# Alias for clearer naming
+repack_fp8_for_mma = repack_fp8_for_marlin

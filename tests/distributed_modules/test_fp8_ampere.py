@@ -28,7 +28,8 @@ from raylight.distributed_modules.fp8_ampere.packing import (
 )
 from raylight.distributed_modules.fp8_ampere.fp8_ampere_linear import (
     Fp8AmpereLinear,
-    _is_ampere_or_newer,
+    Fp8KernelMixin,
+    _is_ampere_only,
 )
 
 pytestmark = pytest.mark.gpu
@@ -37,7 +38,7 @@ requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA not available"
 )
 requires_ampere = pytest.mark.skipif(
-    not (torch.cuda.is_available() and _is_ampere_or_newer(torch.device("cuda"))),
+    not (torch.cuda.is_available() and _is_ampere_only(torch.device("cuda"))),
     reason="Ampere GPU (SM≥8.0) required",
 )
 
@@ -190,31 +191,35 @@ class TestComputeFp8Scales:
 
 class TestRepackFp8ForMarlin:
     def test_output_shape_aligned(self):
-        """Repack produces [K, N] transposed layout."""
+        """Repack produces flat [K_pad * N_pad] tiled-permuted layout."""
         N, K = 256, 64
         w = torch.randint(0, 256, (N, K), dtype=torch.uint8)
         packed, _, orig_n, orig_k = repack_fp8_for_marlin(w)
-        assert packed.shape == (K, N)
+        # N=256 already multiple of 128, K=64 already multiple of 32
+        assert packed.shape == (K * N,)
         assert orig_n == N
         assert orig_k == K
 
     def test_output_shape_small(self):
-        """Small dimensions: still produces [K, N]."""
+        """Small dimensions are padded to tile boundaries."""
         N, K = 64, 128
         w = torch.randint(0, 256, (N, K), dtype=torch.uint8)
-        packed, _, orig_n, orig_k = repack_fp8_for_marlin(w)
-        assert packed.shape == (K, N)
+        packed, scale, orig_n, orig_k = repack_fp8_for_marlin(w)
+        # N=64 padded to 128, K=128 already aligned
+        assert packed.shape == (128 * 128,)
         assert orig_n == 64
         assert orig_k == 128
 
     def test_scale_passthrough(self):
-        """Scale vector passed through unchanged."""
+        """Scale vector padded to N_pad; original values preserved."""
         N, K = 64, 128
         w = torch.randint(0, 256, (N, K), dtype=torch.uint8)
         scale = torch.ones(N, dtype=torch.bfloat16)
         _, scale_out, _, _ = repack_fp8_for_marlin(w, scale)
-        assert scale_out.shape == (N,)
-        assert torch.all(scale_out == 1.0)
+        # N=64 padded to 128
+        assert scale_out.shape == (128,)
+        assert torch.all(scale_out[:N] == 1.0)
+        assert torch.all(scale_out[N:] == 1.0)  # padding filled with 1.0
 
     @requires_cuda
     def test_cuda_tensor(self, cuda_device):
@@ -474,7 +479,7 @@ class TestFp8AmpereLinearMarlinForward:
     @requires_cuda
     @requires_ampere
     def test_repack_and_compute_ops(self, cuda_device):
-        """C++ repack_fp8_for_marlin and compute_marlin_scales ops."""
+        """C++ repack_fp8_for_mma and compute_fp8_scales ops."""
         fp8_lin = Fp8AmpereLinear.from_linear(
             nn.Linear(128, 64, bias=False).to(cuda_device)
         ).to(cuda_device)
@@ -482,11 +487,12 @@ class TestFp8AmpereLinearMarlinForward:
         if ext is None:
             pytest.skip("_C_fp8ampere extension not built")
 
-        packed = ext.repack_fp8_for_marlin(fp8_lin.weight)
+        packed = ext.repack_fp8_for_mma(fp8_lin.weight)
         assert packed.dtype == torch.uint8
-        assert packed.shape == (128, 64)  # [K, N] transposed
+        # N=64 padded to 128, K=128 already aligned → flat [128*128]
+        assert packed.shape == (128 * 128,)
 
-        scales = ext.compute_marlin_scales(fp8_lin.weight)
+        scales = ext.compute_fp8_scales(fp8_lin.weight)
         assert scales.shape == (64,)
         assert scales.dtype == torch.bfloat16
         assert torch.all(scales == 1.0)
@@ -580,7 +586,7 @@ class TestTPFp8AmpereLinearFallbackForward:
         K, N = 128, 64
         lin = nn.Linear(K, N, bias=False).to(cuda_device)
         tp_lin = TPFp8AmpereLinear.from_linear(lin, parallelism="column").to(cuda_device)
-        tp_lin._ext = None  # force fallback
+        tp_lin._load_ext = lambda: None  # force fallback
 
         x = torch.randn(8, K, device=cuda_device, dtype=torch.bfloat16)
         out = tp_lin(x)
@@ -592,7 +598,7 @@ class TestTPFp8AmpereLinearFallbackForward:
         K, N = 128, 64
         lin = nn.Linear(K, N, bias=True).to(cuda_device)
         tp_lin = TPFp8AmpereLinear.from_linear(lin, parallelism="column").to(cuda_device)
-        tp_lin._ext = None
+        tp_lin._load_ext = lambda: None  # force fallback
 
         x = torch.randn(2, 8, K, device=cuda_device, dtype=torch.bfloat16)
         out = tp_lin(x)
@@ -605,7 +611,7 @@ class TestTPFp8AmpereLinearFallbackForward:
         K, N = 256, 128
         lin = nn.Linear(K, N, bias=False).to(device=cuda_device, dtype=torch.bfloat16)
         tp_lin = TPFp8AmpereLinear.from_linear(lin, parallelism="column").to(cuda_device)
-        tp_lin._ext = None  # fallback path
+        tp_lin._load_ext = lambda: None  # fallback path
 
         x = torch.randn(16, K, device=cuda_device, dtype=torch.bfloat16)
 
@@ -671,3 +677,376 @@ class TestTPFp8AmpereLinearMarlinForward:
         x = torch.randn(2, 8, K, device=cuda_device, dtype=torch.bfloat16)
         out = tp_lin(x)
         assert out.shape == (2, 8, N)
+
+
+# ---------------------------------------------------------------------------
+# from_tp_linear and weight-freeing tests
+# ---------------------------------------------------------------------------
+
+from raylight.distributed_modules.tensor_parallel import TPLinear
+
+
+class TestTPFp8AmpereLinearFromTPLinear:
+    """from_tp_linear factory: builds from a TPLinear with FP8 shard weight."""
+
+    @requires_cuda
+    def test_basic_column(self, cuda_device):
+        """from_tp_linear col-parallel: adopts sharded weight without re-sharding."""
+        K, N = 256, 128
+        w_fp8 = torch.randn(N, K, device=cuda_device, dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        tp_lin = TPLinear(K, N, bias=False, parallelism="column", device=cuda_device,
+                          dtype=torch.bfloat16)
+        tp_lin.weight.data = w_fp8  # assign fp8 shard (as streaming loader would)
+
+        fp8_tp = TPFp8AmpereLinear.from_tp_linear(tp_lin)
+        assert fp8_tp.weight_u8.shape == (N, K)
+        assert fp8_tp.weight_u8.dtype == torch.uint8
+        assert fp8_tp.weight_scale.shape == (N,)
+        assert fp8_tp.weight_scale.dtype == torch.bfloat16
+        assert fp8_tp.parallelism == "column"
+        assert fp8_tp.in_features == K
+        assert fp8_tp.out_features == N
+
+    @requires_cuda
+    def test_basic_row(self, cuda_device):
+        """from_tp_linear row-parallel."""
+        K, N = 256, 128
+        w_fp8 = torch.randn(N, K, device=cuda_device, dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        tp_lin = TPLinear(K, N, bias=False, parallelism="row", device=cuda_device,
+                          dtype=torch.bfloat16)
+        tp_lin.weight.data = w_fp8
+
+        fp8_tp = TPFp8AmpereLinear.from_tp_linear(tp_lin)
+        assert fp8_tp.weight_u8.shape == (N, K)
+        assert fp8_tp.parallelism == "row"
+
+    @requires_cuda
+    def test_bias_copied(self, cuda_device):
+        """Bias is copied from source TPLinear."""
+        K, N = 128, 64
+        w_fp8 = torch.randn(N, K, device=cuda_device, dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        tp_lin = TPLinear(K, N, bias=True, parallelism="column", device=cuda_device,
+                          dtype=torch.bfloat16)
+        tp_lin.weight.data = w_fp8
+        tp_lin.bias.data.fill_(1.5)
+
+        fp8_tp = TPFp8AmpereLinear.from_tp_linear(tp_lin)
+        assert fp8_tp.bias is not None
+        assert fp8_tp.bias.shape == (N,)
+        assert fp8_tp.bias.abs().mean().item() > 1.0
+
+    @requires_cuda
+    def test_checkpoint_scale_preserved(self, cuda_device):
+        """Checkpoint weight_scale on TPLinear is used instead of all-ones fallback."""
+        K, N = 128, 64
+        w_fp8 = torch.randn(N, K, device=cuda_device, dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        tp_lin = TPLinear(K, N, bias=False, parallelism="column", device=cuda_device,
+                          dtype=torch.bfloat16)
+        tp_lin.weight.data = w_fp8
+        # Simulate per-channel scales loaded from a checkpoint
+        checkpoint_scale = torch.rand(N, device=cuda_device, dtype=torch.bfloat16) + 0.5
+        tp_lin.weight_scale = checkpoint_scale
+
+        fp8_tp = TPFp8AmpereLinear.from_tp_linear(tp_lin)
+        assert torch.allclose(fp8_tp.weight_scale, checkpoint_scale.to(torch.bfloat16))
+
+    @requires_cuda
+    def test_no_checkpoint_scale_falls_back_to_ones(self, cuda_device):
+        """Without a checkpoint scale, weight_scale defaults to all-ones."""
+        K, N = 128, 64
+        w_fp8 = torch.randn(N, K, device=cuda_device, dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        tp_lin = TPLinear(K, N, bias=False, parallelism="column", device=cuda_device,
+                          dtype=torch.bfloat16)
+        tp_lin.weight.data = w_fp8
+        # No weight_scale attribute set
+
+        fp8_tp = TPFp8AmpereLinear.from_tp_linear(tp_lin)
+        assert torch.all(fp8_tp.weight_scale == 1.0)
+
+    @requires_cuda
+    def test_wrong_dtype_raises(self, cuda_device):
+        """Raises TypeError when weight is not FP8."""
+        K, N = 64, 32
+        tp_lin = TPLinear(K, N, bias=False, parallelism="column", device=cuda_device)
+        with pytest.raises(TypeError, match="float8_e4m3fn or uint8"):
+            TPFp8AmpereLinear.from_tp_linear(tp_lin)
+
+    @requires_cuda
+    def test_wrong_type_raises(self, cuda_device):
+        """Raises TypeError when passed something other than TPLinear."""
+        lin = nn.Linear(64, 32, device=cuda_device)
+        with pytest.raises(TypeError, match="TPLinear"):
+            TPFp8AmpereLinear.from_tp_linear(lin)
+
+
+class TestWeightFreeing:
+    """Verify raw FP8 buffers are freed after _prepare_packed."""
+
+    @requires_cuda
+    @requires_ampere
+    def test_fp8_ampere_linear_frees_weight(self, cuda_device):
+        """Fp8AmpereLinear.weight_packed should be populated after first Marlin forward.
+
+        The raw FP8 weight is intentionally retained (not freed) so that the
+        small-batch cuBLAS fallback path remains available.  Only weight_packed
+        is checked here.
+        """
+        K, N = 256, 128
+        lin = nn.Linear(K, N, bias=False).to(device=cuda_device, dtype=torch.bfloat16)
+        fp8 = Fp8AmpereLinear.from_linear(lin).to(cuda_device)
+        ext = fp8._load_ext()
+        if ext is None:
+            pytest.skip("_C_fp8ampere extension not built")
+
+        assert fp8.weight.numel() == N * K, "weight should be full before first forward"
+
+        # Call _prepare_packed directly — the forward threshold may route small
+        # batches to the cuBLAS fallback, which never triggers packing.
+        fp8._prepare_packed(cuda_device)
+
+        assert fp8.weight_packed is not None, "weight_packed should be populated after _prepare_packed"
+        assert fp8.weight_packed.numel() > 0
+
+    @requires_cuda
+    @requires_ampere
+    def test_tp_fp8_ampere_linear_frees_weight_u8(self, cuda_device):
+        """TPFp8AmpereLinear.weight_u8 should be 0-element after first Marlin forward."""
+        K, N = 256, 128
+        lin = nn.Linear(K, N, bias=False).to(device=cuda_device, dtype=torch.bfloat16)
+        tp_fp8 = TPFp8AmpereLinear.from_linear(lin, parallelism="column").to(cuda_device)
+        ext = tp_fp8._load_ext()
+        if ext is None:
+            pytest.skip("_C_fp8ampere extension not built")
+
+        assert tp_fp8.weight_u8.numel() == N * K
+
+        x = torch.randn(8, K, device=cuda_device, dtype=torch.bfloat16)
+        _ = tp_fp8(x)
+
+        assert tp_fp8.weight_u8.numel() == 0, "weight_u8 should be freed after pack"
+        assert tp_fp8.weight_packed is not None
+
+    @requires_cuda
+    @requires_ampere
+    def test_prepare_packed_is_idempotent(self, cuda_device):
+        """Calling _prepare_packed twice on the same device is a no-op."""
+        K, N = 128, 64
+        lin = nn.Linear(K, N, bias=False).to(device=cuda_device, dtype=torch.bfloat16)
+        fp8 = Fp8AmpereLinear.from_linear(lin).to(cuda_device)
+        ext = fp8._load_ext()
+        if ext is None:
+            pytest.skip("_C_fp8ampere extension not built")
+
+        fp8._prepare_packed(cuda_device)
+        packed_id = id(fp8.weight_packed)
+        fp8._prepare_packed(cuda_device)  # should not re-allocate
+        assert id(fp8.weight_packed) == packed_id
+
+
+# ---------------------------------------------------------------------------
+# Fp8KernelMixin.on_device_activated
+# ---------------------------------------------------------------------------
+
+
+class TestFp8KernelMixinOnDeviceActivated:
+    """Verify on_device_activated migrates packed buffers to the target device."""
+
+    @requires_cuda
+    @requires_ampere
+    def test_migrates_weight_packed_to_cuda(self, cuda_device):
+        """on_device_activated moves weight_packed from CPU to CUDA."""
+        K, N = 128, 64
+        lin = nn.Linear(K, N, bias=False).to(dtype=torch.bfloat16)
+        fp8 = Fp8AmpereLinear.from_linear(lin)  # CPU
+        ext = fp8._load_ext()
+        if ext is None:
+            pytest.skip("_C_fp8ampere extension not built")
+
+        fp8._prepare_packed(torch.device("cpu"))
+        assert fp8.weight_packed.device.type == "cpu"
+        assert fp8.scale_padded.device.type == "cpu"
+
+        fp8.on_device_activated(cuda_device)
+
+        assert fp8.weight_packed.device.type == "cuda"
+        assert fp8.scale_padded.device.type == "cuda"
+
+    @requires_cuda
+    @requires_ampere
+    def test_noop_when_already_on_device(self, cuda_device):
+        """on_device_activated is a no-op when buffers are already on the target device."""
+        K, N = 128, 64
+        lin = nn.Linear(K, N, bias=False).to(device=cuda_device, dtype=torch.bfloat16)
+        fp8 = Fp8AmpereLinear.from_linear(lin).to(cuda_device)
+        ext = fp8._load_ext()
+        if ext is None:
+            pytest.skip("_C_fp8ampere extension not built")
+
+        fp8._prepare_packed(cuda_device)
+        packed_id = id(fp8.weight_packed)
+
+        fp8.on_device_activated(cuda_device)  # already on cuda — should not reallocate
+
+        assert id(fp8.weight_packed) == packed_id
+
+    def test_noop_when_not_packed(self):
+        """on_device_activated before _prepare_packed is a safe no-op."""
+        K, N = 128, 64
+        lin = nn.Linear(K, N, bias=False).to(dtype=torch.bfloat16)
+        fp8 = Fp8AmpereLinear.from_linear(lin)
+
+        # No _prepare_packed called — _packed is False
+        fp8.on_device_activated(torch.device("cpu"))  # must not raise
+
+    def test_isinstance_check(self):
+        """Both Fp8AmpereLinear and TPFp8AmpereLinear are Fp8KernelMixin instances."""
+        from raylight.distributed_modules.fp8_ampere.tp_fp8_ampere_linear import TPFp8AmpereLinear
+        K, N = 128, 64
+        lin = nn.Linear(K, N, bias=False).to(dtype=torch.bfloat16)
+        fp8 = Fp8AmpereLinear.from_linear(lin)
+        tp_fp8 = TPFp8AmpereLinear.from_linear(lin, parallelism="column")
+        assert isinstance(fp8, Fp8KernelMixin)
+        assert isinstance(tp_fp8, Fp8KernelMixin)
+
+
+# ---------------------------------------------------------------------------
+# ModelContext._apply_fp8_swap and _activate_fp8_buffers
+# ---------------------------------------------------------------------------
+
+
+class _FakeLoadConfig:
+    """Minimal stand-in for ModelState."""
+    def __init__(self, model_options):
+        self.model_options = model_options
+
+
+class _FakeModel:
+    """Minimal stand-in for a ComfyUI ModelPatcher."""
+    def __init__(self, inner):
+        self.model = inner
+        self.load_config = _FakeLoadConfig({})
+
+
+class _FakeInner(nn.Module):
+    """A tiny model with float8 linear weights for swap testing."""
+    def __init__(self, K=128, N=64):
+        super().__init__()
+        w = torch.randn(N, K).to(torch.float8_e4m3fn)
+        self.linear = nn.Linear(K, N, bias=False)
+        self.linear.weight = nn.Parameter(w, requires_grad=False)
+
+
+class TestApplyFp8Swap:
+    """Tests for ModelContext._apply_fp8_swap."""
+
+    @requires_cuda
+    @requires_ampere
+    def test_swaps_linear_when_flag_set(self, cuda_device):
+        """_apply_fp8_swap replaces float8 nn.Linear with Fp8AmpereLinear."""
+        from raylight.distributed_actor.model_context._base import ModelContext
+
+        inner = _FakeInner()
+        model = _FakeModel(inner)
+        model.load_config.model_options = {"fp8_ampere": True}
+
+        ModelContext._apply_fp8_swap(model, cuda_device)
+
+        assert isinstance(inner.linear, Fp8AmpereLinear), (
+            "nn.Linear with float8 weight should be swapped to Fp8AmpereLinear"
+        )
+
+    @requires_cuda
+    @requires_ampere
+    def test_no_swap_when_flag_absent(self, cuda_device):
+        """_apply_fp8_swap is a no-op when fp8_ampere flag is not set."""
+        from raylight.distributed_actor.model_context._base import ModelContext
+
+        inner = _FakeInner()
+        model = _FakeModel(inner)
+        # model_options has no "fp8_ampere" key
+
+        ModelContext._apply_fp8_swap(model, cuda_device)
+
+        assert isinstance(inner.linear, nn.Linear) and not isinstance(inner.linear, Fp8AmpereLinear)
+
+    @requires_cuda
+    @requires_ampere
+    def test_idempotent(self, cuda_device):
+        """Calling _apply_fp8_swap twice does not double-swap."""
+        from raylight.distributed_actor.model_context._base import ModelContext
+
+        inner = _FakeInner()
+        model = _FakeModel(inner)
+        model.load_config.model_options = {"fp8_ampere": True}
+
+        ModelContext._apply_fp8_swap(model, cuda_device)
+        first_mod = inner.linear
+        ModelContext._apply_fp8_swap(model, cuda_device)  # second call — no-op
+
+        assert inner.linear is first_mod, "_fp8_swap_done guard should prevent re-swap"
+
+    @requires_cuda
+    @requires_ampere
+    def test_packed_buffers_on_cpu_after_swap(self, cuda_device):
+        """After _apply_fp8_swap, weight_packed is on CPU (weights not yet moved to CUDA)."""
+        from raylight.distributed_actor.model_context._base import ModelContext
+
+        inner = _FakeInner()
+        model = _FakeModel(inner)
+        model.load_config.model_options = {"fp8_ampere": True}
+
+        ModelContext._apply_fp8_swap(model, cuda_device)
+
+        fp8 = inner.linear
+        # Swap packs on source device (CPU), cache.build() will capture them there.
+        assert fp8._packed, "weight should be packed after swap"
+        assert fp8.weight_packed.device.type == "cpu"
+
+
+class TestActivateFp8Buffers:
+    """Tests for ModelContext._activate_fp8_buffers."""
+
+    @requires_cuda
+    @requires_ampere
+    def test_migrates_all_mixin_instances(self, cuda_device):
+        """_activate_fp8_buffers calls on_device_activated on every Fp8KernelMixin."""
+        from raylight.distributed_actor.model_context._base import ModelContext
+
+        inner = _FakeInner()
+        model = _FakeModel(inner)
+        model.load_config.model_options = {"fp8_ampere": True}
+
+        # Swap and pack on CPU
+        ModelContext._apply_fp8_swap(model, cuda_device)
+        assert inner.linear.weight_packed.device.type == "cpu"
+
+        # Now activate — should move packed buffers to CUDA
+        ModelContext._activate_fp8_buffers(model, cuda_device)
+
+        assert inner.linear.weight_packed.device.type == "cuda"
+        assert inner.linear.scale_padded.device.type == "cuda"
+
+    def test_noop_on_model_with_no_fp8(self):
+        """_activate_fp8_buffers is safe on models with no Fp8KernelMixin layers."""
+        from raylight.distributed_actor.model_context._base import ModelContext
+
+        class _PlainInner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(64, 32)
+
+        inner = _PlainInner()
+        model = _FakeModel(inner)
+
+        # Must not raise
+        ModelContext._activate_fp8_buffers(model, torch.device("cpu"))

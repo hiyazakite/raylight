@@ -131,6 +131,11 @@ class LazyTensorContext(ModelContext):
         if model is None:
             return
 
+        # Swap FP8 nn.Linear → Fp8AmpereLinear while weights are CPU-resident
+        # so that cache.build() captures weight_packed / scale_padded in
+        # pinned RAM.  Must happen before cache.build(), not after.
+        self._apply_fp8_swap(model, device)
+
         cache = getattr(model, 'pinned_param_cache', None)
         diff_model = getattr(model, 'model', None)
         if cache is not None and diff_model is not None and not cache.built:
@@ -360,6 +365,7 @@ class LazyTensorContext(ModelContext):
                 print("[LazyTensorContext] Pinned-RAM Hot-Reload (full): pinned CPU → CUDA...")
                 try:
                     pinned_cache.reload_to_cuda(diffusion_model)
+                    self._activate_fp8_buffers(model, device)
                     diffusion_model.device = device
                     self._fast_reload_full(model, diffusion_model, device)
                     model.current_device = device
@@ -371,6 +377,7 @@ class LazyTensorContext(ModelContext):
                     try:
                         if hasattr(model, "load"):
                             model.load(device)
+                        self._activate_fp8_buffers(model, device)
                         model.current_device = device
                         return
                     except Exception as e2:
@@ -394,6 +401,7 @@ class LazyTensorContext(ModelContext):
                             model.load(device, lowvram_model_memory=budget)
                         finally:
                             model._skip_pinned_auto_restore = False
+                    self._activate_fp8_buffers(model, device)
                     model.current_device = device
                     pinned_cache._on_cuda = True
                     print("[LazyTensorContext] Pinned-RAM Hot-Reload (partial) complete.")
@@ -406,4 +414,5 @@ class LazyTensorContext(ModelContext):
 
         if model is not None and hasattr(model, "load"):
             model.load(device)
+            self._activate_fp8_buffers(model, device)
             model.current_device = device

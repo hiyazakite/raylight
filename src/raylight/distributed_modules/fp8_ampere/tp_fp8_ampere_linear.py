@@ -38,7 +38,7 @@ from raylight.distributed_modules.tensor_parallel import (
     get_tp_group,
     get_tp_size,
 )
-from .fp8_ampere_linear import Fp8AmpereLinear, _try_load_extension, _is_ampere_or_newer
+from .fp8_ampere_linear import Fp8AmpereLinear, Fp8KernelMixin, _try_load_extension, _is_ampere_only
 from .packing import compute_fp8_scales, narrow_fp8_weight_for_tp, quantize_to_fp8_e4m3, repack_fp8_for_marlin
 
 __all__ = ["TPFp8AmpereLinear"]
@@ -64,7 +64,7 @@ def _get_extract_lora_ab():
 # TPFp8AmpereLinear
 # ---------------------------------------------------------------------------
 
-class TPFp8AmpereLinear(nn.Module):
+class TPFp8AmpereLinear(Fp8KernelMixin, nn.Module):
     """TP-parallel FP8 Ampere linear layer.
 
     See module docstring for description.  The layer is intentionally
@@ -131,9 +131,14 @@ class TPFp8AmpereLinear(nn.Module):
             self.register_parameter("bias", None)
 
         self._ext = None  # lazily loaded CUDA extension
-        # Cached Marlin-packed weight + padded scale (computed lazily).
-        self._weight_packed: torch.Tensor | None = None
-        self._scale_padded: torch.Tensor | None = None
+        # Marlin-packed weight + padded scale, registered as buffers so the
+        # pinned cache can offload/reload them with the rest of the model.
+        # Populated lazily by _prepare_packed(); _packed tracks whether packing
+        # has happened (survives storage resize-to-0 during offload).
+        self.register_buffer("weight_packed", None)
+        self.register_buffer("scale_padded",  None)
+        self._packed: bool = False
+        self._local_n: int | None = None  # cached before weight_u8 is freed
 
     # ── TP group helpers ──────────────────────────────────────────────
 
@@ -184,17 +189,22 @@ class TPFp8AmpereLinear(nn.Module):
         # ── IMMA path (with optional LoRA residual) ─────────────────
         ext = self._load_ext()
         device = x.device
-        if ext is not None and _is_ampere_or_newer(device):
+        if ext is not None and _is_ampere_only(device):
             can_residual, lora_ab = self._try_extract_lora_ab()
             if can_residual:
                 out = self._forward_imma_2d(x, ext)
                 if lora_ab is not None:
                     out = out + self._compute_lora_residual(x, lora_ab)
                 if bias is not None:
-                    out = out + bias.to(out.dtype)
+                    out = out + bias.to(device=out.device, dtype=out.dtype)
                 return self._apply_tp_collective(out)
 
         # ── Fallback: dequant → BF16 F.linear ───────────────────────
+        if self.weight_u8.numel() == 0:
+            raise RuntimeError(
+                "TPFp8AmpereLinear: raw FP8 weight has been freed after Marlin "
+                "packing and the CUDA extension is no longer available."
+            )
         w_bf16 = self.weight_u8.view(torch.float8_e4m3fn).to(dtype=torch.bfloat16)
 
         # Apply LoRA patches via weight_function (ComfyUI LowVramPatch).
@@ -203,22 +213,43 @@ class TPFp8AmpereLinear(nn.Module):
             for fn in wf:
                 w_bf16 = fn(w_bf16)
 
-        out = F.linear(x.to(torch.bfloat16), w_bf16, bias)
+        out = F.linear(x.to(torch.bfloat16), w_bf16, bias.to(device=x.device, dtype=torch.bfloat16) if bias is not None else None)
         return self._apply_tp_collective(out)
 
-    def _prepare_packed(self):
-        """Lazily repack weight to Marlin format with alignment padding."""
-        if self._weight_packed is not None:
-            if self._weight_packed.device == self.weight_u8.device:
-                return
-            self._weight_packed = None
-            self._scale_padded = None
+    def _prepare_packed(self, device: torch.device | None = None) -> None:
+        """Repack weight_u8 to Marlin format and free the raw FP8 buffer.
+
+        After packing succeeds ``weight_u8`` is replaced with a 0-element
+        placeholder so only the Marlin-layout copy lives in VRAM (same
+        pattern as ``Fp8AmpereLinear``).
+
+        ``weight_packed`` and ``scale_padded`` are registered buffers so the
+        pinned cache includes them in ``offload_to_cpu`` / ``reload_to_cuda``
+        cycles.  ``_packed`` is a plain Python bool that survives storage
+        resize-to-0 and tells us not to re-pack after a reload.
+
+        Args:
+            device: target device for the packed tensor.  If *None* the
+                    device of ``weight_u8`` is used (lazy-forward path).
+        """
+        if self._packed:
+            # Device migration is handled by on_device_activated (called by
+            # ModelContext._activate_fp8_buffers after every reload_to_cuda).
+            return
+
+        target = device or self.weight_u8.device
 
         packed, scale_padded, _, _ = repack_fp8_for_marlin(
             self.weight_u8, self.weight_scale,
         )
-        self._weight_packed = packed
-        self._scale_padded = scale_padded
+        self.weight_packed = packed.to(target)
+        self.scale_padded  = scale_padded.to(target) if scale_padded is not None else None
+        # Cache local_N before freeing (needed by _forward_imma_2d).
+        self._local_n = self.weight_u8.shape[0]
+        self._packed = True
+
+        # Free raw FP8 storage — keeps only the Marlin-layout copy in VRAM.
+        self.weight_u8.data = self.weight_u8.new_empty(0)
 
     def _forward_imma_2d(self, x: torch.Tensor, ext) -> torch.Tensor:
         """Run the BF16 tensor core kernel, handling arbitrary leading dims."""
@@ -230,11 +261,14 @@ class TPFp8AmpereLinear(nn.Module):
         if x.dim() != 2:
             x = x.view(-1, orig_shape[-1])
 
-        self._prepare_packed()
+        self._prepare_packed(x.device)
 
-        out = ext.fp8_ampere_mm(x, self._weight_packed, self._scale_padded)
+        out = ext.fp8_ampere_mm(x, self.weight_packed, self.scale_padded)
 
-        local_n = self.weight_u8.shape[0]
+        local_n = self._local_n
+        # Slice off padding columns if N was rounded up to BLOCK_N
+        if out.shape[-1] != local_n:
+            out = out[:, :local_n]
         if len(orig_shape) != 2:
             out = out.view(*orig_shape[:-1], local_n)
         return out
@@ -410,6 +444,76 @@ class TPFp8AmpereLinear(nn.Module):
                     0, _tmp_rank * obj.local_out_features, obj.local_out_features,
                 )
             obj.bias.data.copy_(bias_src.to(dtype=torch.bfloat16))
+
+        return obj
+
+    @classmethod
+    def from_tp_linear(
+        cls,
+        tp_linear: "TPLinear",
+        tp_group: Optional[dist.ProcessGroup] = None,
+        compressor=None,
+    ) -> "TPFp8AmpereLinear":
+        """Create a ``TPFp8AmpereLinear`` from a ``TPLinear`` whose weight is
+        already a sharded FP8 tensor (``float8_e4m3fn`` or ``uint8``).
+
+        This is the factory used by ``_apply_tp_fp8_ampere_swap`` in
+        ``tp.py``.  The weight is already the per-rank shard — no further
+        sharding is performed.  Scales are computed from the shard directly.
+
+        Args:
+            tp_linear:  A ``TPLinear`` with ``weight.dtype == float8_e4m3fn``
+                        (as loaded by the TP streaming loader).
+            tp_group:   Optional explicit process group.  Defaults to the
+                        same group as *tp_linear*.
+            compressor: Optional gradient compressor (passed through).
+        """
+        from raylight.distributed_modules.tensor_parallel import TPLinear  # local to avoid circular
+
+        if not isinstance(tp_linear, TPLinear):
+            raise TypeError(
+                f"from_tp_linear expects a TPLinear, got {type(tp_linear)!r}"
+            )
+
+        w = tp_linear.weight
+        if w.dtype not in (torch.float8_e4m3fn, torch.uint8):
+            raise TypeError(
+                f"from_tp_linear: TPLinear.weight must be float8_e4m3fn or uint8, "
+                f"got {w.dtype}"
+            )
+
+        shard_u8 = w.view(torch.uint8).contiguous()
+
+        # Prefer the checkpoint scale already loaded by the streaming loader
+        # (tp_linear.weight_scale is set from the safetensors file during Phase 5).
+        # Fall back to all-ones only when no checkpoint scale is present.
+        existing_scale = getattr(tp_linear, "weight_scale", None)
+        if (
+            isinstance(existing_scale, torch.Tensor)
+            and existing_scale.shape == (shard_u8.shape[0],)
+        ):
+            shard_scale = existing_scale.to(dtype=torch.bfloat16)
+        else:
+            shard_scale = compute_fp8_scales(shard_u8)
+
+        resolved_group = tp_group if tp_group is not None else tp_linear._tp_group
+
+        obj = cls(
+            in_features=tp_linear.in_features,
+            out_features=tp_linear.out_features,
+            bias=tp_linear.bias is not None,
+            parallelism=tp_linear.parallelism,
+            gather_output=tp_linear.gather_output,
+            input_is_parallel=tp_linear.input_is_parallel,
+            reduce_results=tp_linear.reduce_results,
+            tp_group=resolved_group,
+            compressor=compressor,
+        )
+        obj.register_buffer("weight_u8",    shard_u8)
+        obj.register_buffer("weight_scale", shard_scale)
+
+        if tp_linear.bias is not None:
+            obj.bias.data.copy_(tp_linear.bias.data.to(dtype=torch.bfloat16))
 
         return obj
 

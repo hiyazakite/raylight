@@ -1,3 +1,4 @@
+
 """Simulated LTXAV-22B block benchmark: FP8 IMMA kernel vs BF16-upcast baseline.
 
 Simulates a full forward pass through ONE BasicAVTransformerBlock of the
@@ -42,7 +43,7 @@ from raylight.distributed_modules.fp8_ampere.packing import (
     compute_fp8_int8_scales,
 )
 from raylight.distributed_modules.fp8_ampere.fp8_ampere_linear import (
-    _is_ampere_or_newer,
+    _is_ampere_only,
 )
 
 # ---------------------------------------------------------------------------

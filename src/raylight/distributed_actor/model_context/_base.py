@@ -169,6 +169,86 @@ class ModelContext(ABC):
         """Fast VRAM transfer for soft-reloaded models."""
         ...
 
+    @staticmethod
+    def _apply_fp8_swap(model: Any, device: torch.device) -> None:
+        """Walk model and swap ``nn.Linear`` FP8 weights → ``Fp8AmpereLinear``.
+
+        Idempotent: guarded by ``_fp8_swap_done`` on the model patcher.
+        Only runs when ``model_options["fp8_ampere"]`` is truthy, on Ampere
+        (SM 8.0–8.8), and when the CUDA extension is available.
+
+        Requires opt-in via ``model_options["fp8_ampere"] = True`` — the same
+        flag used by the TP path — so non-TP and TP contexts behave identically.
+
+        TP contexts run ``_apply_tp_fp8_ampere_swap`` during streaming load
+        (which sets ``_fp8_swap_done``), so this is a no-op there.
+        """
+        if getattr(model, "_fp8_swap_done", False):
+            return
+        # Respect the same opt-in flag as the TP path.
+        load_config = getattr(model, "load_config", None)
+        model_options = getattr(load_config, "model_options", {}) if load_config is not None else {}
+        if not model_options.get("fp8_ampere", False):
+            model._fp8_swap_done = True
+            return
+        try:
+            from raylight.distributed_modules.fp8_ampere.fp8_ampere_linear import (
+                Fp8AmpereLinear,
+                _is_ampere_only,
+                _try_load_extension,
+            )
+        except ImportError:
+            return
+        if not _is_ampere_only(device) or not _try_load_extension():
+            model._fp8_swap_done = True  # skip on future calls too
+            return
+        diff_model = getattr(model, "model", None)
+        if diff_model is None:
+            model._fp8_swap_done = True
+            return
+        swapped = 0
+        for parent in diff_model.modules():
+            for name, child in list(parent.named_children()):
+                if (
+                    isinstance(child, torch.nn.Linear)
+                    and getattr(child, "weight", None) is not None
+                    and child.weight.dtype == torch.float8_e4m3fn
+                ):
+                    src_device = child.weight.device  # may be CPU
+                    new_mod = Fp8AmpereLinear.from_fp8_checkpoint(
+                        child.weight.data,
+                        child.bias.data if child.bias is not None else None,
+                    )
+                    # Pack on the source device (CPU or CUDA).
+                    # model.load() / reload_to_cuda will move everything to
+                    # CUDA; _activate_fp8_buffers will confirm placement.
+                    new_mod._prepare_packed(src_device)
+                    setattr(parent, name, new_mod)
+                    swapped += 1
+        model._fp8_swap_done = True
+        if swapped:
+            print(f"[ModelContext] FP8 Ampere: swapped {swapped} nn.Linear → Fp8AmpereLinear")
+
+    @staticmethod
+    def _activate_fp8_buffers(model: Any, device: torch.device) -> None:
+        """Call ``on_device_activated`` on all ``Fp8KernelMixin`` instances.
+
+        Called after every ``reload_to_cuda`` / ``model.load`` to ensure
+        Marlin-packed weight buffers are on the correct device.  Safe to
+        call multiple times — each ``on_device_activated`` is a no-op when
+        buffers are already on *device*.
+        """
+        try:
+            from raylight.distributed_modules.fp8_ampere.fp8_ampere_linear import Fp8KernelMixin
+        except ImportError:
+            return
+        diff_model = getattr(model, "model", None)
+        if diff_model is None:
+            return
+        for module in diff_model.modules():
+            if isinstance(module, Fp8KernelMixin):
+                module.on_device_activated(device)
+
     def activate(self, model: Any, device: torch.device,
                  memory: "MemoryPolicy" = NULL_POLICY) -> None:
         """Activate a freshly-loaded model on *device*.
@@ -183,6 +263,8 @@ class ModelContext(ABC):
             return
         if hasattr(model, "load"):
             model.load(device)
+        self._apply_fp8_swap(model, device)
+        self._activate_fp8_buffers(model, device)
         model.current_device = device
 
     # ─── Template Method: offload ────────────────────────────

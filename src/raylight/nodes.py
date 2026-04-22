@@ -951,6 +951,7 @@ class RayUNETLoader:
                         "default",
                         "fp8_e4m3fn",
                         "fp8_e4m3fn_fast",
+                        "fp8_e4m3fn_ampere",
                         "fp8_e5m2",
                         "bf16",
                         "fp16",
@@ -993,6 +994,9 @@ class RayUNETLoader:
         elif weight_dtype == "fp8_e4m3fn_fast":
             model_options["dtype"] = torch.float8_e4m3fn
             model_options["fp8_optimizations"] = True
+        elif weight_dtype == "fp8_e4m3fn_ampere":
+            model_options["dtype"] = torch.float8_e4m3fn
+            model_options["fp8_ampere"] = True
         elif weight_dtype == "fp8_e5m2":
             model_options["dtype"] = torch.float8_e5m2
         elif weight_dtype in ("int8", "int8_dynamic"):

@@ -45,6 +45,56 @@ def _drop_page_cache(path: str) -> None:
         pass  # Not Linux, or file removed
 
 
+def _apply_tp_fp8_ampere_swap(model: Any, device: torch.device,
+                              model_options: dict | None = None) -> None:
+    """Walk a TP model and swap ``TPLinear`` layers that hold FP8 weights
+    to ``TPFp8AmpereLinear`` (custom IMMA GEMM kernel).
+
+    Called after Phase 5 streaming when ``model_options["fp8_ampere"]``
+    is set.  Each ``TPLinear`` whose ``weight.dtype`` is
+    ``float8_e4m3fn`` is replaced in-place via
+    :meth:`TPFp8AmpereLinear.from_tp_linear`.
+    """
+    from raylight.distributed_modules.fp8_ampere.fp8_ampere_linear import (
+        _try_load_extension,
+        _is_ampere_only,
+    )
+    from raylight.distributed_modules.fp8_ampere.tp_fp8_ampere_linear import (
+        TPFp8AmpereLinear,
+    )
+    from raylight.distributed_modules.tensor_parallel import TPLinear
+
+    if model_options is None:
+        model_options = {}
+    # Always mark done so ModelContext._apply_fp8_swap skips TP models.
+    model._fp8_swap_done = True
+    if not model_options.get("fp8_ampere", False):
+        return
+    if not _is_ampere_only(device):
+        print("[TPContext] FP8 Ampere: GPU is not Ampere (SM 8.0-8.8), skipping swap")
+        return
+    if not _try_load_extension():
+        print("[TPContext] FP8 Ampere: CUDA extension not available, skipping swap")
+        return
+
+    diff_model = getattr(model, "model", None)
+    if diff_model is None:
+        return
+
+    swapped = 0
+    for parent_name, parent in list(diff_model.named_modules()):
+        for attr_name, child in list(parent.named_children()):
+            if isinstance(child, TPLinear) and child.weight.dtype == torch.float8_e4m3fn:
+                new_mod = TPFp8AmpereLinear.from_tp_linear(child)
+                new_mod = new_mod.to(device)
+                new_mod._prepare_packed(device=device)
+                setattr(parent, attr_name, new_mod)
+                swapped += 1
+
+    # Mark patcher so ModelContext._apply_fp8_swap (base-class guard) is a no-op.
+    model._fp8_swap_done = True
+
+
 class TPContext(ModelContext):
     """Context for Tensor Parallel model loading with streaming weight transfer."""
 
@@ -86,6 +136,7 @@ class TPContext(ModelContext):
             if diffusion_model is not None:
                 diffusion_model.device = device
                 self._fast_reload_tp(model, diffusion_model, device)
+            self._activate_fp8_buffers(model, device)
             return
 
         # Legacy / pinned-cache path: weights on CPU, move to CUDA.
@@ -99,6 +150,7 @@ class TPContext(ModelContext):
         if pinned_cache is not None and pinned_cache.built and diffusion_model is not None:
             print("[TPContext] activate: pinned cache → CUDA...")
             pinned_cache.reload_to_cuda(diffusion_model)
+            self._activate_fp8_buffers(model, device)
             if hasattr(pinned_cache, 'release_host_copy'):
                 pinned_cache.release_host_copy()
             diffusion_model.device = device
@@ -109,6 +161,7 @@ class TPContext(ModelContext):
         # Fallback: model.load() for legacy / non-pinned path
         if hasattr(model, "load"):
             model.load(device)
+        self._activate_fp8_buffers(model, device)
         model.current_device = device
 
     # ─── Disk loading (used by legacy fallback) ──────────────
@@ -263,6 +316,10 @@ class TPContext(ModelContext):
         # "used" via `(total - available) / total`.  Advise the kernel to
         # drop them so VAE decode doesn't push past the OOM threshold.
         _drop_page_cache(path)
+
+        # ── Phase 5c: FP8 Ampere swap (opt-in via fp8_ampere flag) ──
+        _apply_tp_fp8_ampere_swap(model, config.device,
+                                  model_options=state.model_options)
 
         model.unet_path = state.unet_path
         model.load_config = state
@@ -789,6 +846,7 @@ class TPContext(ModelContext):
                 print("[TPContext] Pinned-RAM Hot-Reload (full): pinned CPU → CUDA...")
                 try:
                     pinned_cache.reload_to_cuda(diffusion_model)
+                    self._activate_fp8_buffers(model, device)
                     if hasattr(pinned_cache, 'release_host_copy'):
                         pinned_cache.release_host_copy()
                     diffusion_model.device = device
@@ -804,7 +862,8 @@ class TPContext(ModelContext):
         print("[TPContext] Hot-Reload: falling back to model.load()...")
         if model is not None and hasattr(model, "load"):
             model.load(device)
-            model.current_device = device
+        self._activate_fp8_buffers(model, device)
+        model.current_device = device
 
     def _hot_load_zero_ram(self, model: Any, device: torch.device) -> None:
         """Re-stream weights from disk directly to CUDA (zero_ram reload)."""
@@ -813,7 +872,8 @@ class TPContext(ModelContext):
             print("[TPContext] zero-RAM reload: no safetensors path, falling back...")
             if hasattr(model, "load"):
                 model.load(device)
-                model.current_device = device
+            self._activate_fp8_buffers(model, device)
+            model.current_device = device
             return
 
         t0 = time.perf_counter()
@@ -828,6 +888,7 @@ class TPContext(ModelContext):
             if inner is not None:
                 self._fast_reload_tp(model, inner, device)
 
+        self._activate_fp8_buffers(model, device)
         model.current_device = device
         dt = (time.perf_counter() - t0) * 1000
         print(f"[TPContext] zero-RAM Hot-Reload complete: {loaded_count} params in {dt:.0f} ms")

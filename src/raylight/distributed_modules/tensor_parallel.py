@@ -39,6 +39,88 @@ try:
 except ImportError:
     _HAS_INT8_KER = False
 
+# True when torch._scaled_mm FP8 GEMM is available (PyTorch 2.1+)
+_HAS_SCALED_MM: bool = hasattr(torch, "_scaled_mm")
+
+_FP8_DTYPES: frozenset = frozenset(filter(None, [
+    getattr(torch, "float8_e4m3fn",   None),
+    getattr(torch, "float8_e5m2",      None),
+    getattr(torch, "float8_e4m3fnuz",  None),
+    getattr(torch, "float8_e5m2fnuz",  None),
+]))
+
+
+def _is_native_fp8_capable(device: torch.device) -> bool:
+    """Return True for GPUs with native FP8 hardware (Ada Lovelace+, SM ≥ 8.9)."""
+    if device.type != "cuda":
+        return False
+    props = torch.cuda.get_device_properties(device)
+    return props.major > 8 or (props.major == 8 and props.minor >= 9)
+
+
+@torch.no_grad()
+def _native_fp8_forward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale,  # None | float | Tensor[N] | Tensor[1]
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """W8A8 FP8 GEMM via ``torch._scaled_mm`` for Ada / Hopper / Blackwell.
+
+    Dynamically quantises activations to ``float8_e4m3fn`` per-tensor, then
+    calls the native CUTLASS FP8 kernel.  The weight is already in FP8 and
+    ``weight_scale`` carries the per-channel (or per-tensor) dequant factor.
+
+    Out dtype is always bfloat16 (the activation compute dtype for all
+    diffusion models targeted by Raylight).
+    """
+    out_dtype = torch.bfloat16
+    x_bf16 = x.to(out_dtype)
+
+    # -- Dynamic per-tensor activation quantisation -----------------------
+    x_f32  = x_bf16.float()
+    x_amax = x_f32.abs().max().clamp(min=1e-12)
+    _FP8_MAX = 448.0  # E4M3 max representable value
+    act_scale = x_amax / _FP8_MAX          # scalar float32
+    x_fp8 = (x_f32 / act_scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+
+    # scale_a must be a scalar Float32 tensor
+    scale_a = act_scale.to(torch.float32).reshape([])
+
+    # -- Weight scale (per-tensor or per-channel) -------------------------
+    if weight_scale is None or (isinstance(weight_scale, float) and weight_scale == 1.0):
+        scale_b = torch.ones([], dtype=torch.float32, device=weight.device)
+        per_channel = False
+    elif isinstance(weight_scale, torch.Tensor):
+        if weight_scale.numel() == 1:
+            scale_b = weight_scale.float().reshape([])
+            per_channel = False
+        else:
+            # Per-channel [N] → must be [1, N] for _scaled_mm
+            scale_b = weight_scale.float().reshape(1, -1)
+            per_channel = True
+    else:
+        scale_b = torch.tensor(float(weight_scale), dtype=torch.float32,
+                               device=weight.device)
+        per_channel = False
+
+    # -- Call native FP8 GEMM --------------------------------------------
+    # weight is [N, K]; mat2 must be [K, N] column-major for _scaled_mm.
+    # weight.T has strides (1, K) which IS column-major — no copy needed.
+    w_t = weight.T  # [K, N], Fortran-contiguous
+
+    bias_bf16 = bias.to(out_dtype) if bias is not None else None
+
+    out = torch._scaled_mm(
+        x_fp8,
+        w_t,
+        scale_a=scale_a,
+        scale_b=scale_b,
+        bias=bias_bf16,
+        out_dtype=out_dtype,
+    )
+    return out
+
 # =============================================================================
 # Type Aliases
 # =============================================================================
@@ -576,7 +658,22 @@ class TPLinear(nn.Module):
 
         # 2. Local matrix multiplication
         if not weight.is_floating_point():
-            if _HAS_INT8_KER and hasattr(self, "weight_scale"):
+            if weight.dtype in _FP8_DTYPES and _HAS_SCALED_MM and _is_native_fp8_capable(x.device):
+                # -- Native FP8 W8A8 path (Ada Lovelace / Hopper / Blackwell) --
+                if weight.device != x.device:
+                    weight = weight.to(x.device, non_blocking=True)
+                if bias is not None and bias.device != x.device:
+                    bias = bias.to(x.device, non_blocking=True)
+                x_shape = x.shape
+                x_2d = x.reshape(-1, x_shape[-1])
+                out = _native_fp8_forward(
+                    x_2d,
+                    weight,
+                    getattr(self, "weight_scale", None),
+                    bias,
+                )
+                out = out.reshape(*x_shape[:-1], out.shape[-1])
+            elif _HAS_INT8_KER and hasattr(self, "weight_scale"):
                 # Native INT8 fast-path (W8A8 dynamic)
                 # Ensure weight is on the same device as input (handles
                 # zero-RAM / LowVram mode where weights may be on CPU).

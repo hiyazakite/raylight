@@ -190,6 +190,7 @@ class FSDPContext(ModelContext):
             print("[FSDPContext] FSDP Hot-Reload: pinned CPU RAM → CUDA...")
             try:
                 shard_cache.reload_to_cuda(model.model.diffusion_model)
+                self._activate_fp8_buffers(model, device)
                 if model.model is not None:
                     model.model.device = device
                 model.current_device = device
@@ -201,4 +202,5 @@ class FSDPContext(ModelContext):
         print("[FSDPContext] Hot-Reload: no shard cache or pinned reload failed — full reload.")
         if model is not None and hasattr(model, "load"):
             model.load(device)
+            self._activate_fp8_buffers(model, device)
             model.current_device = device
